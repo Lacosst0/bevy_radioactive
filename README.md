@@ -82,7 +82,8 @@ distinct meanings:
 
 The scene receives the current value explicitly and uses it for its initial render.
 `watch_resource` observes future publications; it does not replay a value merely
-because a new listener was added.
+because a new listener was added. Resolving the scene returns an error if `Counter`
+was not registered or does not currently exist as a resource.
 
 ## Watch one component source
 
@@ -129,7 +130,7 @@ app.track_component::<Score>();
 
 `watch_component` accepts an `EntityTemplate`, so named BSN references such as
 `#Player` resolve normally. Bevy relationships associate the listener with that
-specific source.
+specific source. Resolving the scene returns an error when `Score` was not registered.
 
 ## App-wide observers
 
@@ -161,6 +162,8 @@ fn record_health_change(change: On<ValueChanged<Health>>) {
 app-wide `On<ValueChanged<T>>` observer. Use `track_resource::<T>` or
 `track_component::<T>` when registration and observer attachment are separate. All
 four methods must be called while constructing the app, before it starts running.
+A Rust type can be tracked in exactly one storage role: resource or ordinary
+component. Use distinct newtype wrappers if the same payload needs both roles.
 
 ## Subscribe to another entity's event
 
@@ -195,10 +198,16 @@ fn update_slider_label(
 }
 ```
 
-`Subscription<E>` dereferences to the unchanged original event. `source()` reports
-the original producer and `target()` reports the receiving entity. Forwarding does
-not rewrite fields such as `ValueChange::source`, and it does not retrigger `E` for
-global `On<E>` observers.
+`Subscription<E>` dereferences to a clone of the event as the forwarding observer saw
+it. `source()` reports the entity whose relationship routed the event and `target()`
+reports the receiving entity. Forwarding does not rewrite fields such as
+`ValueChange::source`, and it does not retrigger `E` for global `On<E>` observers.
+
+For propagating events, `source()` is the current propagation entity. If a handler
+also needs the pre-propagation origin, store that entity in a separate immutable field
+on `E`. The snapshot may include mutations made by an earlier observer because Bevy
+does not specify ordering between unrelated observers; `bevy_radioactive` itself never
+retargets the clone.
 
 The public `SubscribedTo<E>` relationship is stored on the listener and its
 `Subscribers<E>` relationship target is stored on the producer. Bevy maintains the
@@ -206,8 +215,20 @@ relationship target; treat it as read-only application state.
 `SubscriptionEvent<E>` is the underlying targeted wrapper for integrations that
 need a regular `On<SubscriptionEvent<E>>` observer.
 
+A listener has one source per event type. Put handlers on separate listener entities
+when the same `E` must be received from multiple sources. `subscribe_to` installs the
+shared forwarder automatically. Code that inserts `SubscribedTo<E>` directly must
+first call `app.register_subscription::<E>()` during app construction; otherwise the
+insertion fails immediately instead of silently losing the first event.
+
 Subscriptions carry events, not current state. They do not replay an event to a late
 subscriber.
+
+Forwarded deliveries are queued through Bevy's deferred `Commands`. Events emitted
+inside schedules are delivered at the next normal command flush. If application code
+calls `World::trigger` directly outside a schedule, call `World::flush` afterward;
+starting `App::update` is not itself a guaranteed flush for commands that were already
+queued before its schedules began.
 
 ## Choosing an API
 
@@ -256,6 +277,11 @@ Tracking uses Bevy's native change ticks:
   reaction depend on another reaction running first.
 - Adding a listener does not replay the current value. Read state while creating the
   scene and use it for the initial UI, as shown above.
+- Sources carrying Bevy's built-in `Disabled` marker still publish and route events.
+  Subscription routing also bypasses application-defined disabling filters. Tracked
+  state publisher queries remain subject to custom default filters; use a tailored
+  normal query system when custom-disabled resource or component sources must stay
+  reactive.
 
 `ValueChanged<T>` is the underlying source-preserving snapshot event. It dereferences
 to `T` and also exposes `source()`, `value()`, and `snapshot()`.
@@ -266,9 +292,10 @@ to `T` and also exposes `source()`, `value()`, and `snapshot()`.
 
 Registration adds one lightweight `Last` publisher for each resource/component
 tracking registration. Resource tracking checks one singleton; component tracking
-queries changed instances of that type. When a source changes, the crate clones one
-`T` snapshot and routes it through relationships only to listeners of that source.
-Each listener then runs its own observer system.
+uses Bevy's non-archetypal `Changed<T>` filter, which scans matching `T` instances on
+each publisher run and yields only changed ones. When a source changes, the crate
+clones one `T` snapshot and routes it through relationships only to listeners of that
+source. Each listener then runs its own observer system.
 
 There is no value cache, equality comparison, or world-wide scan of entity observers.
 The publisher remains installed for the app's lifetime, while listener relationships
@@ -294,9 +321,11 @@ following views synchronized:
 
 - `PuzzleSettings` updates the camera, column count, puzzle summary, and preview-grid
   material.
-- `PuzzleImage` updates the preview image, aspect ratio, image summary, and feedback.
+- `PuzzleImage` updates the preview image, aspect ratio, image summary, feedback, and
+  play-button availability.
 - `LoadingFeedback` updates the menu feedback label.
 - `ConnectorDistortion` and `Pseudo3dSettings` update settings status text.
+- `DebugDisplaySettings` updates developer-only diagnostics status text.
 
 This keeps update behavior next to the `Text`, `ImageNode`, or material-bearing node
 that owns it. Adjacent uses include inspector fields, HUD labels, settings summaries,

@@ -15,4 +15,6 @@ pub use reactivity::{
     Reaction, ReactiveAppExt, ReactiveSet, ValueChanged, WatchResource, watch_component,
     watch_resource,
 };
-pub use subscription::{SubscribedTo, Subscribers, Subscription, SubscriptionEvent, subscribe_to};
+pub use subscription::{
+    SubscribedTo, Subscribers, Subscription, SubscriptionAppExt, SubscriptionEvent, subscribe_to,
+};

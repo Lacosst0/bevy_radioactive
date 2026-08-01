@@ -3,8 +3,8 @@
 This revision replaces the original lazy, world-wide broadcast prototype with
 explicit app-time tracking and source-specific routing. The change is intentionally
 breaking: watched types are easier to reason about, component listeners cannot
-receive changes from the wrong entity, and subscriptions preserve their original
-event.
+receive changes from the wrong entity, and subscriptions no longer retarget source
+events.
 
 ## Migration summary
 
@@ -22,7 +22,7 @@ event.
 | `subscribe_on(source, handler)` | `subscribe_to(source, handler)` |
 | `Subscribe<E>` | `SubscribedTo<E>` |
 | Forwarded `On<E>` | `Subscription<E>` |
-| `RetargetEvent`, `SubscribableEvent`, and retarget helpers | Removed; the original cloned event is wrapped unchanged |
+| `RetargetEvent`, `SubscribableEvent`, and retarget helpers | Removed; an observed snapshot is wrapped without retargeting |
 
 `Subscribers<E>` remains the inverse relationship target, now paired with
 `SubscribedTo<E>`. The old `ReactiveEvent`, `ReactiveValue`,
@@ -49,6 +49,11 @@ as a singleton `Component`:
 
 - `track_resource::<T>` publishes changes from the one resource entity.
 - `track_component::<T>` publishes changes from every entity carrying `T`.
+
+One Rust type cannot be registered in both roles because both routes use
+`ValueChanged<T>`. Introduce distinct resource and component newtypes when both are
+needed. `watch_resource` also requires the resource to exist when its scene resolves;
+both watch helpers now report missing app-time registration as a scene error.
 
 Registration adds publishers to `Last` in `ReactiveSet::Publish` and lasts for the
 lifetime of the app. Both methods require `T: Clone`; tracking itself no longer
@@ -194,7 +199,7 @@ subscribe_on(#Slider, |event: On<ValueChange<f32>>| {
 })
 ```
 
-After, `Subscription<E>` wraps an unchanged shared clone:
+After, `Subscription<E>` wraps one shared clone without retargeting it:
 
 ```rust
 subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>| {
@@ -204,14 +209,30 @@ subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>| {
 })
 ```
 
-The original event fields remain intact. Forwarding uses the distinct
+The event fields are copied as the forwarding observer sees them. Forwarding uses the distinct
 `SubscriptionEvent<E>` wrapper, so global `On<E>` observers do not receive one
 duplicate `E` for every subscriber. `Subscription<E>` exposes `target()`,
-`source()`, `event()`, and `observer()`, and dereferences to `E`.
+`source()`, `event()`, and `observer()`, and dereferences to `E`. For propagating
+events, `source()` is the current propagation entity; keep a separate immutable origin
+field on `E` if the pre-propagation target is also required. An earlier observer can
+mutate the event before the forwarder snapshots it because unrelated observer order
+is unspecified.
 
 The relationship on the listener is now `SubscribedTo<E>`. The producer still stores
 the automatically maintained `Subscribers<E>` relationship target. Custom events no
 longer implement `RetargetEvent`; they only need to implement `EntityEvent + Clone`.
+Each listener supports one source per event type; use separate listener entities for
+multiple same-typed sources. `subscribe_to` installs routing automatically. Before
+inserting `SubscribedTo<E>` directly, register its forwarder during app construction:
+
+```rust
+app.register_subscription::<MyEntityEvent>();
+```
+
+Forwarding is deferred. Scheduled event producers reach the usual command flushes. If
+you emit an event by calling `World::trigger` directly outside a schedule, follow it
+with `World::flush` to deliver the queued `SubscriptionEvent` values; merely starting
+`App::update` is not a guaranteed flush for commands queued before its schedules run.
 
 ## 6. Account for the new change semantics
 
@@ -236,6 +257,12 @@ still require `T: Clone`.
 Multiple writes before `ReactiveSet::Publish` runs are coalesced into one publication
 holding the final snapshot. Delivery uses deferred commands at the next flush, and
 observer execution order is unspecified.
+
+The built-in Bevy `Disabled` component does not suppress tracked publications or
+subscription routing, and subscription routing bypasses custom disabling filters too.
+Tracked resource/component publisher queries remain subject to a custom component
+registered as a default query filter; use an application-specific query system if
+those custom-disabled sources must remain reactive.
 
 ## 7. Initialize newly spawned views explicitly
 
@@ -265,8 +292,9 @@ on listener construction happening before that publication.
 For the original consumer, the mechanical migration is:
 
 1. Register `PuzzleSettings`, `PuzzleImage`, `LoadingFeedback`,
-   `ConnectorDistortion`, and `Pseudo3dSettings` with `track_resource` during
-   plugin construction. An `observe_resource` call also registers its inferred type.
+   `ConnectorDistortion`, `Pseudo3dSettings`, and the developer-only
+   `DebugDisplaySettings` with `track_resource` during plugin construction. An
+   `observe_resource` call also registers its inferred type.
 2. Replace the camera's `add_reactive_observer` call with `observe_resource`, and
    change that handler to `On<ValueChanged<PuzzleSettings>>`.
 3. Replace each BSN `react(update_...)` entry with

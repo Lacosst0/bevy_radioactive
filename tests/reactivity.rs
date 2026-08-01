@@ -1,4 +1,9 @@
-use bevy::{asset::AssetPlugin, ecs::resource::IsResource, prelude::*, scene::ScenePlugin};
+use bevy::{
+    asset::AssetPlugin,
+    ecs::{entity_disabling::Disabled, resource::IsResource},
+    prelude::*,
+    scene::ScenePlugin,
+};
 use bevy_radioactive::{Reaction, ReactiveAppExt, ValueChanged, watch_component, watch_resource};
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +153,79 @@ fn duplicate_registration_is_idempotent_and_reinsertion_is_published() {
 }
 
 #[test]
+fn app_update_flushes_scheduled_publication_to_local_watchers() {
+    let mut app = test_app();
+    app.insert_resource(Counter(1)).track_resource::<Counter>();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            watch_resource(record_counter)
+        })
+        .unwrap();
+
+    // Resolve the scene commands before the frame, then rely only on App::update
+    // for publication and nested subscription delivery.
+    app.world_mut().flush();
+    app.update();
+
+    assert_eq!(app.world().resource::<Log>().local.len(), 1);
+    assert_eq!(app.world().resource::<Log>().local[0].2, 1);
+}
+
+#[test]
+fn disabled_sources_still_publish() {
+    let mut component_app = test_app();
+    component_app.track_component::<Meter>();
+    component_app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Children [
+                (#A SourceA Meter(7) Disabled),
+                (
+                    Listener
+                    watch_component(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
+                        log.local.push((event.target(), event.source(), event.event().0));
+                    })
+                )
+            ]
+        })
+        .unwrap();
+    component_app.world_mut().flush();
+    component_app.update();
+    assert_eq!(component_app.world().resource::<Log>().local.len(), 1);
+    assert_eq!(component_app.world().resource::<Log>().local[0].2, 7);
+
+    let mut resource_app = test_app();
+    resource_app
+        .insert_resource(Counter(8))
+        .track_resource::<Counter>();
+    let source = {
+        let world = resource_app.world_mut();
+        let mut query = world.query_filtered::<Entity, (With<Counter>, With<IsResource>)>();
+        query.single(world).unwrap()
+    };
+    resource_app.world_mut().entity_mut(source).insert(Disabled);
+    resource_app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            watch_resource(record_counter)
+        })
+        .unwrap();
+    resource_app.world_mut().flush();
+    resource_app.update();
+    assert_eq!(resource_app.world().resource::<Log>().local.len(), 1);
+    assert_eq!(resource_app.world().resource::<Log>().local[0].2, 8);
+}
+
+#[test]
+#[should_panic(expected = "cannot be tracked as both")]
+fn one_type_cannot_be_tracked_as_both_a_resource_and_component() {
+    let mut app = test_app();
+    app.track_resource::<Counter>().track_component::<Counter>();
+}
+
+#[test]
 fn component_watch_is_scoped_to_its_source() {
     let mut app = test_app();
     app.track_component::<Meter>();
@@ -260,4 +338,39 @@ fn watch_resource_requires_app_time_registration() {
     };
 
     assert!(error.to_string().contains("track_resource"));
+}
+
+#[test]
+fn watch_resource_requires_a_current_resource_value() {
+    let mut app = test_app();
+    app.insert_resource(Counter(1)).track_resource::<Counter>();
+    app.world_mut().remove_resource::<Counter>();
+
+    let Err(error) = app.world_mut().spawn_scene(bsn! {
+        Listener
+        watch_resource(record_counter)
+    }) else {
+        panic!("watch unexpectedly resolved without its resource");
+    };
+
+    assert!(error.to_string().contains("must exist"));
+}
+
+#[test]
+fn watch_component_requires_app_time_registration() {
+    let mut app = test_app();
+
+    let Err(error) = app.world_mut().spawn_scene(bsn! {
+        Children [
+            (#A SourceA Meter(1)),
+            (
+                Listener
+                watch_component(#A, |_: Reaction<Meter>| {})
+            )
+        ]
+    }) else {
+        panic!("unregistered component watch unexpectedly resolved");
+    };
+
+    assert!(error.to_string().contains("track_component"));
 }

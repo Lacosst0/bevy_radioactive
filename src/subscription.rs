@@ -1,6 +1,11 @@
 //! Source-preserving routing of entity events to related listener entities.
 
-use std::{any::TypeId, marker::PhantomData, ops::Deref, sync::Arc};
+use std::{
+    any::{TypeId, type_name},
+    marker::PhantomData,
+    ops::Deref,
+    sync::Arc,
+};
 
 use bevy::{
     ecs::{
@@ -18,8 +23,9 @@ use bevy::{
 
 /// A source event delivered to a subscribed listener.
 ///
-/// Unlike retargeting the original event, this wrapper preserves the original
-/// event and source. Its entity-event target is the listener that receives it.
+/// Unlike retargeting the source event, this wrapper gives the delivery its own
+/// listener target. The source event is cloned as the forwarding observer sees
+/// it, without this crate rewriting its fields.
 #[derive(Clone, Debug, EntityEvent)]
 pub struct SubscriptionEvent<E>
 where
@@ -59,13 +65,19 @@ where
         self.target
     }
 
-    /// Original target of the source event.
+    /// Source entity whose subscription relationship routed this delivery.
+    ///
+    /// For an event that propagates, this is the current propagation entity.
     #[must_use]
     pub fn source(&self) -> Entity {
         self.source
     }
 
-    /// Original, unmodified source event.
+    /// Snapshot of the source event as observed by the forwarding observer.
+    ///
+    /// The crate does not retarget or otherwise modify this clone. Because Bevy
+    /// does not define ordering between unrelated observers, changes made by an
+    /// earlier observer can already be present in this snapshot.
     #[must_use]
     pub fn event(&self) -> &E {
         &self.event
@@ -85,8 +97,8 @@ where
 
 /// Observer input for events forwarded through a subscription.
 ///
-/// This dereferences to the original event while exposing both the original
-/// source entity and the subscribed listener target.
+/// This dereferences to the source-event snapshot while exposing the routing
+/// source and subscribed listener target.
 pub struct Subscription<'w, 't, E, B = ()>
 where
     E: EntityEvent + Clone,
@@ -131,13 +143,13 @@ where
         self.on.event().target()
     }
 
-    /// Original target of the source event.
+    /// Source entity whose subscription relationship routed this delivery.
     #[must_use]
     pub fn source(&self) -> Entity {
         self.on.event().source()
     }
 
-    /// Original, unmodified source event.
+    /// Snapshot of the source event as observed by the forwarding observer.
     #[must_use]
     pub fn event(&self) -> &E {
         self.on.event().event()
@@ -162,9 +174,12 @@ where
     }
 }
 
-/// Relationship from a listener entity to its event source entity.
+/// Relationship from a listener entity to its one event source entity.
+///
+/// Call [`SubscriptionAppExt::register_subscription`] before inserting this
+/// relationship directly. Prefer [`subscribe_to`] in BSN scenes.
 #[derive(Component, FromTemplate, Clone, Copy, Debug)]
-#[component(on_add = queue_subscription_forwarder::<E>)]
+#[component(on_add = assert_subscription_registered::<E>)]
 #[relationship(relationship_target = Subscribers<E>)]
 pub struct SubscribedTo<E>
 where
@@ -236,7 +251,9 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> bevy::ecs::error::Result<()> {
         context.entity.world_scope(install_subscription::<E>);
         let source = self.source.build_template(context)?;
-        context.entity.insert(SubscribedTo::<E>::new(source));
+        if ensure_subscription_source_available::<E>(context, source)? {
+            context.entity.insert(SubscribedTo::<E>::new(source));
+        }
         context.entity.observe(self.observer.clone());
         Ok(())
     }
@@ -269,6 +286,9 @@ where
 
 /// BSN helper that subscribes the current entity to a source and observes the
 /// forwarded `SubscriptionEvent`.
+///
+/// A listener can have one source per event type. Use separate listener
+/// entities when the same event type must be received from multiple sources.
 pub fn subscribe_to<I, E, B, M>(source: EntityTemplate, observer: I) -> impl Scene
 where
     I: IntoObserverSystem<SubscriptionEvent<E>, B, M> + Clone + Send + Sync + 'static,
@@ -280,6 +300,27 @@ where
         source,
         observer,
         marker: PhantomData,
+    }
+}
+
+/// App construction helper for direct [`SubscribedTo`] relationship use.
+///
+/// [`subscribe_to`] registers its event type automatically. Call this method
+/// before the app starts only when relationships will be inserted directly.
+pub trait SubscriptionAppExt {
+    /// Registers one source-event forwarder for direct `SubscribedTo<E>` use.
+    fn register_subscription<E>(&mut self) -> &mut Self
+    where
+        E: EntityEvent + Clone;
+}
+
+impl SubscriptionAppExt for App {
+    fn register_subscription<E>(&mut self) -> &mut Self
+    where
+        E: EntityEvent + Clone,
+    {
+        install_subscription::<E>(self.world_mut());
+        self
     }
 }
 
@@ -301,28 +342,59 @@ where
     }
 }
 
-fn queue_subscription_forwarder<E>(mut world: DeferredWorld, _context: HookContext)
+pub(crate) fn ensure_subscription_source_available<E>(
+    context: &TemplateContext,
+    source: Entity,
+) -> bevy::ecs::error::Result<bool>
 where
     E: EntityEvent + Clone,
 {
-    world.commands().queue(|world: &mut World| {
-        install_subscription::<E>(world);
-    });
+    let Some(existing) = context.entity.get::<SubscribedTo<E>>() else {
+        return Ok(true);
+    };
+    if existing.source() == source {
+        return Ok(false);
+    }
+    Err(format!(
+        "an entity can subscribe to only one source for `{}`; use separate listener entities",
+        type_name::<E>(),
+    )
+    .into())
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Bevy component hooks receive DeferredWorld by value"
+)]
+fn assert_subscription_registered<E>(world: DeferredWorld, _context: HookContext)
+where
+    E: EntityEvent + Clone,
+{
+    let registered = world
+        .get_resource::<SubscriptionRegistry>()
+        .is_some_and(|registry| registry.0.contains(&TypeId::of::<E>()));
+    assert!(
+        registered,
+        "subscription event `{}` is not registered; call `app.register_subscription::<{}>()` during app construction or use `subscribe_to(...)`",
+        type_name::<E>(),
+        type_name::<E>(),
+    );
 }
 
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Bevy observer systems receive SystemInput parameters by value"
 )]
-fn forward_subscribed_event<E>(
-    event: On<E>,
-    subscribers: Query<&Subscribers<E>>,
-    mut commands: Commands,
-) where
+fn forward_subscribed_event<E>(event: On<E>, mut world: DeferredWorld)
+where
     E: EntityEvent + Clone,
 {
     let source = event.event_target();
-    let Ok(subscribers) = subscribers.get(source) else {
+    let (entities, mut commands) = world.entities_and_commands();
+    let Ok(source_entity) = entities.get(source) else {
+        return;
+    };
+    let Some(subscribers) = source_entity.get::<Subscribers<E>>() else {
         return;
     };
     let event = Arc::new(event.event().clone());

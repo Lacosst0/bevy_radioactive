@@ -8,8 +8,9 @@ use std::{
 use bevy::{
     ecs::{
         bundle::Bundle,
+        entity_disabling::Disabled,
         event::{EntityEvent, EntityTrigger, Event},
-        query::{Changed as BevyChanged, Without},
+        query::{Allow, Changed as BevyChanged, Without},
         resource::IsResource,
         system::IntoObserverSystem,
         template::{EntityTemplate, Template, TemplateContext},
@@ -20,7 +21,8 @@ use bevy::{
 };
 
 use crate::subscription::{
-    SubscribedTo, Subscription, SubscriptionEvent, install_subscription, subscribe_to,
+    SubscribedTo, Subscription, SubscriptionEvent, ensure_subscription_source_available,
+    install_subscription,
 };
 
 type ObserverMarker<E, B, M> = fn() -> (E, B, M);
@@ -38,6 +40,15 @@ struct ReactiveRegistry {
 
 impl ReactiveRegistry {
     fn register<T: 'static>(&mut self, kind: SourceKind) -> bool {
+        let opposite = match kind {
+            SourceKind::Component => SourceKind::Resource,
+            SourceKind::Resource => SourceKind::Component,
+        };
+        assert!(
+            !self.contains::<T>(opposite),
+            "`{}` cannot be tracked as both a resource and a component; use distinct wrapper types",
+            type_name::<T>(),
+        );
         self.sources.insert((TypeId::of::<T>(), kind))
     }
 
@@ -145,6 +156,8 @@ pub trait ReactiveAppExt {
     ///
     /// Resource entities are excluded. This uses Bevy's non-archetypal
     /// `Changed<T>` filter and should be reserved for presentation-scale work.
+    /// A type cannot be tracked as both a resource and an ordinary component;
+    /// use distinct wrapper types when both storage roles are needed.
     fn track_component<T>(&mut self) -> &mut Self
     where
         T: Component + Clone;
@@ -223,7 +236,7 @@ fn source_is_registered<T: 'static>(world: &World, kind: SourceKind) -> bool {
 
 fn publish_resource_changes<T>(
     value: Option<Res<T>>,
-    sources: Query<Entity, (With<T>, With<IsResource>)>,
+    sources: Query<Entity, (With<T>, With<IsResource>, Allow<Disabled>)>,
     mut commands: Commands,
 ) where
     T: Resource + Clone,
@@ -242,7 +255,7 @@ fn publish_resource_changes<T>(
 }
 
 fn publish_component_changes<T>(
-    values: Query<(Entity, &T), (BevyChanged<T>, Without<IsResource>)>,
+    values: Query<(Entity, &T), (BevyChanged<T>, Without<IsResource>, Allow<Disabled>)>,
     mut commands: Commands,
 ) where
     T: Component + Clone,
@@ -285,6 +298,17 @@ where
             .into());
         }
 
+        let exists = context
+            .entity
+            .world_scope(|world| world.contains_resource::<T>());
+        if !exists {
+            return Err(format!(
+                "resource `{}` must exist before resolving `watch_resource(...)`",
+                type_name::<T>(),
+            )
+            .into());
+        }
+
         let Some(source) = context.resource_entity::<T>() else {
             return Err(format!(
                 "resource `{}` must exist before resolving `watch_resource(...)`",
@@ -293,12 +317,16 @@ where
             .into());
         };
 
+        let insert_relationship =
+            ensure_subscription_source_available::<ValueChanged<T>>(context, source)?;
         context
             .entity
             .world_scope(install_subscription::<ValueChanged<T>>);
-        context
-            .entity
-            .insert(SubscribedTo::<ValueChanged<T>>::new(source));
+        if insert_relationship {
+            context
+                .entity
+                .insert(SubscribedTo::<ValueChanged<T>>::new(source));
+        }
         context.entity.observe(self.observer.clone());
         Ok(())
     }
@@ -346,6 +374,80 @@ where
     }
 }
 
+struct WatchComponent<T, B, M, I>
+where
+    T: Component + Clone,
+    B: Bundle,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M>,
+{
+    source: EntityTemplate,
+    observer: I,
+    marker: PhantomData<ObserverMarker<T, B, M>>,
+}
+
+impl<T, B, M, I> Template for WatchComponent<T, B, M, I>
+where
+    T: Component + Clone,
+    B: Bundle,
+    M: 'static,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone,
+{
+    type Output = ();
+
+    fn build_template(&self, context: &mut TemplateContext) -> bevy::ecs::error::Result<()> {
+        let registered = context
+            .entity
+            .world_scope(|world| source_is_registered::<T>(world, SourceKind::Component));
+        if !registered {
+            return Err(format!(
+                "component `{}` is not tracked; call `app.track_component::<{}>()` during app construction",
+                type_name::<T>(),
+                type_name::<T>(),
+            )
+            .into());
+        }
+
+        let source = self.source.build_template(context)?;
+        let insert_relationship =
+            ensure_subscription_source_available::<ValueChanged<T>>(context, source)?;
+        context
+            .entity
+            .world_scope(install_subscription::<ValueChanged<T>>);
+        if insert_relationship {
+            context
+                .entity
+                .insert(SubscribedTo::<ValueChanged<T>>::new(source));
+        }
+        context.entity.observe(self.observer.clone());
+        Ok(())
+    }
+
+    fn clone_template(&self) -> Self {
+        Self {
+            source: self.source.clone_template(),
+            observer: self.observer.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, B, M, I> Scene for WatchComponent<T, B, M, I>
+where
+    T: Component + Clone,
+    B: Bundle,
+    M: 'static,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone + Send + Sync,
+{
+    fn resolve(
+        self,
+        _context: &mut ResolveContext,
+        scene: &mut ResolvedScene,
+    ) -> Result<(), ResolveSceneError> {
+        scene.push_bundle_template(self);
+        Ok(())
+    }
+}
+
 /// Watches component `T` on `source` from the current BSN entity.
 ///
 /// Call [`ReactiveAppExt::track_component`] during app construction. Unlike
@@ -358,5 +460,9 @@ where
     M: 'static,
     I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone + Send + Sync + 'static,
 {
-    subscribe_to(source, observer)
+    WatchComponent {
+        source,
+        observer,
+        marker: PhantomData,
+    }
 }

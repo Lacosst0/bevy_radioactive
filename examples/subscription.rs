@@ -6,31 +6,33 @@ use bevy_radioactive::subscription::{Subscription, subscribe_to};
 #[derive(Component, Clone, Copy, Default)]
 struct Slider;
 
+#[derive(Resource, Default)]
+struct Received(Option<(Entity, Entity, f32)>);
+
 fn main() {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin));
+    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
+        .init_resource::<Received>();
 
     let root = app
         .world_mut()
         .spawn_scene(bsn! {
+            Name::new("subscription-root")
             Children[
                 (#Slider Slider),
                 (
                     Name::new("subscribed label")
-                    subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>| {
-                        println!(
-                            "listener {:?} received {} from {:?}",
-                            event.target(),
-                            event.value,
-                            event.source(),
-                        );
+                    subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>, mut received: ResMut<Received>| {
+                        received.0 = Some((event.target(), event.source(), event.value));
                     })
                 )
             ]
         })
         .unwrap()
         .id();
+    app.world_mut().flush();
     app.update();
+    app.world_mut().flush();
 
     let slider = app
         .world_mut()
@@ -38,13 +40,19 @@ fn main() {
         .iter(app.world())
         .next()
         .expect("slider exists");
-
     app.world_mut().trigger(ValueChange {
         source: slider,
-        value: 42.0,
+        value: 42.0_f32,
         is_final: true,
     });
-    app.update();
+    app.world_mut().flush();
+
+    let (listener, source, value) = app
+        .world()
+        .resource::<Received>()
+        .0
+        .expect("subscription delivery was flushed");
+    println!("listener {listener:?} received {value} from {source:?}");
 
     app.world_mut().despawn(root);
 }
