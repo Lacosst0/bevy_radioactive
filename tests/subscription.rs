@@ -56,19 +56,18 @@ fn subscribe_to_preserves_original_source_and_payload() {
         .spawn_scene(bsn! {
             Name::new("subscription-root")
             Children[
-                (#Source Source),
-                (
-                    Subscriber
-                    subscribe_to(#Source, |event: Subscription<ValueChange<i32>>, mut log: ResMut<Log>| {
-                        log.0.push((
-                            event.target(),
-                            event.source(),
-                            event.event().source,
-                            event.value,
-                            event.is_final,
-                        ));
-                    })
-                )
+                #Source Source
+                --
+                Subscriber
+                subscribe_to(#Source, |event: Subscription<ValueChange<i32>>, mut log: ResMut<Log>| {
+                    log.0.push((
+                        event.target(),
+                        event.source(),
+                        event.event().source,
+                        event.value,
+                        event.is_final,
+                    ));
+                })
             ]
         })
         .unwrap();
@@ -82,7 +81,7 @@ fn subscribe_to_preserves_original_source_and_payload() {
         value: 7,
         is_final: true,
     });
-    assert!(app.world().resource::<Log>().0.is_empty());
+    assert_eq!(app.world().resource::<Log>().0.len(), 0);
     app.world_mut().flush();
 
     assert_eq!(
@@ -103,11 +102,10 @@ fn forwarding_does_not_retrigger_the_original_global_event() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children[
-                (#Source Source),
-                (
-                    Subscriber
-                    subscribe_to(#Source, |_event: Subscription<ValueChange<i32>>| {})
-                )
+                #Source Source
+                --
+                Subscriber
+                subscribe_to(#Source, |_event: Subscription<ValueChange<i32>>| {})
             ]
         })
         .unwrap();
@@ -186,13 +184,13 @@ fn bsn_helper_rejects_two_sources_for_the_same_event_type() {
 
     let Err(error) = app.world_mut().spawn_scene(bsn! {
         Children[
-            (#A Source),
-            (#B Source),
-            (
-                Subscriber
-                subscribe_to(#A, |_: Subscription<Ping>| {})
-                subscribe_to(#B, |_: Subscription<Ping>| {})
-            )
+            #A Source
+            --
+        #B Source
+            --
+            Subscriber
+            subscribe_to(#A, |_: Subscription<Ping>| {})
+            subscribe_to(#B, |_: Subscription<Ping>| {})
         ]
     }) else {
         panic!("duplicate same-event subscription unexpectedly resolved");
@@ -208,16 +206,15 @@ fn bsn_helper_allows_multiple_handlers_for_the_same_source() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children[
-                (#Source Source),
-                (
-                    Subscriber
-                    subscribe_to(#Source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
-                        log.0.push((event.target(), event.source(), event.event().source, event.value, false));
-                    })
-                    subscribe_to(#Source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
-                        log.0.push((event.target(), event.source(), event.event().source, event.value + 100, false));
-                    })
-                )
+                #Source Source
+                --
+                Subscriber
+                subscribe_to(#Source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.event().source, event.value, false));
+                })
+                subscribe_to(#Source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.event().source, event.value + 100, false));
+                })
             ]
         })
         .unwrap();

@@ -9,7 +9,6 @@ use std::{
 
 use bevy::{
     ecs::{
-        bundle::Bundle,
         event::EntityEvent,
         lifecycle::HookContext,
         system::{FromInput, IntoObserverSystem, SystemInput},
@@ -18,44 +17,28 @@ use bevy::{
     },
     platform::collections::HashSet,
     prelude::*,
-    scene::{ResolveContext, ResolveSceneError, ResolvedScene, Scene},
+    scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
 
 /// A source event delivered to a subscribed listener.
 ///
-/// Unlike retargeting the source event, this wrapper gives the delivery its own
-/// listener target. The source event is cloned as the forwarding observer sees
-/// it, without this crate rewriting its fields.
+/// The delivery has its own listener target; the source event is shared as
+/// the forwarding observer saw it, without this crate rewriting its fields.
 #[derive(Clone, Debug, EntityEvent)]
-pub struct SubscriptionEvent<E>
-where
-    E: EntityEvent + Clone,
-{
+pub struct SubscriptionEvent<E: EntityEvent + Clone> {
     #[event_target]
     target: Entity,
     source: Entity,
     event: Arc<E>,
 }
 
-impl<E> SubscriptionEvent<E>
-where
-    E: EntityEvent + Clone,
-{
+impl<E: EntityEvent + Clone> SubscriptionEvent<E> {
     /// Wraps an event for delivery to the target listener.
     pub fn new(target: Entity, event: E) -> Self {
-        let source = event.event_target();
         Self {
             target,
-            source,
+            source: event.event_target(),
             event: Arc::new(event),
-        }
-    }
-
-    fn from_shared(target: Entity, source: Entity, event: Arc<E>) -> Self {
-        Self {
-            target,
-            source,
-            event,
         }
     }
 
@@ -75,102 +58,59 @@ where
 
     /// Snapshot of the source event as observed by the forwarding observer.
     ///
-    /// The crate does not retarget or otherwise modify this clone. Because Bevy
-    /// does not define ordering between unrelated observers, changes made by an
-    /// earlier observer can already be present in this snapshot.
+    /// Bevy does not order unrelated observers, so changes made by an earlier
+    /// observer can already be present in this snapshot.
     #[must_use]
     pub fn event(&self) -> &E {
         &self.event
     }
 }
 
-impl<E> Deref for SubscriptionEvent<E>
-where
-    E: EntityEvent + Clone,
-{
+impl<E: EntityEvent + Clone> Deref for SubscriptionEvent<E> {
     type Target = E;
 
-    fn deref(&self) -> &Self::Target {
-        self.event()
+    fn deref(&self) -> &E {
+        &self.event
     }
 }
 
 /// Observer input for events forwarded through a subscription.
 ///
-/// This dereferences to the source-event snapshot while exposing the routing
-/// source and subscribed listener target.
-pub struct Subscription<'w, 't, E, B = ()>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-{
-    on: On<'w, 't, SubscriptionEvent<E>, B>,
-}
+/// Dereferences to [`SubscriptionEvent`], and through it to the source event.
+pub struct Subscription<'w, 't, E: EntityEvent + Clone>(On<'w, 't, SubscriptionEvent<E>>);
 
-impl<E, B> SystemInput for Subscription<'_, '_, E, B>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-{
-    type Param<'i> = Subscription<'i, 'i, E, B>;
-    type Inner<'i> = On<'i, 'i, SubscriptionEvent<E>, B>;
+impl<E: EntityEvent + Clone> SystemInput for Subscription<'_, '_, E> {
+    type Param<'i> = Subscription<'i, 'i, E>;
+    type Inner<'i> = On<'i, 'i, SubscriptionEvent<E>>;
 
     fn wrap(on: Self::Inner<'_>) -> Self::Param<'_> {
-        Subscription { on }
+        Subscription(on)
     }
 }
 
-impl<E, B> FromInput<On<'_, '_, SubscriptionEvent<E>, B>> for Subscription<'_, '_, E, B>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
+impl<E: EntityEvent + Clone> FromInput<On<'_, '_, SubscriptionEvent<E>>>
+    for Subscription<'_, '_, E>
 {
     fn from_inner<'i>(
-        on: <On<'_, '_, SubscriptionEvent<E>, B> as SystemInput>::Inner<'i>,
+        on: <On<'_, '_, SubscriptionEvent<E>> as SystemInput>::Inner<'i>,
     ) -> Self::Inner<'i> {
         on
     }
 }
 
-impl<E, B> Subscription<'_, '_, E, B>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-{
-    /// Listener entity receiving this subscription event.
-    #[must_use]
-    pub fn target(&self) -> Entity {
-        self.on.event().target()
-    }
-
-    /// Source entity whose subscription relationship routed this delivery.
-    #[must_use]
-    pub fn source(&self) -> Entity {
-        self.on.event().source()
-    }
-
-    /// Snapshot of the source event as observed by the forwarding observer.
-    #[must_use]
-    pub fn event(&self) -> &E {
-        self.on.event().event()
-    }
-
+impl<E: EntityEvent + Clone> Subscription<'_, '_, E> {
     /// Entity containing the observer that is handling this event.
     #[must_use]
     pub fn observer(&self) -> Entity {
-        self.on.observer()
+        self.0.observer()
     }
 }
 
-impl<E, B> Deref for Subscription<'_, '_, E, B>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-{
-    type Target = E;
+impl<E: EntityEvent + Clone> Deref for Subscription<'_, '_, E> {
+    type Target = SubscriptionEvent<E>;
 
-    fn deref(&self) -> &Self::Target {
-        self.event()
+    fn deref(&self) -> &SubscriptionEvent<E> {
+        self.0.event()
     }
 }
 
@@ -181,20 +121,14 @@ where
 #[derive(Component, FromTemplate, Clone, Copy, Debug)]
 #[component(on_add = assert_subscription_registered::<E>)]
 #[relationship(relationship_target = Subscribers<E>)]
-pub struct SubscribedTo<E>
-where
-    E: EntityEvent + Clone,
-{
+pub struct SubscribedTo<E: EntityEvent + Clone> {
     #[relationship]
     #[entities]
     source: Entity,
     marker: PhantomData<fn() -> E>,
 }
 
-impl<E> SubscribedTo<E>
-where
-    E: EntityEvent + Clone,
-{
+impl<E: EntityEvent + Clone> SubscribedTo<E> {
     /// Creates a relationship targeting the source.
     #[must_use]
     pub fn new(source: Entity) -> Self {
@@ -214,111 +148,110 @@ where
 /// Relationship target stored on an event source entity.
 #[derive(Component, Debug, Default)]
 #[relationship_target(relationship = SubscribedTo<E>)]
-pub struct Subscribers<E>(#[relationship] Vec<Entity>, PhantomData<fn() -> E>)
-where
-    E: EntityEvent + Clone;
+pub struct Subscribers<E: EntityEvent + Clone>(#[relationship] Vec<Entity>, PhantomData<fn() -> E>);
 
-impl<E> Subscribers<E>
-where
-    E: EntityEvent + Clone,
-{
+impl<E: EntityEvent + Clone> Subscribers<E> {
     /// Iterates the listener entities subscribed to this source.
     pub fn iter(&self) -> impl Iterator<Item = Entity> + '_ {
         self.0.iter().copied()
     }
 }
 
-struct SubscribeTo<E, B, M, I>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-    I: IntoObserverSystem<SubscriptionEvent<E>, B, M>,
-{
-    source: EntityTemplate,
+/// BSN template that subscribes the current entity to the entity built by `S`
+/// and observes forwarded `E` events. See [`subscribe_to`].
+pub struct Subscribe<E, S, I, M> {
+    source: S,
     observer: I,
-    marker: PhantomData<fn() -> (E, B, M)>,
+    marker: PhantomData<fn() -> (E, M)>,
 }
 
-impl<E, B, M, I> Template for SubscribeTo<E, B, M, I>
-where
-    E: EntityEvent + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<E>, B, M> + Clone,
-{
-    type Output = ();
-
-    fn build_template(&self, context: &mut TemplateContext) -> bevy::ecs::error::Result<()> {
-        context.entity.world_scope(install_subscription::<E>);
-        let source = self.source.build_template(context)?;
-        if ensure_subscription_source_available::<E>(context, source)? {
-            context.entity.insert(SubscribedTo::<E>::new(source));
-        }
-        context.entity.observe(self.observer.clone());
-        Ok(())
-    }
-
-    fn clone_template(&self) -> Self {
+impl<E, S, I, M> Subscribe<E, S, I, M> {
+    pub(crate) fn new(source: S, observer: I) -> Self {
         Self {
-            source: self.source.clone_template(),
-            observer: self.observer.clone(),
+            source,
+            observer,
             marker: PhantomData,
         }
     }
 }
 
-impl<E, B, M, I> Scene for SubscribeTo<E, B, M, I>
+impl<E, S, I, M> Template for Subscribe<E, S, I, M>
 where
     E: EntityEvent + Clone,
-    B: Bundle,
+    S: Template<Output = Entity>,
+    I: IntoObserverSystem<SubscriptionEvent<E>, M> + Clone,
     M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<E>, B, M> + Clone + Send + Sync,
+{
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        let source = self.source.build_template(context)?;
+        context.entity.world_scope(install_subscription::<E>);
+        match context.entity.get::<SubscribedTo<E>>() {
+            Some(existing) if existing.source == source => {}
+            Some(_) => {
+                return Err(format!(
+                    "an entity can subscribe to only one source for `{}`; use separate listener entities",
+                    type_name::<E>(),
+                )
+                .into());
+            }
+            None => {
+                context.entity.insert(SubscribedTo::<E>::new(source));
+            }
+        }
+        context.entity.observe(self.observer.clone());
+        Ok(EmptySceneEffect)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self::new(self.source.clone_template(), self.observer.clone())
+    }
+}
+
+impl<E, S, I, M> Scene for Subscribe<E, S, I, M>
+where
+    E: EntityEvent + Clone,
+    S: Template<Output = Entity> + Send + Sync + 'static,
+    I: IntoObserverSystem<SubscriptionEvent<E>, M> + Clone + Sync,
+    M: 'static,
 {
     fn resolve(
         self,
         _context: &mut ResolveContext,
         scene: &mut ResolvedScene,
     ) -> Result<(), ResolveSceneError> {
-        scene.push_bundle_template(self);
+        scene.push_template(self);
         Ok(())
     }
 }
 
-/// BSN helper that subscribes the current entity to a source and observes the
-/// forwarded `SubscriptionEvent`.
+/// Subscribes the current BSN entity to `source` and observes the forwarded
+/// [`SubscriptionEvent`].
 ///
 /// A listener can have one source per event type. Use separate listener
 /// entities when the same event type must be received from multiple sources.
-pub fn subscribe_to<I, E, B, M>(source: EntityTemplate, observer: I) -> impl Scene
+pub fn subscribe_to<E, I, M>(
+    source: EntityTemplate,
+    observer: I,
+) -> Subscribe<E, EntityTemplate, I, M>
 where
-    I: IntoObserverSystem<SubscriptionEvent<E>, B, M> + Clone + Send + Sync + 'static,
     E: EntityEvent + Clone,
-    B: Bundle,
-    M: 'static,
+    I: IntoObserverSystem<SubscriptionEvent<E>, M>,
 {
-    SubscribeTo {
-        source,
-        observer,
-        marker: PhantomData,
-    }
+    Subscribe::new(source, observer)
 }
 
 /// App construction helper for direct [`SubscribedTo`] relationship use.
-///
-/// [`subscribe_to`] registers its event type automatically. Call this method
-/// before the app starts only when relationships will be inserted directly.
 pub trait SubscriptionAppExt {
-    /// Registers one source-event forwarder for direct `SubscribedTo<E>` use.
-    fn register_subscription<E>(&mut self) -> &mut Self
-    where
-        E: EntityEvent + Clone;
+    /// Registers the source-event forwarder for direct `SubscribedTo<E>` use.
+    ///
+    /// [`subscribe_to`] registers its event type automatically.
+    fn register_subscription<E: EntityEvent + Clone>(&mut self) -> &mut Self;
 }
 
 impl SubscriptionAppExt for App {
-    fn register_subscription<E>(&mut self) -> &mut Self
-    where
-        E: EntityEvent + Clone,
-    {
+    fn register_subscription<E: EntityEvent + Clone>(&mut self) -> &mut Self {
         install_subscription::<E>(self.world_mut());
         self
     }
@@ -327,56 +260,27 @@ impl SubscriptionAppExt for App {
 #[derive(Default, Resource)]
 struct SubscriptionRegistry(HashSet<TypeId>);
 
-pub(crate) fn install_subscription<E>(world: &mut World)
-where
-    E: EntityEvent + Clone,
-{
+fn install_subscription<E: EntityEvent + Clone>(world: &mut World) {
     world.init_resource::<SubscriptionRegistry>();
-    let should_install = world
+    if world
         .resource_mut::<SubscriptionRegistry>()
         .0
-        .insert(TypeId::of::<E>());
-
-    if should_install {
-        world.add_observer(forward_subscribed_event::<E>);
+        .insert(TypeId::of::<E>())
+    {
+        world.add_observer(forward::<E>);
     }
-}
-
-pub(crate) fn ensure_subscription_source_available<E>(
-    context: &TemplateContext,
-    source: Entity,
-) -> bevy::ecs::error::Result<bool>
-where
-    E: EntityEvent + Clone,
-{
-    let Some(existing) = context.entity.get::<SubscribedTo<E>>() else {
-        return Ok(true);
-    };
-    if existing.source() == source {
-        return Ok(false);
-    }
-    Err(format!(
-        "an entity can subscribe to only one source for `{}`; use separate listener entities",
-        type_name::<E>(),
-    )
-    .into())
 }
 
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Bevy component hooks receive DeferredWorld by value"
 )]
-fn assert_subscription_registered<E>(world: DeferredWorld, _context: HookContext)
-where
-    E: EntityEvent + Clone,
-{
-    let registered = world
-        .get_resource::<SubscriptionRegistry>()
-        .is_some_and(|registry| registry.0.contains(&TypeId::of::<E>()));
+fn assert_subscription_registered<E: EntityEvent + Clone>(world: DeferredWorld, _: HookContext) {
     assert!(
-        registered,
-        "subscription event `{}` is not registered; call `app.register_subscription::<{}>()` during app construction or use `subscribe_to(...)`",
-        type_name::<E>(),
+        world
+            .get_resource::<SubscriptionRegistry>()
+            .is_some_and(|registry| registry.0.contains(&TypeId::of::<E>())),
+        "subscription event `{0}` is not registered; call `app.register_subscription::<{0}>()` during app construction or use `subscribe_to(...)`",
         type_name::<E>(),
     );
 }
@@ -385,25 +289,22 @@ where
     clippy::needless_pass_by_value,
     reason = "Bevy observer systems receive SystemInput parameters by value"
 )]
-fn forward_subscribed_event<E>(event: On<E>, mut world: DeferredWorld)
-where
-    E: EntityEvent + Clone,
-{
+fn forward<E: EntityEvent + Clone>(event: On<E>, mut world: DeferredWorld) {
     let source = event.event_target();
     let (entities, mut commands) = world.entities_and_commands();
-    let Ok(source_entity) = entities.get(source) else {
-        return;
-    };
-    let Some(subscribers) = source_entity.get::<Subscribers<E>>() else {
+    let Some(subscribers) = entities
+        .get(source)
+        .ok()
+        .and_then(|entity| entity.get::<Subscribers<E>>())
+    else {
         return;
     };
     let event = Arc::new(event.event().clone());
-
     for target in subscribers.iter() {
-        commands.trigger(SubscriptionEvent::from_shared(
+        commands.trigger(SubscriptionEvent {
             target,
             source,
-            Arc::clone(&event),
-        ));
+            event: Arc::clone(&event),
+        });
     }
 }

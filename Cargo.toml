@@ -1,19 +1,19 @@
 [package]
 name = "bevy_radioactive"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.95"
-description = "Source-specific reactive state and event routing for Bevy 0.19 BSN scenes"
+rust-version = "1.97.1"
+description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
 readme = "README.md"
 publish = false
 keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["bevy_scene"] }
+bevy = { version = "0.20", default-features = false, features = ["bevy_scene"] }
 
 [dev-dependencies]
-bevy = { version = "0.19", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_scene",
     "bevy_ui_widgets",
 ] }

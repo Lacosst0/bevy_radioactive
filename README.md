@@ -1,6 +1,6 @@
 # `bevy_radioactive`
 
-`bevy_radioactive` connects Bevy 0.19 state and entity events to local observers in
+`bevy_radioactive` connects Bevy 0.20 state and entity events to local observers in
 code-authored BSN scenes. A UI node can own the handler that keeps it synchronized
 without a global system querying every possible view.
 
@@ -12,13 +12,13 @@ functional-reactive state graph.
 
 | `bevy_radioactive` | Bevy | Rust |
 | --- | --- | --- |
-| 0.2 | 0.19 | 1.95 or newer |
+| 0.3 | 0.20 | 1.97.1 or newer |
 
 For a workspace checkout:
 
 ```toml
 [dependencies]
-bevy = "0.19"
+bevy = "0.20"
 bevy_radioactive = { path = "../bevy_radioactive" }
 ```
 
@@ -100,11 +100,10 @@ struct Score(u32);
 fn scoreboard(initial: Score) -> impl Scene {
     bsn! {
         Children [
-            (#Player Score({initial.0})),
-            (
-                Text({initial.0.to_string()})
-                watch_component(#Player, update_score)
-            )
+            #Player Score({initial.0})
+            --
+            Text({initial.0.to_string()})
+            watch_component(#Player, update_score)
         ]
     }
 }
@@ -178,11 +177,10 @@ use bevy_radioactive::prelude::*;
 fn slider_and_label() -> impl Scene {
     bsn! {
         Children [
-            (#Slider Name::new("volume slider")),
-            (
-                Text("0")
-                subscribe_to(#Slider, update_slider_label)
-            )
+            #Slider Name::new("volume slider")
+            --
+            Text("0")
+            subscribe_to(#Slider, update_slider_label)
         ]
     }
 }
@@ -242,7 +240,7 @@ queued before its schedules began.
 | Component/resource add, insert, discard, or removal | Bevy's native lifecycle observers |
 | Bulk or per-frame processing over many entities | A normal scheduled Bevy system |
 
-Bevy 0.19 stores resources as components on singleton entities. Consequently, native
+Bevy 0.20 stores resources as components on singleton entities. Consequently, native
 lifecycle observers work for both components and resources and this crate does not
 wrap them:
 
@@ -253,10 +251,10 @@ use bevy::{ecs::lifecycle::{Add, Discard, Insert, Remove}, prelude::*};
 # struct MyState;
 # let mut app = App::new();
 
-app.add_observer(|event: On<Add, MyState>| { /* added */ });
-app.add_observer(|event: On<Insert, MyState>| { /* inserted or replaced */ });
-app.add_observer(|event: On<Discard, MyState>| { /* old value is leaving */ });
-app.add_observer(|event: On<Remove, MyState>| { /* removed or despawned */ });
+app.add_observer(|event: On<Add<MyState>>| { /* added */ });
+app.add_observer(|event: On<Insert<MyState>>| { /* inserted or replaced */ });
+app.add_observer(|event: On<Discard<MyState>>| { /* old value is leaving */ });
+app.add_observer(|event: On<Remove<MyState>>| { /* removed or despawned */ });
 ```
 
 ## Change and delivery semantics
@@ -333,8 +331,8 @@ tooltips, and direct slider-to-label or button-to-panel event wiring.
 
 ## Official Bevy references
 
-- [Bevy 0.19: resources as components and next-generation scenes](https://bevy.org/news/bevy-0-19/)
-- [BSN and scene observers](https://docs.rs/bevy/0.19.0/bevy/scene/)
-- [Bevy observer semantics](https://docs.rs/bevy_ecs/0.19.0/bevy_ecs/observer/)
-- [Bevy change detection](https://docs.rs/bevy_ecs/0.19.0/bevy_ecs/change_detection/)
-- [Bevy ECS relationships](https://docs.rs/bevy_ecs/0.19.0/bevy_ecs/relationship/)
+- [Bevy 0.20: resources as components and next-generation scenes](https://bevy.org/news/bevy-0-20/)
+- [BSN and scene observers](https://docs.rs/bevy/0.20.0/bevy/scene/)
+- [Bevy observer semantics](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/observer/)
+- [Bevy change detection](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/change_detection/)
+- [Bevy ECS relationships](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/relationship/)

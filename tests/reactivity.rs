@@ -180,13 +180,12 @@ fn disabled_sources_still_publish() {
         .world_mut()
         .spawn_scene(bsn! {
             Children [
-                (#A SourceA Meter(7) Disabled),
-                (
-                    Listener
-                    watch_component(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                        log.local.push((event.target(), event.source(), event.event().0));
-                    })
-                )
+                #A SourceA Meter(7) Disabled
+                --
+                Listener
+                watch_component(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
+                    log.local.push((event.target(), event.source(), event.event().0));
+                })
             ]
         })
         .unwrap();
@@ -233,14 +232,14 @@ fn component_watch_is_scoped_to_its_source() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                (#A SourceA Meter(1)),
-                (#B SourceB Meter(10)),
-                (
-                    Listener
-                    watch_component(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                        log.local.push((event.target(), event.source(), event.event().0));
-                    })
-                )
+                #A SourceA Meter(1)
+                --
+            #B SourceB Meter(10)
+                --
+                Listener
+                watch_component(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
+                    log.local.push((event.target(), event.source(), event.event().0));
+                })
             ]
         })
         .unwrap();
@@ -292,7 +291,7 @@ fn watcher_spawned_during_update_uses_pre_registered_publisher() {
 
     app.add_systems(Update, spawn_dynamic_listener.run_if(run_once));
     settle(&mut app);
-    assert!(app.world().resource::<Log>().local.is_empty());
+    assert_eq!(app.world().resource::<Log>().local.len(), 0);
 
     app.world_mut()
         .resource_mut::<Counter>()
@@ -362,11 +361,10 @@ fn watch_component_requires_app_time_registration() {
 
     let Err(error) = app.world_mut().spawn_scene(bsn! {
         Children [
-            (#A SourceA Meter(1)),
-            (
-                Listener
-                watch_component(#A, |_: Reaction<Meter>| {})
-            )
+            #A SourceA Meter(1)
+            --
+            Listener
+            watch_component(#A, |_: Reaction<Meter>| {})
         ]
     }) else {
         panic!("unregistered component watch unexpectedly resolved");

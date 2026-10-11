@@ -12,9 +12,9 @@ pub mod reactivity;
 pub mod subscription;
 
 pub use reactivity::{
-    Reaction, ReactiveAppExt, ReactiveSet, ValueChanged, WatchResource, watch_component,
-    watch_resource,
+    Reaction, ReactiveAppExt, ReactiveSet, ValueChanged, Watch, watch_component, watch_resource,
 };
 pub use subscription::{
-    SubscribedTo, Subscribers, Subscription, SubscriptionAppExt, SubscriptionEvent, subscribe_to,
+    Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt, SubscriptionEvent,
+    subscribe_to,
 };

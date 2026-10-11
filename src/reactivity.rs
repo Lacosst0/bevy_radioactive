@@ -7,55 +7,31 @@ use std::{
 
 use bevy::{
     ecs::{
-        bundle::Bundle,
         entity_disabling::Disabled,
         event::{EntityEvent, EntityTrigger, Event},
-        query::{Allow, Changed as BevyChanged, Without},
+        query::Allow,
         resource::IsResource,
         system::IntoObserverSystem,
         template::{EntityTemplate, Template, TemplateContext},
     },
-    platform::collections::HashSet,
+    platform::collections::HashMap,
     prelude::*,
-    scene::{ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
 
-use crate::subscription::{
-    SubscribedTo, Subscription, SubscriptionEvent, ensure_subscription_source_available,
-    install_subscription,
-};
+use crate::subscription::{Subscribe, Subscription, SubscriptionEvent};
 
-type ObserverMarker<E, B, M> = fn() -> (E, B, M);
+/// BSN template returned by [`watch_resource`] and [`watch_component`].
+pub type Watch<T, S, I, M> = Subscribe<ValueChanged<T>, S, I, M>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceKind {
     Component,
     Resource,
 }
 
+/// Tracked types and whether each is tracked as a component or a resource.
 #[derive(Default, Resource)]
-struct ReactiveRegistry {
-    sources: HashSet<(TypeId, SourceKind)>,
-}
-
-impl ReactiveRegistry {
-    fn register<T: 'static>(&mut self, kind: SourceKind) -> bool {
-        let opposite = match kind {
-            SourceKind::Component => SourceKind::Resource,
-            SourceKind::Resource => SourceKind::Component,
-        };
-        assert!(
-            !self.contains::<T>(opposite),
-            "`{}` cannot be tracked as both a resource and a component; use distinct wrapper types",
-            type_name::<T>(),
-        );
-        self.sources.insert((TypeId::of::<T>(), kind))
-    }
-
-    fn contains<T: 'static>(&self, kind: SourceKind) -> bool {
-        self.sources.contains(&(TypeId::of::<T>(), kind))
-    }
-}
+struct ReactiveRegistry(HashMap<TypeId, SourceKind>);
 
 /// Scheduling set containing change publishers installed by this crate.
 ///
@@ -71,19 +47,15 @@ pub enum ReactiveSet {
 /// A snapshot published after a component or resource is inserted or mutably
 /// dereferenced.
 ///
-/// The event targets the entity that owns the value. For a resource, that is
-/// Bevy 0.19's singleton resource entity. Global observers receive this event
-/// once; BSN watchers receive a separate, source-preserving [`Subscription`].
+/// The event targets the entity that owns the value; for a resource, that is
+/// its singleton resource entity. Global observers receive this event once;
+/// BSN watchers receive a separate, source-preserving [`Subscription`].
 pub struct ValueChanged<T: Component> {
     source: Entity,
     value: Arc<T>,
 }
 
 impl<T: Component> ValueChanged<T> {
-    fn new(source: Entity, value: Arc<T>) -> Self {
-        Self { source, value }
-    }
-
     /// Returns the entity that owns the changed value.
     #[must_use]
     pub fn source(&self) -> Entity {
@@ -115,8 +87,8 @@ impl<T: Component> Clone for ValueChanged<T> {
 impl<T: Component> Deref for ValueChanged<T> {
     type Target = T;
 
-    fn deref(&self) -> &Self::Target {
-        self.value()
+    fn deref(&self) -> &T {
+        &self.value
     }
 }
 
@@ -132,10 +104,10 @@ impl<T: Component> EntityEvent for ValueChanged<T> {
 
 /// Observer input used by [`watch_resource`] and [`watch_component`].
 ///
-/// It dereferences through [`ValueChanged`] to the captured `T`. Use
-/// [`Subscription::target`] for the watching entity and
-/// [`Subscription::source`] for the entity that owns `T`.
-pub type Reaction<'w, 't, T, B = ()> = Subscription<'w, 't, ValueChanged<T>, B>;
+/// Dereferences through [`ValueChanged`] to the captured `T`. Use
+/// `target()` for the watching entity and `source()` for the entity that
+/// owns `T`.
+pub type Reaction<'w, 't, T> = Subscription<'w, 't, ValueChanged<T>>;
 
 /// App construction helpers for registering reactive value publishers.
 ///
@@ -144,325 +116,196 @@ pub type Reaction<'w, 't, T, B = ()> = Subscription<'w, 't, ValueChanged<T>, B>;
 pub trait ReactiveAppExt {
     /// Publishes changes to resource `T` from its singleton resource entity.
     ///
-    /// This uses `Res<T>` change ticks, so the unchanged-frame check is O(1).
-    /// Insertion counts as a change, as does mutable dereferencing. Prefer
-    /// Bevy's `set_if_neq` and `insert_resource_if_neq` APIs to suppress no-op
+    /// Insertion and mutable dereferencing count as changes. Prefer Bevy's
+    /// `set_if_neq` and `insert_resource_if_neq` to suppress no-op
     /// notifications.
-    fn track_resource<T>(&mut self) -> &mut Self
-    where
-        T: Resource + Clone;
+    fn track_resource<T: Resource + Clone>(&mut self) -> &mut Self;
 
     /// Publishes changes to ordinary component `T` instances.
     ///
     /// Resource entities are excluded. This uses Bevy's non-archetypal
     /// `Changed<T>` filter and should be reserved for presentation-scale work.
-    /// A type cannot be tracked as both a resource and an ordinary component;
-    /// use distinct wrapper types when both storage roles are needed.
-    fn track_component<T>(&mut self) -> &mut Self
-    where
-        T: Component + Clone;
+    /// A type cannot be tracked as both a resource and a component; use
+    /// distinct wrapper types when both storage roles are needed.
+    fn track_component<T: Component + Clone>(&mut self) -> &mut Self;
 
-    /// Registers resource tracking and adds one global observer.
-    fn observe_resource<T, B, M, I>(&mut self, observer: I) -> &mut Self
-    where
-        T: Resource + Clone,
-        B: Bundle,
-        I: IntoObserverSystem<ValueChanged<T>, B, M>;
+    /// Tracks resource `T` and adds one global observer.
+    fn observe_resource<T: Resource + Clone, M>(
+        &mut self,
+        observer: impl IntoObserverSystem<ValueChanged<T>, M>,
+    ) -> &mut Self;
 
-    /// Registers component tracking and adds one global observer.
-    fn observe_component<T, B, M, I>(&mut self, observer: I) -> &mut Self
-    where
-        T: Component + Clone,
-        B: Bundle,
-        I: IntoObserverSystem<ValueChanged<T>, B, M>;
+    /// Tracks component `T` and adds one global observer.
+    fn observe_component<T: Component + Clone, M>(
+        &mut self,
+        observer: impl IntoObserverSystem<ValueChanged<T>, M>,
+    ) -> &mut Self;
 }
 
 impl ReactiveAppExt for App {
-    fn track_resource<T>(&mut self) -> &mut Self
-    where
-        T: Resource + Clone,
-    {
-        if register_source::<T>(self.world_mut(), SourceKind::Resource) {
-            self.add_systems(
-                Last,
-                publish_resource_changes::<T>.in_set(ReactiveSet::Publish),
-            );
+    fn track_resource<T: Resource + Clone>(&mut self) -> &mut Self {
+        if register::<T>(self.world_mut(), SourceKind::Resource) {
+            self.add_systems(Last, publish_resource::<T>.in_set(ReactiveSet::Publish));
         }
         self
     }
 
-    fn track_component<T>(&mut self) -> &mut Self
-    where
-        T: Component + Clone,
-    {
-        if register_source::<T>(self.world_mut(), SourceKind::Component) {
-            self.add_systems(
-                Last,
-                publish_component_changes::<T>.in_set(ReactiveSet::Publish),
-            );
+    fn track_component<T: Component + Clone>(&mut self) -> &mut Self {
+        if register::<T>(self.world_mut(), SourceKind::Component) {
+            self.add_systems(Last, publish_components::<T>.in_set(ReactiveSet::Publish));
         }
         self
     }
 
-    fn observe_resource<T, B, M, I>(&mut self, observer: I) -> &mut Self
-    where
-        T: Resource + Clone,
-        B: Bundle,
-        I: IntoObserverSystem<ValueChanged<T>, B, M>,
-    {
+    fn observe_resource<T: Resource + Clone, M>(
+        &mut self,
+        observer: impl IntoObserverSystem<ValueChanged<T>, M>,
+    ) -> &mut Self {
         self.track_resource::<T>().add_observer(observer)
     }
 
-    fn observe_component<T, B, M, I>(&mut self, observer: I) -> &mut Self
-    where
-        T: Component + Clone,
-        B: Bundle,
-        I: IntoObserverSystem<ValueChanged<T>, B, M>,
-    {
+    fn observe_component<T: Component + Clone, M>(
+        &mut self,
+        observer: impl IntoObserverSystem<ValueChanged<T>, M>,
+    ) -> &mut Self {
         self.track_component::<T>().add_observer(observer)
     }
 }
 
-fn register_source<T: 'static>(world: &mut World, kind: SourceKind) -> bool {
+/// Registers `T` as `kind`, returning `true` the first time.
+fn register<T: 'static>(world: &mut World, kind: SourceKind) -> bool {
     world.init_resource::<ReactiveRegistry>();
-    world.resource_mut::<ReactiveRegistry>().register::<T>(kind)
+    let Some(existing) = world
+        .resource_mut::<ReactiveRegistry>()
+        .0
+        .insert(TypeId::of::<T>(), kind)
+    else {
+        return true;
+    };
+    assert!(
+        existing == kind,
+        "`{}` cannot be tracked as both a resource and a component; use distinct wrapper types",
+        type_name::<T>(),
+    );
+    false
 }
 
-fn source_is_registered<T: 'static>(world: &World, kind: SourceKind) -> bool {
-    world
-        .get_resource::<ReactiveRegistry>()
-        .is_some_and(|registry| registry.contains::<T>(kind))
+fn ensure_tracked<T: 'static>(context: &mut TemplateContext, kind: SourceKind) -> Result {
+    let tracked = context.entity.world_scope(|world| {
+        world
+            .get_resource::<ReactiveRegistry>()
+            .and_then(|registry| registry.0.get(&TypeId::of::<T>()))
+            == Some(&kind)
+    });
+    if tracked {
+        return Ok(());
+    }
+    let (noun, method) = match kind {
+        SourceKind::Component => ("component", "track_component"),
+        SourceKind::Resource => ("resource", "track_resource"),
+    };
+    Err(format!(
+        "{noun} `{0}` is not tracked; call `app.{method}::<{0}>()` during app construction",
+        type_name::<T>(),
+    )
+    .into())
 }
 
-fn publish_resource_changes<T>(
+fn publish_resource<T: Resource + Clone>(
     value: Option<Res<T>>,
     sources: Query<Entity, (With<T>, With<IsResource>, Allow<Disabled>)>,
     mut commands: Commands,
-) where
-    T: Resource + Clone,
-{
-    let Some(value) = value else {
-        return;
-    };
-    if !value.is_changed() {
-        return;
+) {
+    if let Some(value) = value.filter(Res::is_changed)
+        && let Ok(source) = sources.single()
+    {
+        commands.trigger(ValueChanged {
+            source,
+            value: Arc::new(value.clone()),
+        });
     }
-    let Ok(source) = sources.single() else {
-        return;
-    };
-
-    commands.trigger(ValueChanged::new(source, Arc::new(value.as_ref().clone())));
 }
 
-fn publish_component_changes<T>(
-    values: Query<(Entity, &T), (BevyChanged<T>, Without<IsResource>, Allow<Disabled>)>,
+fn publish_components<T: Component + Clone>(
+    values: Query<(Entity, &T), (Changed<T>, Without<IsResource>, Allow<Disabled>)>,
     mut commands: Commands,
-) where
-    T: Component + Clone,
-{
+) {
     for (source, value) in &values {
-        commands.trigger(ValueChanged::new(source, Arc::new(value.clone())));
+        commands.trigger(ValueChanged {
+            source,
+            value: Arc::new(value.clone()),
+        });
     }
 }
 
-/// BSN template returned by [`watch_resource`].
-pub struct WatchResource<T, B, M, I>
-where
-    T: Resource + Clone,
-    B: Bundle,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M>,
-{
-    observer: I,
-    marker: PhantomData<ObserverMarker<T, B, M>>,
-}
+/// Resolves to the singleton entity of tracked resource `T`.
+pub struct ResourceSource<T>(PhantomData<fn() -> T>);
 
-impl<T, B, M, I> Template for WatchResource<T, B, M, I>
-where
-    T: Resource + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone,
-{
-    type Output = ();
+impl<T: Resource> Template for ResourceSource<T> {
+    type Output = Entity;
 
-    fn build_template(&self, context: &mut TemplateContext) -> bevy::ecs::error::Result<()> {
-        let registered = context
-            .entity
-            .world_scope(|world| source_is_registered::<T>(world, SourceKind::Resource));
-        if !registered {
-            return Err(format!(
-                "resource `{}` is not tracked; call `app.track_resource::<{}>()` during app construction",
-                type_name::<T>(),
-                type_name::<T>(),
-            )
-            .into());
-        }
-
+    fn build_template(&self, context: &mut TemplateContext) -> Result<Entity> {
+        ensure_tracked::<T>(context, SourceKind::Resource)?;
         let exists = context
             .entity
             .world_scope(|world| world.contains_resource::<T>());
-        if !exists {
-            return Err(format!(
-                "resource `{}` must exist before resolving `watch_resource(...)`",
-                type_name::<T>(),
-            )
-            .into());
-        }
-
-        let Some(source) = context.resource_entity::<T>() else {
-            return Err(format!(
-                "resource `{}` must exist before resolving `watch_resource(...)`",
-                type_name::<T>(),
-            )
-            .into());
-        };
-
-        let insert_relationship =
-            ensure_subscription_source_available::<ValueChanged<T>>(context, source)?;
         context
-            .entity
-            .world_scope(install_subscription::<ValueChanged<T>>);
-        if insert_relationship {
-            context
-                .entity
-                .insert(SubscribedTo::<ValueChanged<T>>::new(source));
-        }
-        context.entity.observe(self.observer.clone());
-        Ok(())
+            .resource_entity::<T>()
+            .filter(|_| exists)
+            .ok_or_else(|| {
+                format!(
+                    "resource `{}` must exist before resolving `watch_resource(...)`",
+                    type_name::<T>(),
+                )
+                .into()
+            })
     }
 
     fn clone_template(&self) -> Self {
-        Self {
-            observer: self.observer.clone(),
-            marker: PhantomData,
-        }
+        Self(PhantomData)
     }
 }
 
-impl<T, B, M, I> Scene for WatchResource<T, B, M, I>
-where
-    T: Resource + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone + Send + Sync,
-{
-    fn resolve(
-        self,
-        _context: &mut ResolveContext,
-        scene: &mut ResolvedScene,
-    ) -> Result<(), ResolveSceneError> {
-        scene.push_bundle_template(self);
-        Ok(())
+/// Resolves to a scene entity whose tracked component `T` is watched.
+pub struct ComponentSource<T>(EntityTemplate, PhantomData<fn() -> T>);
+
+impl<T: Component> Template for ComponentSource<T> {
+    type Output = Entity;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<Entity> {
+        ensure_tracked::<T>(context, SourceKind::Component)?;
+        self.0.build_template(context)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self(self.0.clone_template(), PhantomData)
     }
 }
 
 /// Watches resource `T` from the current BSN entity.
 ///
 /// Call [`ReactiveAppExt::track_resource`] during app construction and ensure
-/// the resource exists before this scene resolves. The helper does not replay
-/// current state to late listeners: initialize the node from `Res<T>` when
-/// building the scene, then use the reaction for later changes.
-pub fn watch_resource<T, B, M, I>(observer: I) -> WatchResource<T, B, M, I>
+/// the resource exists before this scene resolves. Current state is not
+/// replayed: initialize the node from `Res<T>`, then react to later changes.
+pub fn watch_resource<T, I, M>(observer: I) -> Watch<T, ResourceSource<T>, I, M>
 where
     T: Resource + Clone,
-    B: Bundle,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M>,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, M>,
 {
-    WatchResource {
-        observer,
-        marker: PhantomData,
-    }
-}
-
-struct WatchComponent<T, B, M, I>
-where
-    T: Component + Clone,
-    B: Bundle,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M>,
-{
-    source: EntityTemplate,
-    observer: I,
-    marker: PhantomData<ObserverMarker<T, B, M>>,
-}
-
-impl<T, B, M, I> Template for WatchComponent<T, B, M, I>
-where
-    T: Component + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone,
-{
-    type Output = ();
-
-    fn build_template(&self, context: &mut TemplateContext) -> bevy::ecs::error::Result<()> {
-        let registered = context
-            .entity
-            .world_scope(|world| source_is_registered::<T>(world, SourceKind::Component));
-        if !registered {
-            return Err(format!(
-                "component `{}` is not tracked; call `app.track_component::<{}>()` during app construction",
-                type_name::<T>(),
-                type_name::<T>(),
-            )
-            .into());
-        }
-
-        let source = self.source.build_template(context)?;
-        let insert_relationship =
-            ensure_subscription_source_available::<ValueChanged<T>>(context, source)?;
-        context
-            .entity
-            .world_scope(install_subscription::<ValueChanged<T>>);
-        if insert_relationship {
-            context
-                .entity
-                .insert(SubscribedTo::<ValueChanged<T>>::new(source));
-        }
-        context.entity.observe(self.observer.clone());
-        Ok(())
-    }
-
-    fn clone_template(&self) -> Self {
-        Self {
-            source: self.source.clone_template(),
-            observer: self.observer.clone(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<T, B, M, I> Scene for WatchComponent<T, B, M, I>
-where
-    T: Component + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone + Send + Sync,
-{
-    fn resolve(
-        self,
-        _context: &mut ResolveContext,
-        scene: &mut ResolvedScene,
-    ) -> Result<(), ResolveSceneError> {
-        scene.push_bundle_template(self);
-        Ok(())
-    }
+    Subscribe::new(ResourceSource::<T>(PhantomData), observer)
 }
 
 /// Watches component `T` on `source` from the current BSN entity.
 ///
-/// Call [`ReactiveAppExt::track_component`] during app construction. Unlike
-/// resource watching, the source is resolved through the scene's entity
-/// references and may be created by the same BSN scene.
-pub fn watch_component<T, B, M, I>(source: EntityTemplate, observer: I) -> impl Scene
+/// Call [`ReactiveAppExt::track_component`] during app construction. The
+/// source may be created by the same BSN scene.
+pub fn watch_component<T, I, M>(
+    source: EntityTemplate,
+    observer: I,
+) -> Watch<T, ComponentSource<T>, I, M>
 where
     T: Component + Clone,
-    B: Bundle,
-    M: 'static,
-    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, B, M> + Clone + Send + Sync + 'static,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, M>,
 {
-    WatchComponent {
-        source,
-        observer,
-        marker: PhantomData,
-    }
+    Subscribe::new(ComponentSource::<T>(source, PhantomData), observer)
 }

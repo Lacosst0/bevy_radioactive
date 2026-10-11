@@ -19,13 +19,12 @@ fn main() {
         .spawn_scene(bsn! {
             Name::new("subscription-root")
             Children[
-                (#Slider Slider),
-                (
-                    Name::new("subscribed label")
-                    subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>, mut received: ResMut<Received>| {
-                        received.0 = Some((event.target(), event.source(), event.value));
-                    })
-                )
+                #Slider Slider
+                --
+                Name::new("subscribed label")
+                subscribe_to(#Slider, |event: Subscription<ValueChange<f32>>, mut received: ResMut<Received>| {
+                    received.0 = Some((event.target(), event.source(), event.value));
+                })
             ]
         })
         .unwrap()

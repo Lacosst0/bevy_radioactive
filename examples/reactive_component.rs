@@ -12,18 +12,17 @@ fn main() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                (#Meter Meter(1)),
-                (
-                    Name::new("meter-listener")
-                    watch_component(#Meter, |event: Reaction<Meter>| {
-                        println!(
-                            "listener {:?} saw source {:?} change to {}",
-                            event.target(),
-                            event.source(),
-                            event.0,
-                        );
-                    })
-                )
+                #Meter Meter(1)
+                --
+                Name::new("meter-listener")
+                watch_component(#Meter, |event: Reaction<Meter>| {
+                    println!(
+                        "listener {:?} saw source {:?} change to {}",
+                        event.target(),
+                        event.source(),
+                        event.0,
+                    );
+                })
             ]
         })
         .unwrap();
