@@ -13,7 +13,9 @@ unified. Event subscriptions now support multiple sources per listener.
 | publishers in `Last` | runtime in `PostUpdate`, before UI layout |
 
 New: `bind`, `bind_or`, `on_removed`, `ValueRemoved<T>`, `Removal<T>`,
-`RadioactivePlugin`, `ReactiveSettings`, and the `webby` module.
+`RadioactivePlugin`, `ReactiveSettings`, the `webby` module (React-style components and
+hooks), and the `coat` module (`coat!` templates and signals, in the new
+`bevy_radioactive_macros` crate).
 
 Behavior changes:
 
@@ -25,7 +27,8 @@ Behavior changes:
 - BSN helpers place each subscription on an internal entity linked to the listener by
   `SubscriptionOf`. `SubscriptionEvent::target()` still reports the listener;
   `Subscription::observer()` now reports the internal subscription entity's observer.
-- Missing-registration errors now mention `app.track::<T>()`.
+- `app.track::<T>()` is optional: `watch`, `bind` and `on_removed` track their type on
+  first use. Without `RadioactivePlugin` they report a scene error naming the plugin.
 
 # Migrating from 0.1 to 0.2
 

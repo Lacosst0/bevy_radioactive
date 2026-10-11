@@ -80,7 +80,7 @@ impl Plugin for RadioactivePlugin {
             .init_resource::<PublishCounter>()
             .init_schedule(ReactivePublish)
             .add_systems(PostUpdate, run_reactive.in_set(ReactiveSet::Publish));
-        crate::webby::init(app.world_mut());
+        crate::runtime::init(app.world_mut());
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
@@ -89,9 +89,39 @@ impl Plugin for RadioactivePlugin {
     }
 }
 
-/// Tracked value types.
+/// Tracked value types, and publishers waiting to be added to
+/// [`ReactivePublish`] at the start of the next pass.
 #[derive(Default, Resource)]
-struct ReactiveRegistry(HashSet<TypeId>);
+struct ReactiveRegistry {
+    tracked: HashSet<TypeId>,
+    pending: Vec<fn(&mut Schedule)>,
+}
+
+/// Registers `T` once. Safe at any time, including while scenes spawn
+/// during a reactive pass: the publisher joins the schedule between passes.
+fn register<T: Component + Clone>(world: &mut World) {
+    let mut registry = world.resource_mut::<ReactiveRegistry>();
+    if !registry.tracked.insert(TypeId::of::<T>()) {
+        return;
+    }
+    registry.pending.push(|schedule| {
+        schedule.add_systems(publish::<T>);
+    });
+    install_subscription::<ValueChanged<T>>(world);
+    register_routed::<ValueRemoved<T>>(world);
+    world.add_observer(publish_removed::<T>);
+}
+
+fn add_pending_publishers(world: &mut World) {
+    let pending = std::mem::take(&mut world.resource_mut::<ReactiveRegistry>().pending);
+    if !pending.is_empty() {
+        world.schedule_scope(ReactivePublish, |_, schedule| {
+            for add in pending {
+                add(schedule);
+            }
+        });
+    }
+}
 
 /// Counts publications in the current pass.
 #[derive(Default, Resource)]
@@ -100,6 +130,7 @@ struct PublishCounter(AtomicUsize);
 fn run_reactive(world: &mut World) {
     let max_passes = world.resource::<ReactiveSettings>().max_passes.max(1);
     for _ in 0..max_passes {
+        add_pending_publishers(world);
         world
             .resource::<PublishCounter>()
             .0
@@ -107,7 +138,7 @@ fn run_reactive(world: &mut World) {
         let _ = world.try_run_schedule(ReactivePublish);
         world.flush();
         let published = world.resource::<PublishCounter>().0.load(Ordering::Relaxed);
-        let ran = crate::webby::run_effects(world);
+        let ran = crate::runtime::run_effects(world);
         if published == 0 && ran == 0 {
             return;
         }
@@ -229,6 +260,10 @@ pub trait ReactiveAppExt {
     /// Insertion and mutable dereferencing count as changes. Prefer Bevy's
     /// `set_if_neq` to suppress no-op notifications. Registration is
     /// idempotent and adds [`RadioactivePlugin`] if needed.
+    ///
+    /// Optional for scenes: [`watch`], [`bind`] and [`on_removed`] track their
+    /// type on first use. Call it for types only observed globally, or to
+    /// register everything up front.
     fn track<T: Component + Clone>(&mut self) -> &mut Self;
 
     /// Tracks `T` and adds one global [`ValueChanged`] observer.
@@ -243,17 +278,7 @@ impl ReactiveAppExt for App {
         if !self.is_plugin_added::<RadioactivePlugin>() {
             self.add_plugins(RadioactivePlugin);
         }
-        if self
-            .world_mut()
-            .resource_mut::<ReactiveRegistry>()
-            .0
-            .insert(TypeId::of::<T>())
-        {
-            install_subscription::<ValueChanged<T>>(self.world_mut());
-            register_routed::<ValueRemoved<T>>(self.world_mut());
-            self.add_systems(ReactivePublish, publish::<T>)
-                .add_observer(publish_removed::<T>);
-        }
+        register::<T>(self.world_mut());
         self
     }
 
@@ -265,20 +290,19 @@ impl ReactiveAppExt for App {
     }
 }
 
-fn ensure_tracked<T: 'static>(context: &mut TemplateContext) -> Result {
-    let tracked = context.entity.world_scope(|world| {
-        world
-            .get_resource::<ReactiveRegistry>()
-            .is_some_and(|registry| registry.0.contains(&TypeId::of::<T>()))
-    });
-    if tracked {
-        return Ok(());
-    }
-    Err(format!(
-        "`{0}` is not tracked; call `app.track::<{0}>()` during app construction",
-        type_name::<T>(),
-    )
-    .into())
+/// Tracks `T` on first use, so scenes need no app-time `track` call.
+fn ensure_tracked<T: Component + Clone>(context: &mut TemplateContext) -> Result {
+    context.entity.world_scope(|world| {
+        if !world.contains_resource::<ReactiveRegistry>() {
+            return Err(format!(
+                "watching `{}` needs the reactive runtime; add `RadioactivePlugin` to the app",
+                type_name::<T>(),
+            )
+            .into());
+        }
+        register::<T>(world);
+        Ok(())
+    })
 }
 
 #[expect(

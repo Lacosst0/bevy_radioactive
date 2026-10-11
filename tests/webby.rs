@@ -1,27 +1,36 @@
-//! Integration coverage for automatically tracked `webby` effects.
+//! Integration coverage for React-style `webby` components.
 
-use bevy::{
-    asset::AssetPlugin, ecs::relationship::RelationshipTarget, prelude::*, scene::ScenePlugin,
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
-use bevy_radioactive::{RadioactivePlugin, webby::*};
 
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Health(u32);
+use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
+use bevy_radioactive::{
+    RadioactivePlugin,
+    webby::{Cx, SetState, Signal, component, keyed},
+};
 
 #[derive(Resource, Clone, Debug, Default, PartialEq)]
-struct Items(Vec<(u32, &'static str)>);
+struct Title(String);
 
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Low(bool);
+#[derive(Resource, Clone, Default)]
+struct Setter(Option<SetState<i32>>);
 
-#[derive(Component, Clone, Copy, Default)]
-struct Label;
+#[derive(Resource, Clone, Default)]
+struct Order(Vec<u32>);
 
-#[derive(Component, Clone, Copy, Default)]
-struct List;
+#[derive(Resource, Default)]
+struct Renders(Arc<AtomicUsize>);
 
-#[derive(Component, Clone, Copy, Default)]
-struct Row(u32);
+#[derive(Resource, Default)]
+struct Memos(Arc<AtomicUsize>);
+
+#[derive(Component, Clone, Default)]
+struct Label(u32);
+
+#[derive(Component, Clone, Copy, Default, PartialEq)]
+struct Health(u32);
 
 fn app() -> App {
     let mut app = App::new();
@@ -31,152 +40,250 @@ fn app() -> App {
         ScenePlugin,
         RadioactivePlugin,
     ))
-    .init_resource::<Items>();
+    .init_resource::<Title>()
+    .init_resource::<Setter>()
+    .init_resource::<Order>()
+    .init_resource::<Renders>()
+    .init_resource::<Memos>();
     app
 }
 
-fn single<T: Component>(app: &mut App) -> Entity {
-    app.world_mut()
-        .query_filtered::<Entity, With<T>>()
-        .single(app.world())
-        .unwrap()
+fn texts(app: &mut App) -> Vec<(u32, String)> {
+    let mut texts: Vec<_> = app
+        .world_mut()
+        .query::<(&Label, &Text)>()
+        .iter(app.world())
+        .map(|(label, text)| (label.0, text.0.clone()))
+        .collect();
+    texts.sort();
+    texts
 }
 
-fn label_text(app: &mut App) -> String {
-    let label = single::<Label>(app);
-    app.world().get::<Text>(label).unwrap().0.clone()
+#[component]
+fn counter(cx: &Cx, id: u32) -> impl Scene {
+    let (count, set_count) = cx.use_state(|| 0);
+    cx.use_effect((), move |(), commands| {
+        if id == 0 {
+            commands.insert_resource(Setter(Some(set_count.clone())));
+        }
+    });
+    bsn! { Label({id}) Text({format!("count {count}")}) }
 }
 
 #[test]
-fn text_and_prop_render_immediately_and_follow_changes() {
+fn use_state_setter_rerenders() {
+    let mut app = app();
+    app.world_mut().spawn_scene(bsn! { @counter(0) }).unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(0, "count 0".into())]);
+
+    let setter = app.world().resource::<Setter>().0.clone().unwrap();
+    setter(2);
+    app.update();
+    assert_eq!(texts(&mut app), vec![(0, "count 2".into())]);
+}
+
+#[component]
+fn titled(cx: &Cx) -> impl Scene {
+    let title = cx.use_resource::<Title>().unwrap_or_default().0;
+    cx.untracked()
+        .resource::<Renders>()
+        .0
+        .fetch_add(1, Ordering::Relaxed);
+    bsn! {
+        Node
+        Children [
+            Label(99) Text({title})
+            --
+            @counter(0)
+        ]
+    }
+}
+
+#[test]
+fn resource_reads_rerender_and_child_state_survives() {
+    let mut app = app();
+    app.world_mut().spawn_scene(bsn! { @titled() }).unwrap();
+    app.update();
+    app.update();
+    assert_eq!(
+        app.world().resource::<Renders>().0.load(Ordering::Relaxed),
+        1
+    );
+
+    let setter = app.world().resource::<Setter>().0.clone().unwrap();
+    setter(7);
+    app.update();
+    app.world_mut().resource_mut::<Title>().0 = "Hello".into();
+    app.update();
+    assert_eq!(
+        app.world().resource::<Renders>().0.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        texts(&mut app),
+        vec![(0, "count 7".into()), (99, "Hello".into())]
+    );
+}
+
+#[component]
+fn title_length(cx: &Cx) -> impl Scene {
+    let title = cx.use_resource::<Title>().unwrap_or_default().0;
+    let probe = cx.untracked().resource::<Memos>().0.clone();
+    let length = cx.use_memo(title.len(), move |len| {
+        probe.fetch_add(1, Ordering::Relaxed);
+        *len
+    });
+    bsn! { Label(1) Text({length.to_string()}) }
+}
+
+#[test]
+fn use_memo_recomputes_only_when_deps_change() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(bsn! { @title_length() })
+        .unwrap();
+    app.update();
+    app.world_mut().resource_mut::<Title>().0 = "ab".into();
+    app.update();
+    app.world_mut().resource_mut::<Title>().0 = "cd".into();
+    app.update();
+    assert_eq!(app.world().resource::<Memos>().0.load(Ordering::Relaxed), 2);
+    assert_eq!(texts(&mut app), vec![(1, "2".into())]);
+}
+
+#[component]
+fn provider(cx: &Cx, value: &'static str) -> impl Scene {
+    cx.provide_context(Signal::new(String::from(value)));
+    bsn! { @consumer() }
+}
+
+#[component]
+fn consumer(cx: &Cx) -> impl Scene {
+    let value = cx
+        .use_context::<Signal<String>>()
+        .map(|signal| signal.get())
+        .unwrap_or_default();
+    bsn! { Label(3) Text({value}) }
+}
+
+#[test]
+fn context_reaches_descendants() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(bsn! { @provider("ctx") })
+        .unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(3, "ctx".into())]);
+}
+
+#[component]
+fn keyed_row(cx: &Cx, id: u32) -> impl Scene {
+    let (initial, _) = cx.use_state(|| id * 10);
+    bsn! { Label({id}) Text({initial.to_string()}) }
+}
+
+#[component]
+fn keyed_list(cx: &Cx) -> impl Scene {
+    let rows = cx
+        .use_resource::<Order>()
+        .unwrap_or_default()
+        .0
+        .into_iter()
+        .map(|id| keyed_row(id).key(id))
+        .collect::<Vec<_>>();
+    bsn! { Node Children [ {rows} ] }
+}
+
+#[test]
+fn keyed_children_keep_state_when_reordered() {
+    let mut app = app();
+    app.world_mut().resource_mut::<Order>().0 = vec![1, 2];
+    app.world_mut().spawn_scene(bsn! { @keyed_list() }).unwrap();
+    app.update();
+    app.world_mut().resource_mut::<Order>().0 = vec![2, 1, 3];
+    app.update();
+    assert_eq!(
+        texts(&mut app),
+        vec![(1, "10".into()), (2, "20".into()), (3, "30".into())]
+    );
+}
+
+#[component]
+fn health_label(cx: &Cx, player: Entity) -> impl Scene {
+    let hp = cx.use_component::<Health>(player).map_or(0, |hp| hp.0);
+    bsn! { Label(5) Text({format!("HP {hp}")}) }
+}
+
+#[test]
+fn entity_props_take_scene_references() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(bsn! {
+            Node
             Children [
                 #Player Health(100)
                 --
-                Label
-                Text("")
-                text(#Player, |cx, player| format!("HP {}", cx.get::<Health>(player).map_or(0, |hp| hp.0)))
-                prop(#Player, |cx, player| Low(cx.get::<Health>(player).is_some_and(|hp| hp.0 < 30)))
+                @health_label(#Player)
+                --
+                @keyed(7, keyed_row(7))
             ]
         })
         .unwrap();
-    app.update();
-    assert_eq!(label_text(&mut app), "HP 100");
-
-    let player = single::<Health>(&mut app);
-    app.world_mut().get_mut::<Health>(player).unwrap().0 = 20;
-    app.update();
-    assert_eq!(label_text(&mut app), "HP 20");
-    let label = single::<Label>(&mut app);
-    assert_eq!(app.world().get::<Low>(label), Some(&Low(true)));
-
-    app.world_mut().entity_mut(player).remove::<Health>();
-    app.update();
-    assert_eq!(label_text(&mut app), "HP 0");
-}
-
-#[test]
-fn effects_without_changes_do_not_rerun() {
-    let mut app = app();
-    app.world_mut()
-        .spawn_scene(bsn! {
-            Label
-            Text("")
-            text((), |cx, ()| format!("{}", cx.resource::<Items>().map_or(0, |i| i.0.len())))
-        })
-        .unwrap();
-    app.update();
-    let label = single::<Label>(&mut app);
-    let tick = app
-        .world()
-        .entity(label)
-        .get_change_ticks::<Text>()
-        .unwrap()
-        .changed;
-    app.update();
-    app.update();
-    let again = app
-        .world()
-        .entity(label)
-        .get_change_ticks::<Text>()
-        .unwrap()
-        .changed;
-    assert_eq!(tick, again);
-}
-
-#[test]
-fn each_is_keyed_and_when_toggles_children() {
-    let mut app = app();
-    app.world_mut().resource_mut::<Items>().0 = vec![(1, "a"), (2, "b")];
-    app.world_mut()
-        .spawn_scene(bsn! {
-            Children [
-                #Player Health(1)
-                --
-                List
-                each(
-                    (),
-                    |cx, ()| cx.resource::<Items>().map(|i| i.0.clone()).unwrap_or_default(),
-                    |item: &(u32, &'static str)| item.0,
-                    |item, ()| { let id = item.0; bsn! { Row({id}) } },
-                )
-                --
-                Label
-                when(#Player, |cx, player| cx.get::<Health>(player).is_none(), |_| bsn! { Row(99) })
-            ]
-        })
-        .unwrap();
-    app.update();
-
-    let rows = |app: &mut App| -> Vec<u32> {
-        let list = single::<List>(app);
-        app.world()
-            .get::<Children>(list)
-            .map(|children| {
-                children
-                    .iter()
-                    .map(|c| app.world().get::<Row>(c).unwrap().0)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    assert_eq!(rows(&mut app), vec![1, 2]);
-    let list = single::<List>(&mut app);
-    let first = app.world().get::<Children>(list).unwrap()[0];
-
-    app.world_mut().resource_mut::<Items>().0 = vec![(2, "b"), (3, "c"), (1, "a")];
-    app.update();
-    assert_eq!(rows(&mut app), vec![2, 3, 1]);
-    assert_eq!(app.world().get::<Children>(list).unwrap()[2], first);
-
-    let label = single::<Label>(&mut app);
-    assert!(
-        app.world()
-            .get::<Children>(label)
-            .is_none_or(RelationshipTarget::is_empty)
-    );
-    let player = single::<Health>(&mut app);
-    app.world_mut().despawn(player);
     app.update();
     assert_eq!(
-        app.world()
-            .get::<Children>(label)
-            .map(RelationshipTarget::len),
-        Some(1)
+        texts(&mut app),
+        vec![(5, "HP 100".into()), (7, "70".into())]
     );
+
+    let mut players = app.world_mut().query_filtered::<Entity, With<Health>>();
+    let player = players.single(app.world()).unwrap();
+    app.world_mut().get_mut::<Health>(player).unwrap().0 = 40;
+    app.update();
+    assert_eq!(texts(&mut app)[0], (5, "HP 40".into()));
 }
 
 #[test]
-fn effects_require_the_runtime() {
+fn closures_mount_as_components() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(bsn! { component(|_cx| bsn! { Label(8) Text("inline") }) })
+        .unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(8, "inline".into())]);
+}
+
+#[test]
+fn components_require_the_runtime() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin));
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Text("")
-        text((), |_, ()| "x")
-    }) else {
-        panic!("effect resolved without runtime");
+    let Err(error) = app.world_mut().spawn_scene(bsn! { @counter(1) }) else {
+        panic!("component resolved without runtime");
     };
     assert!(error.to_string().contains("RadioactivePlugin"));
+}
+
+#[derive(Resource, Clone, Default)]
+struct Dispatcher(Option<bevy_radioactive::webby::Dispatch<i32>>);
+
+#[component]
+fn reducer(cx: &Cx) -> impl Scene {
+    let (total, dispatch) = cx.use_reducer(|| 0, |total, delta: i32| total + delta);
+    cx.use_effect((), move |(), commands| {
+        commands.insert_resource(Dispatcher(Some(dispatch.clone())));
+    });
+    bsn! { Label(4) Text({total.to_string()}) }
+}
+
+#[test]
+fn use_reducer_applies_actions_to_latest_state() {
+    let mut app = app();
+    app.init_resource::<Dispatcher>();
+    app.world_mut().spawn_scene(bsn! { @reducer() }).unwrap();
+    app.update();
+    let dispatch = app.world().resource::<Dispatcher>().0.clone().unwrap();
+    dispatch(2);
+    dispatch(3);
+    app.update();
+    assert_eq!(texts(&mut app), vec![(4, "5".into())]);
 }

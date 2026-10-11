@@ -1,10 +1,23 @@
-//! A `webby` counter: the label re-renders whenever the resource it reads changes.
+//! A React-style `webby` counter, mounted with `@counter(..)`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{RadioactivePlugin, webby::text};
+use bevy_radioactive::{
+    RadioactivePlugin,
+    webby::{Cx, Dispatch, component},
+};
 
 #[derive(Resource, Default)]
-struct Clicks(u32);
+struct Increment(Option<Dispatch<u32>>);
+
+#[component]
+fn counter(cx: &Cx, label: &'static str) -> impl Scene {
+    let (count, add) = cx.use_reducer(|| 0, |count, delta: u32| count + delta);
+    let doubled = cx.use_memo(count, |count| count * 2);
+    cx.use_effect((), move |(), commands| {
+        commands.insert_resource(Increment(Some(add.clone())));
+    });
+    bsn! { Text({format!("{label}: {count} (x2 = {doubled})")}) }
+}
 
 fn main() {
     let mut app = App::new();
@@ -14,20 +27,20 @@ fn main() {
         ScenePlugin,
         RadioactivePlugin,
     ))
-    .init_resource::<Clicks>();
+    .init_resource::<Increment>();
 
-    let label = app
+    let host = app
         .world_mut()
-        .spawn_scene(bsn! {
-            Text("")
-            text((), |cx, ()| format!("clicked {} times", cx.resource::<Clicks>().map_or(0, |c| c.0)))
-        })
+        .spawn_scene(bsn! { Node @counter("clicks") })
         .unwrap()
         .id();
 
     for _ in 0..3 {
         app.update();
-        println!("{}", app.world().get::<Text>(label).unwrap().0);
-        app.world_mut().resource_mut::<Clicks>().0 += 1;
+        let child = app.world().get::<Children>(host).unwrap()[0];
+        println!("{}", app.world().get::<Text>(child).unwrap().0);
+        if let Some(increment) = &app.world().resource::<Increment>().0 {
+            increment(1);
+        }
     }
 }

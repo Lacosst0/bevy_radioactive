@@ -5,7 +5,8 @@ use bevy::{
     scene::ScenePlugin,
 };
 use bevy_radioactive::{
-    Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind, bind_or, on_removed, watch,
+    RadioactivePlugin, Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind, bind_or,
+    on_removed, watch,
 };
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,18 +319,43 @@ fn despawned_watcher_stops_receiving_changes() {
 }
 
 #[test]
-fn watch_resource_requires_app_time_registration() {
+fn watch_tracks_its_type_on_first_use() {
     let mut app = test_app();
-    app.insert_resource(Counter(1));
+    app.add_plugins(RadioactivePlugin)
+        .insert_resource(Counter(1));
 
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            watch(Singleton, record_counter)
+        })
+        .unwrap();
+    settle(&mut app);
+    // The first publisher run reports the current value once.
+    assert_eq!(app.world().resource::<Log>().local.len(), 1);
+
+    app.world_mut()
+        .resource_mut::<Counter>()
+        .set_if_neq(Counter(2));
+    settle(&mut app);
+    assert_eq!(app.world().resource::<Log>().local.len(), 2);
+    assert_eq!(app.world().resource::<Log>().local[1].2, 2);
+}
+
+#[test]
+fn watch_without_runtime_reports_the_plugin() {
+    let mut app = test_app();
     let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Listener
-        watch(Singleton, record_counter)
+        Children [
+            #A SourceA Meter(1)
+            --
+            Listener
+            watch(#A, |_: Reaction<Meter>| {})
+        ]
     }) else {
-        panic!("unregistered watch unexpectedly resolved");
+        panic!("watch unexpectedly resolved without the runtime");
     };
-
-    assert!(error.to_string().contains("app.track::<"));
+    assert!(error.to_string().contains("RadioactivePlugin"));
 }
 
 #[test]
@@ -346,24 +372,6 @@ fn watch_resource_requires_a_current_resource_value() {
     };
 
     assert!(error.to_string().contains("must exist"));
-}
-
-#[test]
-fn watch_component_requires_app_time_registration() {
-    let mut app = test_app();
-
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Children [
-            #A SourceA Meter(1)
-            --
-            Listener
-            watch(#A, |_: Reaction<Meter>| {})
-        ]
-    }) else {
-        panic!("unregistered component watch unexpectedly resolved");
-    };
-
-    assert!(error.to_string().contains("app.track::<"));
 }
 
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]

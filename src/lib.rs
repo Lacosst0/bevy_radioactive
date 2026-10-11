@@ -4,10 +4,16 @@
 
 extern crate self as bevy_radioactive;
 
+pub mod coat;
 /// Convenient imports for common reactive BSN use cases.
 pub mod prelude;
 /// Component and resource change publication plus BSN state watching.
 pub mod reactivity;
+pub(crate) mod runtime;
+#[doc(hidden)]
+pub mod macros {
+    pub use bevy_radioactive_macros::*;
+}
 /// Source-preserving entity-event subscriptions backed by relationships.
 pub mod subscription;
 pub mod webby;

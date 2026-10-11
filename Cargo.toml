@@ -12,9 +12,15 @@ categories = ["game-development", "gui"]
 [features]
 default = ["ui"]
 ## Orders the runtime before UI layout and enables `webby::text` and `webby::show`.
-ui = ["bevy/bevy_ui"]
+ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]
+## Full Bevy with Feathers, for the `comparison_*` examples.
+comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
+
+[workspace]
+members = ["macros"]
 
 [dependencies]
+bevy_radioactive_macros = { path = "macros", version = "0.4.0" }
 bevy = { version = "0.20", default-features = false, features = ["bevy_scene"] }
 
 [dev-dependencies]
@@ -27,3 +33,23 @@ bevy = { version = "0.20", default-features = false, features = [
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 type_complexity = "allow"
+
+[[example]]
+name = "comparison_reactivity"
+path = "examples/comparison/reactivity.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "comparison_subscription"
+path = "examples/comparison/subscription.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "comparison_webby"
+path = "examples/comparison/webby.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "comparison_coat"
+path = "examples/comparison/coat.rs"
+required-features = ["comparison"]
