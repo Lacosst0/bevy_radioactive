@@ -1,5 +1,5 @@
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{Reaction, ReactiveAppExt, watch_resource};
+use bevy_radioactive::{Reaction, ReactiveAppExt, Singleton, watch};
 
 #[derive(Resource, Clone, Copy, PartialEq)]
 struct Counter {
@@ -10,12 +10,12 @@ fn main() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
         .insert_resource(Counter { value: 1 })
-        .track_resource::<Counter>();
+        .track::<Counter>();
 
     app.world_mut()
         .spawn_scene(bsn! {
             Name::new("counter-listener")
-            watch_resource(|event: Reaction<Counter>| {
+            watch(Singleton, |event: Reaction<Counter>| {
                 println!("counter changed to {}", event.value);
             })
         })

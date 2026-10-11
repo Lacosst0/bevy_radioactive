@@ -179,24 +179,57 @@ fn direct_relationship_requires_app_time_registration() {
 }
 
 #[test]
-fn bsn_helper_rejects_two_sources_for_the_same_event_type() {
+fn bsn_helper_allows_two_sources_for_the_same_event_type() {
     let mut app = subscription_app();
 
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Children[
-            #A Source
-            --
-        #B Source
-            --
-            Subscriber
-            subscribe_to(#A, |_: Subscription<Ping>| {})
-            subscribe_to(#B, |_: Subscription<Ping>| {})
-        ]
-    }) else {
-        panic!("duplicate same-event subscription unexpectedly resolved");
-    };
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children[
+                #A Source
+                --
+                #B Source
+                --
+                Subscriber
+                subscribe_to(#A, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.event().source, event.value, false));
+                })
+                subscribe_to(#B, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.event().source, event.value + 100, false));
+                })
+            ]
+        })
+        .unwrap();
+    settle(&mut app);
 
-    assert!(error.to_string().contains("only one source"));
+    let listener = single_entity::<Subscriber>(app.world_mut());
+    let mut sources = app.world_mut().query_filtered::<Entity, With<Source>>();
+    let sources: Vec<Entity> = sources.iter(app.world()).collect();
+    app.world_mut().trigger(Ping {
+        source: sources[0],
+        value: 1,
+    });
+    app.world_mut().trigger(Ping {
+        source: sources[1],
+        value: 1,
+    });
+    app.world_mut().flush();
+
+    let mut values: Vec<_> = app
+        .world()
+        .resource::<Log>()
+        .0
+        .iter()
+        .map(|e| e.3)
+        .collect();
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 101]);
+    assert!(
+        app.world()
+            .resource::<Log>()
+            .0
+            .iter()
+            .all(|e| e.0 == listener)
+    );
 }
 
 #[test]

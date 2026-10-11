@@ -10,11 +10,14 @@ pub mod prelude;
 pub mod reactivity;
 /// Source-preserving entity-event subscriptions backed by relationships.
 pub mod subscription;
+pub mod webby;
 
 pub use reactivity::{
-    Reaction, ReactiveAppExt, ReactiveSet, ValueChanged, Watch, watch_component, watch_resource,
+    RadioactivePlugin, Reaction, ReactiveAppExt, ReactivePublish, ReactiveSet, ReactiveSettings,
+    Removal, Singleton, ValueChanged, ValueRemoved, Watch, WatchRemoval, bind, bind_or, on_removed,
+    watch,
 };
 pub use subscription::{
-    Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt, SubscriptionEvent,
-    subscribe_to,
+    Source, Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt,
+    SubscriptionEvent, SubscriptionOf, Subscriptions, subscribe_to,
 };

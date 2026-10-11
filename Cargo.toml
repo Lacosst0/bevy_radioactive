@@ -1,6 +1,6 @@
 [package]
 name = "bevy_radioactive"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
@@ -8,6 +8,11 @@ readme = "README.md"
 publish = false
 keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
+
+[features]
+default = ["ui"]
+## Orders the runtime before UI layout and enables `webby::text` and `webby::show`.
+ui = ["bevy/bevy_ui"]
 
 [dependencies]
 bevy = { version = "0.20", default-features = false, features = ["bevy_scene"] }
