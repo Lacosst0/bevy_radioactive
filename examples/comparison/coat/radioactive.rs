@@ -1,6 +1,8 @@
-//! Counter as a React-style `webby` component.
+//! Counter as a `coat!` template.
 //!
-//! The count is component state; every change re-renders the component.
+//! The count is a signal; only the patched `Text` updates when it changes.
+//!
+//! Plain Bevy counterpart: `coat_bevy`.
 
 use bevy::{
     feathers::{
@@ -17,7 +19,7 @@ use bevy::{
 };
 use bevy_radioactive::{
     RadioactivePlugin,
-    webby::{Cx, component},
+    coat::{coat, signal},
 };
 
 fn main() {
@@ -29,21 +31,12 @@ fn main() {
 }
 
 fn scene() -> impl SceneList {
-    bsn_list! {
-        Camera2d
-        --
-        Node { width: percent(100), height: percent(100) }
-        ThemeBackgroundColor(tokens::WINDOW_BG)
-        @counter()
-    }
+    bsn_list! { Camera2d -- @counter() }
 }
 
-#[component]
-fn counter(cx: &Cx) -> impl Scene {
-    let (count, set_count) = cx.use_state(|| 0);
-    let (minus, plus, reset) = (set_count.clone(), set_count.clone(), set_count);
-
-    bsn! {
+fn counter() -> impl Scene {
+    let count = signal(|| 0);
+    coat! {
         Node {
             width: percent(100),
             height: percent(100),
@@ -52,34 +45,34 @@ fn counter(cx: &Cx) -> impl Scene {
             justify_content: JustifyContent::Center,
             row_gap: vmin(4),
         }
+        ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
             Node { align_items: AlignItems::Center, column_gap: vmin(6) }
             Children [
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>| minus(count - 1))
+                on(move |_: On<Activate>| count.set($count - 1))
                 Children [ @caption("-1") ]
                 --
-                Text({count.to_string()})
+                Text($(format!("{}", $count)))
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>| plus(count + 1))
+                on(move |_: On<Activate>| count.set($count + 1))
                 Children [ @caption("+1") ]
             ]
             --
-            // Like `{count !== 0 && <Reset />}` in JSX.
-            {(count != 0).then(|| bsn_list! {
+            if $count != 0 {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>| reset(0))
+                on(move |_: On<Activate>| count.set(0))
                 Children [ @caption("Reset") ]
-            })}
+            }
         ]
     }
 }

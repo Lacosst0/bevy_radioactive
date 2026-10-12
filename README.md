@@ -256,6 +256,209 @@ feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
 `update`, `increment`, ...) also work inside `webby` components and `coat::effect`;
 `coat::shard(args, |args, world| scene)` re-renders a subtree when its arguments change.
 
+## Comparison with plain Bevy
+
+`examples/comparison` builds the same Feathers counter (−1, count, +1, and a Reset
+button shown while the count is not zero) once per style. Each style has its own
+folder with two standalone files: `radioactive.rs` uses `bevy_radioactive`, and
+`bevy.rs` does the same thing with plain Bevy. No file shares code with another.
+
+| Style | `bevy_radioactive` | Plain Bevy |
+| --- | --- | --- |
+| Reactivity | `reactivity_radioactive` | `reactivity_bevy` |
+| Subscriptions | `subscription_radioactive` | `subscription_bevy` |
+| `webby` | `webby_radioactive` | `webby_bevy` |
+| `coat!` | `coat_radioactive` | `coat_bevy` |
+
+```sh
+cargo run --example reactivity_radioactive --features comparison
+```
+
+The snippets below show only the parts that differ; layout and button styling are the
+same in every file.
+
+### Reactivity: `bind` vs change-detection systems
+
+The count is a `Count` resource and the buttons write it with `ResMut<Count>`.
+
+With `bevy_radioactive`, each node binds itself to the resource:
+
+```rust,ignore
+Text("0")
+bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
+--
+@FeathersButton
+bind(Singleton, |count: &Count, node: &mut Node| {
+    node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+})
+```
+
+With plain Bevy, the nodes get marker components and global systems find them:
+
+```rust,ignore
+app.add_systems(
+    Update,
+    (sync_count_label, sync_reset_button).run_if(resource_changed::<Count>),
+);
+
+fn sync_count_label(count: Res<Count>, mut labels: Query<&mut Text, With<CountLabel>>) {
+    for mut text in &mut labels {
+        **text = count.0.to_string();
+    }
+}
+
+fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<ResetButton>>) {
+    for mut node in &mut buttons {
+        node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+    }
+}
+```
+
+### Subscriptions: `subscribe_to` vs marker lookups
+
+There is no shared state: the label owns a `LabelCount` component and announces each
+new value with a `CountChanged` entity event.
+
+With `bevy_radioactive`, the label subscribes to the buttons it cares about by name,
+and the Reset button subscribes to the label:
+
+```rust,ignore
+#Label
+LabelCount(0)
+subscribe_to(#Plus, |click: Subscription<Activate>, labels: CountLabels, commands: Commands| {
+    update_count(click.target(), labels, commands, |n| n + 1);
+})
+--
+#Reset @FeathersButton
+subscribe_to(#Label, |changed: Subscription<CountChanged>, mut nodes: Query<&mut Node>| {
+    if let Ok(mut node) = nodes.get_mut(changed.target()) {
+        node.display = if changed.count != 0 { Display::Flex } else { Display::None };
+    }
+})
+```
+
+With plain Bevy, each button observes its own `Activate` and finds the label by a
+marker; the label observes its own `CountChanged` and finds the Reset button the same
+way:
+
+```rust,ignore
+@FeathersButton
+on(|_: On<Activate>, labels: CountLabels, commands: Commands| {
+    update_count(labels, commands, |n| n + 1);
+})
+--
+CountLabel
+LabelCount(0)
+on(|changed: On<CountChanged>, mut resets: Query<&mut Node, With<ResetButton>>| {
+    for mut node in &mut resets {
+        node.display = if changed.count != 0 { Display::Flex } else { Display::None };
+    }
+})
+```
+
+### `webby`: component state vs a re-render system
+
+The count is local to the counter, and every change rebuilds its subtree.
+
+With `bevy_radioactive`, the state is a hook and the runtime re-renders:
+
+```rust,ignore
+#[component]
+fn counter(cx: &Cx) -> impl Scene {
+    let (count, set_count) = cx.use_state(|| 0);
+    let (decrement, increment, reset) = (set_count.clone(), set_count.clone(), set_count);
+    bsn! {
+        // ...
+        on(move |_: On<Activate>| increment(count + 1))
+        // ...
+        {(count != 0).then(|| bsn_list! { /* Reset button */ })}
+    }
+}
+```
+
+With plain Bevy, the state is a component on the root, the buttons write it by
+entity, and a system respawns the subtree when it changes:
+
+```rust,ignore
+#[derive(Component, Clone, Default)]
+struct CounterState(i32);
+
+fn render_counters(
+    counters: Query<(Entity, &CounterState), Changed<CounterState>>,
+    mut commands: Commands,
+) {
+    for (root, state) in &counters {
+        commands.entity(root).despawn_children().apply_scene(counter(root, state.0));
+    }
+}
+
+fn counter(root: Entity, count: i32) -> impl Scene {
+    let set_count = move |states: &mut Query<&mut CounterState>, value: i32| {
+        if let Ok(mut state) = states.get_mut(root) {
+            state.0 = value;
+        }
+    };
+    bsn! {
+        // ...
+        on(move |_: On<Activate>, mut states: Query<&mut CounterState>| set_count(&mut states, count + 1))
+        // ...
+        {(count != 0).then(|| bsn_list! { /* Reset button */ })}
+    }
+}
+```
+
+### `coat!`: signals vs patching and spawning by hand
+
+Only the label's `Text` is patched, and the Reset button exists only while the count
+is not zero.
+
+With `bevy_radioactive`, a `$` read patches the field and `if` owns the button:
+
+```rust,ignore
+let count = signal(|| 0);
+coat! {
+    // ...
+    on(move |_: On<Activate>| count.set($count + 1))
+    --
+    Text($(format!("{}", $count)))
+    // ...
+    if $count != 0 {
+        @FeathersButton
+        on(move |_: On<Activate>| count.set(0))
+        Children [ @caption("Reset") ]
+    }
+}
+```
+
+With plain Bevy, one system patches the label and another spawns or despawns the
+button:
+
+```rust,ignore
+fn patch_count_label(count: Res<Count>, mut labels: Query<&mut Text, With<CountLabel>>) {
+    for mut text in &mut labels {
+        **text = count.0.to_string();
+    }
+}
+
+fn toggle_reset_button(
+    count: Res<Count>,
+    columns: Query<Entity, With<CounterColumn>>,
+    buttons: Query<Entity, With<ResetButton>>,
+    mut commands: Commands,
+) {
+    let shown = !buttons.is_empty();
+    if count.0 != 0 && !shown {
+        for column in &columns {
+            commands.entity(column).queue_spawn_related_scenes::<Children>(reset_button());
+        }
+    } else if count.0 == 0 && shown {
+        for button in &buttons {
+            commands.entity(button).despawn();
+        }
+    }
+}
+```
+
 ## Change and delivery semantics
 
 - Tracking uses Bevy change ticks: insertion and mutable dereferencing count as

@@ -13,7 +13,7 @@ categories = ["game-development", "gui"]
 default = ["ui"]
 ## Orders the runtime before UI layout and enables `webby::text` and `webby::show`.
 ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]
-## Full Bevy with Feathers, for the `comparison_*` examples.
+## Full Bevy with Feathers, for the `examples/comparison` examples.
 comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
 
 [workspace]
@@ -35,26 +35,41 @@ module_name_repetitions = "allow"
 type_complexity = "allow"
 
 [[example]]
-name = "comparison_bevy"
-path = "examples/comparison/bevy.rs"
+name = "reactivity_radioactive"
+path = "examples/comparison/reactivity/radioactive.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_reactivity"
-path = "examples/comparison/reactivity.rs"
+name = "reactivity_bevy"
+path = "examples/comparison/reactivity/bevy.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_subscription"
-path = "examples/comparison/subscription.rs"
+name = "subscription_radioactive"
+path = "examples/comparison/subscription/radioactive.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_webby"
-path = "examples/comparison/webby.rs"
+name = "subscription_bevy"
+path = "examples/comparison/subscription/bevy.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_coat"
-path = "examples/comparison/coat.rs"
+name = "webby_radioactive"
+path = "examples/comparison/webby/radioactive.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "webby_bevy"
+path = "examples/comparison/webby/bevy.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "coat_radioactive"
+path = "examples/comparison/coat/radioactive.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "coat_bevy"
+path = "examples/comparison/coat/bevy.rs"
 required-features = ["comparison"]
