@@ -1,6 +1,6 @@
 //! Counter using event subscriptions.
 //!
-//! Plain Bevy counterpart: `subscription_bevy`.
+//! Plain Bevy counterpart: `subscribe_bevy`.
 //!
 //! There is no shared state: the label owns its count and subscribes to the
 //! `Activate` events of the three buttons. It announces each new count with a
@@ -19,7 +19,7 @@ use bevy::{
     prelude::*,
     ui_widgets::Activate,
 };
-use bevy_radioactive::prelude::*;
+use bevy_radioactive::subscribe::*;
 
 #[derive(Component, Clone, Default)]
 struct LabelCount(i32);

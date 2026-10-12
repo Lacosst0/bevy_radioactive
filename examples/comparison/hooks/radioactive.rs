@@ -1,9 +1,8 @@
-//! Counter using `reactivity`: tracked state plus `bind`.
+//! Counter as a React-style `hooks` component.
 //!
-//! Plain Bevy counterpart: `reactivity_bevy`.
+//! The count is component state; every change re-renders the component.
 //!
-//! The count is a resource. Buttons mutate it; the label binds to it. `bind`
-//! tracks `Count` automatically, so no `app.track::<Count>()` is needed.
+//! Plain Bevy counterpart: `hooks_bevy`.
 
 use bevy::{
     feathers::{
@@ -18,25 +17,31 @@ use bevy::{
     prelude::*,
     ui_widgets::Activate,
 };
-use bevy_radioactive::prelude::*;
-
-#[derive(Resource, Clone, Default)]
-struct Count(i32);
+use bevy_radioactive::hooks::*;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, FeathersPlugins, RadioactivePlugin))
+        .add_plugins((DefaultPlugins, FeathersPlugins, HooksPlugin))
         .insert_resource(UiTheme(create_dark_theme()))
-        .init_resource::<Count>()
         .add_systems(Startup, scene.spawn())
         .run();
 }
 
 fn scene() -> impl SceneList {
-    bsn_list! { Camera2d -- @counter() }
+    bsn_list! {
+        Camera2d
+        --
+        Node { width: percent(100), height: percent(100) }
+        ThemeBackgroundColor(tokens::WINDOW_BG)
+        @counter()
+    }
 }
 
-fn counter() -> impl Scene {
+#[component]
+fn counter(cx: &Cx) -> impl Scene {
+    let (count, set_count) = cx.use_state(|| 0);
+    let (decrement, increment, reset) = (set_count.clone(), set_count.clone(), set_count);
+
     bsn! {
         Node {
             width: percent(100),
@@ -46,41 +51,34 @@ fn counter() -> impl Scene {
             justify_content: JustifyContent::Center,
             row_gap: vmin(4),
         }
-        ThemeBackgroundColor(tokens::WINDOW_BG)
         Children [
             Node { align_items: AlignItems::Center, column_gap: vmin(6) }
             Children [
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>, mut count: ResMut<Count>| count.0 -= 1)
+                on(move |_: On<Activate>| decrement(count - 1))
                 Children [ @caption("-1") ]
                 --
-                Text("0")
+                Text({count.to_string()})
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
-                bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>, mut count: ResMut<Count>| count.0 += 1)
+                on(move |_: On<Activate>| increment(count + 1))
                 Children [ @caption("+1") ]
             ]
             --
-            @FeathersButton
-            Node {
-                display: Display::None,
-                height: Val::Auto,
-                min_width: vmin(18),
-                padding: UiRect::axes(vmin(3), vmin(1.5)),
-            }
-            InheritableFont { font_size: FontSize::VMin(6.0) }
-            on(|_: On<Activate>, mut count: ResMut<Count>| count.0 = 0)
-            bind(Singleton, |count: &Count, node: &mut Node| {
-                node.display = if count.0 != 0 { Display::Flex } else { Display::None };
-            })
-            Children [ @caption("Reset") ]
+            // Like `{count !== 0 && <Reset />}` in JSX.
+            {(count != 0).then(|| bsn_list! {
+                @FeathersButton
+                Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
+                InheritableFont { font_size: FontSize::VMin(6.0) }
+                on(move |_: On<Activate>| reset(0))
+                Children [ @caption("Reset") ]
+            })}
         ]
     }
 }

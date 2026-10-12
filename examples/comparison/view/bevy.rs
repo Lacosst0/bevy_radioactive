@@ -1,6 +1,6 @@
-//! Counter in plain Bevy, the counterpart of `coat_radioactive`.
+//! Counter in plain Bevy, the counterpart of `view_radioactive`.
 //!
-//! The count is a resource. Like `coat!`, only the label's `Text` is patched,
+//! The count is a resource. Like `view!`, only the label's `Text` is patched,
 //! and the Reset button exists only while the count is not zero. Without
 //! `$count` and `if`, systems do the patching and spawn or despawn the button.
 

@@ -1,7 +1,7 @@
 //! Routes a slider event to a subscribed listener without changing its source.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin, ui_widgets::ValueChange};
-use bevy_radioactive::subscription::{Subscription, subscribe_to};
+use bevy_radioactive::subscribe::*;
 
 #[derive(Component, Clone, Copy, Default)]
 struct Slider;

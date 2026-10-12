@@ -1,6 +1,6 @@
 //! Procedural macros for `bevy_radioactive`.
 //!
-//! `coat!` is `bsn!` plus a small Rust subset in scene lists (`if`/`else`,
+//! `view!` is `bsn!` plus a small Rust subset in scene lists (`if`/`else`,
 //! `for` with `#[key(..)]`, `match`, `let`) and `$signal` reads. The macro
 //! works on tokens: everything it does not recognise is passed to `bsn!`
 //! unchanged.
@@ -18,9 +18,9 @@ type Tokens = Vec<TokenTree>;
 
 /// BSN with reactive control flow and `$signal` reads.
 ///
-/// See `bevy_radioactive::coat` for the full syntax.
+/// See `bevy_radioactive::view` for the full syntax.
 #[proc_macro]
-pub fn coat(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+pub fn view(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let tokens: Tokens = TokenStream::from(input).into_iter().collect();
     remember_signals(&tokens);
     let mut scope = Scope::default();
@@ -29,7 +29,7 @@ pub fn coat(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let bsn = invoke("bsn");
     let output = quote! {{
         #[allow(unused_imports)]
-        use ::bevy_radioactive::coat::__private::*;
+        use ::bevy_radioactive::view::__private::*;
         #prelude
         #bsn { #body }
     }};
@@ -37,9 +37,9 @@ pub fn coat(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     output.into()
 }
 
-/// Like `coat!`, producing a scene list (`--` separated entities).
+/// Like `view!`, producing a scene list (`--` separated entities).
 #[proc_macro]
-pub fn coat_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+pub fn view_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let tokens: Tokens = TokenStream::from(input).into_iter().collect();
     remember_signals(&tokens);
     let mut scope = Scope::default();
@@ -48,7 +48,7 @@ pub fn coat_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let bsn_list = invoke("bsn_list");
     let output = quote! {{
         #[allow(unused_imports)]
-        use ::bevy_radioactive::coat::__private::*;
+        use ::bevy_radioactive::view::__private::*;
         #prelude
         #bsn_list { #body }
     }};
@@ -57,7 +57,7 @@ pub fn coat_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 }
 
 fn debug(output: &TokenStream) {
-    if std::env::var_os("COAT_DEBUG").is_some() {
+    if std::env::var_os("VIEW_DEBUG").is_some() {
         eprintln!("{output}");
     }
 }
@@ -81,7 +81,7 @@ impl Scope {
         names.retain(|name| !bound.contains(name));
         let mut bindings = TokenStream::new();
         for name in names {
-            let hoisted = format_ident!("__coat_{}_{}", self.sites, name);
+            let hoisted = format_ident!("__view_{}_{}", self.sites, name);
             self.sites += 1;
             quote!(let #hoisted = ::core::clone::Clone::clone(&#name);)
                 .to_tokens(&mut self.prelude);
@@ -309,7 +309,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
     out
 }
 
-/// `Comp($x)` → `Comp({ x.get() }) __coat_patch(move |c: &mut Comp| c.0 = ..)`.
+/// `Comp($x)` → `Comp({ x.get() }) __view_patch(move |c: &mut Comp| c.0 = ..)`.
 fn reactive_component(
     path: &[TokenTree],
     delimiter: Delimiter,
@@ -359,7 +359,7 @@ fn reactive_component(
     let site = scope.site(content, &[]);
     quote! {
         #path #initial
-        __coat_patch({ #site move |__c: &mut #path| { #assignments } })
+        __view_patch({ #site move |__c: &mut #path| { #assignments } })
     }
 }
 
@@ -576,8 +576,8 @@ fn if_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
         quote!(::core::option::Option::Some(#index) => ::core::option::Option::Some(#body),)
     });
     quote! {
-        __CoatRegion
-        __coat_region(
+        __ViewRegion
+        __view_region(
             { #cond_site move || -> ::core::option::Option<usize> { #selector } },
             { #body_site move |__branch: &::core::option::Option<usize>| match *__branch {
                 #(#arms)*
@@ -630,8 +630,8 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
             let key_site = scope.site(key, &bound);
             let key = reads(key);
             quote! {
-                __CoatRegion
-                __coat_for(
+                __ViewRegion
+                __view_for(
                     #items,
                     { #key_site move |__item: &_| {
                         #[allow(unused_variables)]
@@ -643,8 +643,8 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
             }
         }
         None => quote! {
-            __CoatRegion
-            __coat_for_indexed(#items, #render)
+            __ViewRegion
+            __view_for_indexed(#items, #render)
         },
     }
 }
@@ -718,8 +718,8 @@ fn match_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
         quote!(#pattern => ::core::option::Option::Some(#body),)
     });
     quote! {
-        __CoatRegion
-        __coat_region(
+        __ViewRegion
+        __view_region(
             { #scrutinee_site move || #scrutinee },
             { #body_site move |__value: &_| {
                 #[allow(unused_variables, clippy::match_single_binding)]
@@ -730,9 +730,9 @@ fn match_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
 }
 
 /// Invokes `bsn!`/`bsn_list!` through `macro_rules!` wrappers, so the call
-/// site `bsn!` inspects is its own name rather than `coat!`.
+/// site `bsn!` inspects is its own name rather than `view!`.
 fn invoke(name: &str) -> TokenStream {
-    let name = Ident::new(&format!("__coat_{name}"), Span::call_site());
+    let name = Ident::new(&format!("__view_{name}"), Span::call_site());
     quote!(::bevy_radioactive::#name!)
 }
 
@@ -743,7 +743,7 @@ fn invoke(name: &str) -> TokenStream {
 /// Turns `fn name(cx: &Cx, props..) -> impl Scene` into a component that is
 /// used in `bsn!` like a scene function: `@name(props..)`.
 ///
-/// See `bevy_radioactive::webby` for details.
+/// See `bevy_radioactive::hooks` for details.
 #[proc_macro_attribute]
 pub fn component(
     attr: proc_macro::TokenStream,
@@ -781,7 +781,7 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             "components cannot be async",
         ));
     }
-    let webby = quote!(::bevy_radioactive::webby);
+    let hooks = quote!(::bevy_radioactive::hooks);
     let entity = quote!(::bevy::prelude::Entity);
 
     let mut uses_cx = false;
@@ -809,7 +809,7 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             call_args.push(quote!(__cx));
         } else if last_segment_is(ty, "Entity") && !matches!(&**ty, syn::Type::Reference(_)) {
             // `#Name` in `bsn!` passes an `EntityTemplate`; resolve it as a dep.
-            outer_inputs.push(quote!(#name: impl #webby::Deps<Output = #entity>));
+            outer_inputs.push(quote!(#name: impl #hooks::EntityProps<Output = #entity>));
             entities.push(name.clone());
             call_args.push(quote!(#name));
         } else {
@@ -852,9 +852,9 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
     Ok(quote! {
         #(#attrs)*
         #vis fn #name #impl_generics (#(#outer_inputs),*)
-            -> #webby::Mount<
-                impl #webby::Deps<Output = (#(#entity_types,)*)>,
-                impl #webby::Render<(#(#entity_types,)*)>,
+            -> #hooks::Element<
+                impl #hooks::EntityProps<Output = (#(#entity_types,)*)>,
+                impl #hooks::Render<(#(#entity_types,)*)>,
             >
         #where_clause
         {
@@ -862,9 +862,9 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             #render_sig #block
 
             let __props = (#(#captured,)*);
-            #webby::component_with(
+            #hooks::element(
                 (#(#entities,)*),
-                move |__cx: &#webby::Cx, (#(#entities,)*): (#(#entity_types,)*)| {
+                move |__cx: &#hooks::Cx, (#(#entities,)*): (#(#entity_types,)*)| {
                     #[allow(unused_variables)]
                     let (#(#captured,)*) = &__props;
                     __render #turbofish (#(#call_args),*)
@@ -879,7 +879,7 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// Names read with `$` anywhere in the current `coat!` invocation.
+    /// Names read with `$` anywhere in the current `view!` invocation.
     static SIGNALS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 

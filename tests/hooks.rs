@@ -1,4 +1,5 @@
-//! Integration coverage for React-style `webby` components.
+#![cfg(feature = "hooks")]
+//! Integration coverage for React-style `hooks` components.
 
 use std::sync::{
     Arc,
@@ -6,10 +7,7 @@ use std::sync::{
 };
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    webby::{Cx, SetState, Signal, component, keyed},
-};
+use bevy_radioactive::hooks::*;
 
 #[derive(Resource, Clone, Debug, Default, PartialEq)]
 struct Title(String);
@@ -38,7 +36,7 @@ fn app() -> App {
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
+        HooksPlugin,
     ))
     .init_resource::<Title>()
     .init_resource::<Setter>()
@@ -86,7 +84,7 @@ fn use_state_setter_rerenders() {
 #[component]
 fn titled(cx: &Cx) -> impl Scene {
     let title = cx.use_resource::<Title>().unwrap_or_default().0;
-    cx.untracked()
+    cx.world()
         .resource::<Renders>()
         .0
         .fetch_add(1, Ordering::Relaxed);
@@ -129,7 +127,7 @@ fn resource_reads_rerender_and_child_state_survives() {
 #[component]
 fn title_length(cx: &Cx) -> impl Scene {
     let title = cx.use_resource::<Title>().unwrap_or_default().0;
-    let probe = cx.untracked().resource::<Memos>().0.clone();
+    let probe = cx.world().resource::<Memos>().0.clone();
     let length = cx.use_memo(title.len(), move |len| {
         probe.fetch_add(1, Ordering::Relaxed);
         *len
@@ -154,16 +152,13 @@ fn use_memo_recomputes_only_when_deps_change() {
 
 #[component]
 fn provider(cx: &Cx, value: &'static str) -> impl Scene {
-    cx.provide_context(Signal::new(String::from(value)));
+    cx.provide_context(String::from(value));
     bsn! { @consumer() }
 }
 
 #[component]
 fn consumer(cx: &Cx) -> impl Scene {
-    let value = cx
-        .use_context::<Signal<String>>()
-        .map(|signal| signal.get())
-        .unwrap_or_default();
+    let value = cx.use_context::<String>().unwrap_or_default();
     bsn! { Label(3) Text({value}) }
 }
 
@@ -260,11 +255,11 @@ fn components_require_the_runtime() {
     let Err(error) = app.world_mut().spawn_scene(bsn! { @counter(1) }) else {
         panic!("component resolved without runtime");
     };
-    assert!(error.to_string().contains("RadioactivePlugin"));
+    assert!(error.to_string().contains("HooksPlugin"));
 }
 
 #[derive(Resource, Clone, Default)]
-struct Dispatcher(Option<bevy_radioactive::webby::Dispatch<i32>>);
+struct Dispatcher(Option<Dispatch<i32>>);
 
 #[component]
 fn reducer(cx: &Cx) -> impl Scene {

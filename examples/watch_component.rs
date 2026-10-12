@@ -1,5 +1,5 @@
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{Reaction, ReactiveAppExt, watch};
+use bevy_radioactive::watch::*;
 
 #[derive(Component, Clone, Copy, Default)]
 struct Meter(u32);

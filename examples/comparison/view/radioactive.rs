@@ -1,8 +1,8 @@
-//! Counter as a `coat!` template.
+//! Counter as a `view!` template.
 //!
 //! The count is a signal; only the patched `Text` updates when it changes.
 //!
-//! Plain Bevy counterpart: `coat_bevy`.
+//! Plain Bevy counterpart: `view_bevy`.
 
 use bevy::{
     feathers::{
@@ -17,14 +17,11 @@ use bevy::{
     prelude::*,
     ui_widgets::Activate,
 };
-use bevy_radioactive::{
-    RadioactivePlugin,
-    coat::{coat, signal},
-};
+use bevy_radioactive::view::*;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, FeathersPlugins, RadioactivePlugin))
+        .add_plugins((DefaultPlugins, FeathersPlugins, ViewPlugin))
         .insert_resource(UiTheme(create_dark_theme()))
         .add_systems(Startup, scene.spawn())
         .run();
@@ -36,7 +33,7 @@ fn scene() -> impl SceneList {
 
 fn counter() -> impl Scene {
     let count = signal(|| 0);
-    coat! {
+    view! {
         Node {
             width: percent(100),
             height: percent(100),

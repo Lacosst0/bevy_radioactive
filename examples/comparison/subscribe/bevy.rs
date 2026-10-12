@@ -1,8 +1,8 @@
-//! Counter in plain Bevy, the counterpart of `reactivity_radioactive`.
+//! Counter in plain Bevy, the counterpart of `subscribe_radioactive`.
 //!
-//! The count is a resource. Buttons mutate it; instead of `bind`, global
-//! systems gated on `resource_changed` find the label and the Reset button by
-//! marker components and write to them.
+//! There is no shared state: the label owns its count. Without `subscribe_to`,
+//! each button's own observer has to find the label by a marker component, and
+//! the label's `CountChanged` observer has to find the Reset button the same way.
 
 use bevy::{
     feathers::{
@@ -18,10 +18,11 @@ use bevy::{
     ui_widgets::Activate,
 };
 
-#[derive(Resource, Clone, Default)]
-struct Count(i32);
+/// The count, owned by the label.
+#[derive(Component, Clone, Default)]
+struct LabelCount(i32);
 
-/// Marks the text that shows the count.
+/// Marks the label that owns and shows the count.
 #[derive(Component, Clone, Default)]
 struct CountLabel;
 
@@ -33,31 +34,8 @@ fn main() {
     App::new()
         .add_plugins((DefaultPlugins, FeathersPlugins))
         .insert_resource(UiTheme(create_dark_theme()))
-        .init_resource::<Count>()
         .add_systems(Startup, scene.spawn())
-        .add_systems(
-            Update,
-            (sync_count_label, sync_reset_button).run_if(resource_changed::<Count>),
-        )
         .run();
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn sync_count_label(count: Res<Count>, mut labels: Query<&mut Text, With<CountLabel>>) {
-    for mut text in &mut labels {
-        **text = count.0.to_string();
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<ResetButton>>) {
-    for mut node in &mut buttons {
-        node.display = if count.0 != 0 {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
 }
 
 fn scene() -> impl SceneList {
@@ -81,18 +59,29 @@ fn counter() -> impl Scene {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>, mut count: ResMut<Count>| count.0 -= 1)
+                on(|_: On<Activate>, labels: CountLabels, commands: Commands| {
+                    update_count(labels, commands, |n| n - 1);
+                })
                 Children [ @caption("-1") ]
                 --
                 CountLabel
+                LabelCount(0)
                 Text("0")
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
+                // The label announces its count; Reset shows itself while it is not zero.
+                on(|changed: On<CountChanged>, mut resets: Query<&mut Node, With<ResetButton>>| {
+                    for mut node in &mut resets {
+                        node.display = if changed.count != 0 { Display::Flex } else { Display::None };
+                    }
+                })
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>, mut count: ResMut<Count>| count.0 += 1)
+                on(|_: On<Activate>, labels: CountLabels, commands: Commands| {
+                    update_count(labels, commands, |n| n + 1);
+                })
                 Children [ @caption("+1") ]
             ]
             --
@@ -105,8 +94,32 @@ fn counter() -> impl Scene {
                 padding: UiRect::axes(vmin(3), vmin(1.5)),
             }
             InheritableFont { font_size: FontSize::VMin(6.0) }
-            on(|_: On<Activate>, mut count: ResMut<Count>| count.0 = 0)
+            on(|_: On<Activate>, labels: CountLabels, commands: Commands| {
+                update_count(labels, commands, |_| 0);
+            })
             Children [ @caption("Reset") ]
         ]
+    }
+}
+
+/// Emitted by the label whenever its count changes.
+#[derive(EntityEvent, Clone)]
+struct CountChanged {
+    #[event_target]
+    label: Entity,
+    count: i32,
+}
+
+type CountLabels<'w, 's> =
+    Query<'w, 's, (Entity, &'static mut LabelCount, &'static mut Text), With<CountLabel>>;
+
+fn update_count(mut labels: CountLabels, mut commands: Commands, f: impl Fn(i32) -> i32) {
+    for (label, mut count, mut text) in &mut labels {
+        count.0 = f(count.0);
+        **text = count.0.to_string();
+        commands.trigger(CountChanged {
+            label,
+            count: count.0,
+        });
     }
 }

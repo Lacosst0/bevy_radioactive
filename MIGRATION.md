@@ -1,3 +1,53 @@
+# Migrating from 0.4 to 0.5
+
+The four styles are now independent modules, each behind its own Cargo feature
+(all on by default) with its own plugin and runtime. Import the style you use with a
+glob: `use bevy_radioactive::view::*;`.
+
+| 0.4 | 0.5 |
+| --- | --- |
+| `bevy_radioactive::prelude`, root re-exports | `bevy_radioactive::{watch, subscribe, hooks, view}::*` |
+| `RadioactivePlugin` | `WatchPlugin`, `HooksPlugin` or `ViewPlugin` for each style you use; `subscribe` needs none |
+| `ReactiveSet::Publish` | `WatchSystems`, `HooksSystems`, `ViewSystems` |
+| `ReactiveSettings { max_passes }` | removed; each runtime settles in up to 8 rounds per frame |
+| `ReactiveAppExt` | `WatchAppExt` (`app.track::<T>()`) |
+| `app.observe_value(o)` | `app.track::<T>().add_observer(o)` |
+| `on_removed(source, handler)` | `watch_removed(source, handler)` |
+| `reaction.event().0`, `reaction.value()` | `reaction.0` (`Reaction<T>` dereferences to `T`) |
+| `Watch`, `WatchRemoval`, `Subscribe` return types | `impl Template` |
+| `subscription` module | `subscribe` module |
+| `SubscribedTo`, `Subscribers`, `SubscriptionOf`, `Subscriptions`, `SubscriptionAppExt::register_subscription` | removed; use `subscribe_to` |
+| `Subscription::observer()` | removed |
+| `webby` module | `hooks` module |
+| `Mount` | `Element` |
+| `component_with`, `Deps`, `Render`, `Effects`, `Reads` | internal |
+| `cx.get`, `cx.this`, `cx.resource` (via `Reads`) | `cx.use_component(entity)`, `cx.use_resource()` |
+| `cx.untracked()` | `cx.world()` |
+| `cx.use_signal(init)` | `cx.use_state(init)`, or a `view` signal outside `hooks` |
+| `cx.use_ref(init) -> Ref<T>` | `cx.use_ref(init) -> Arc<Mutex<T>>` |
+| `coat` module, `coat!`, `coat_list!` | `view` module, `view!`, `view_list!` |
+| `Signal::increment` / `decrement` | `signal.update(\|n\| *n += 1)` |
+| `Signal::notify`, `Signal::ptr_eq`, `Step` | removed |
+| `shard(args, render)` | removed; use a `match`/`if` region or `effect` |
+| `cloned!` | removed; `view!` clones signals for you, clone by hand elsewhere |
+| `Region` | internal |
+| `COAT_DEBUG` | `VIEW_DEBUG` |
+
+New: `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
+an event fires on a source.
+
+Behavior changes:
+
+- Each style runs its own loop in its own system set. A `watch` reaction that writes a
+  value read by a `hooks` component or a `view` signal is still picked up in the same
+  frame if that style's set runs later, otherwise on the next frame. Order the sets
+  with `configure_sets` if you mix styles and need a specific order.
+- `hooks` state no longer uses signals: `use_state` and `use_reducer` setters
+  re-render their own component. To share changing values through context, provide
+  them from a parent that re-renders.
+- `use_context` values are plain values; a provider re-render reaches consumers
+  because its subtree renders again.
+
 # Migrating from 0.3 to 0.4
 
 Resources are singleton components in Bevy 0.20, so resource and component APIs are

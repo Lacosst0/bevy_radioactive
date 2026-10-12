@@ -1,13 +1,11 @@
+#![cfg(feature = "watch")]
 use bevy::{
     asset::AssetPlugin,
     ecs::{entity_disabling::Disabled, resource::IsResource},
     prelude::*,
     scene::ScenePlugin,
 };
-use bevy_radioactive::{
-    RadioactivePlugin, Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind, bind_or,
-    on_removed, watch,
-};
+use bevy_radioactive::watch::*;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 struct Counter(u32);
@@ -37,6 +35,12 @@ fn test_app() -> App {
     app
 }
 
+fn test_app_with_plugin() -> App {
+    let mut app = test_app();
+    app.add_plugins(WatchPlugin);
+    app
+}
+
 fn settle(app: &mut App) {
     app.update();
     app.world_mut().flush();
@@ -47,18 +51,17 @@ fn settle(app: &mut App) {
     reason = "Bevy observer systems receive SystemInput parameters by value"
 )]
 fn record_counter(event: Reaction<Counter>, mut log: ResMut<Log>) {
-    log.local
-        .push((event.target(), event.source(), event.event().0));
+    log.local.push((event.target(), event.source(), event.0));
 }
 
 #[test]
 fn resource_change_runs_global_once_and_each_local_watcher_once() {
     let mut app = test_app();
-    app.insert_resource(Counter(1)).observe_value(
-        |event: On<ValueChanged<Counter>>, mut log: ResMut<Log>| {
+    app.insert_resource(Counter(1))
+        .track::<Counter>()
+        .add_observer(|event: On<ValueChanged<Counter>>, mut log: ResMut<Log>| {
             log.global.push((event.source(), event.0));
-        },
-    );
+        });
 
     let first = app
         .world_mut()
@@ -187,7 +190,7 @@ fn disabled_sources_still_publish() {
                 --
                 Listener
                 watch(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.local.push((event.target(), event.source(), event.event().0));
+                    log.local.push((event.target(), event.source(), event.0));
                 })
             ]
         })
@@ -232,7 +235,7 @@ fn component_watch_is_scoped_to_its_source() {
                 --
                 Listener
                 watch(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.local.push((event.target(), event.source(), event.event().0));
+                    log.local.push((event.target(), event.source(), event.0));
                 })
             ]
         })
@@ -320,9 +323,8 @@ fn despawned_watcher_stops_receiving_changes() {
 
 #[test]
 fn watch_tracks_its_type_on_first_use() {
-    let mut app = test_app();
-    app.add_plugins(RadioactivePlugin)
-        .insert_resource(Counter(1));
+    let mut app = test_app_with_plugin();
+    app.insert_resource(Counter(1));
 
     app.world_mut()
         .spawn_scene(bsn! {
@@ -355,7 +357,7 @@ fn watch_without_runtime_reports_the_plugin() {
     }) else {
         panic!("watch unexpectedly resolved without the runtime");
     };
-    assert!(error.to_string().contains("RadioactivePlugin"));
+    assert!(error.to_string().contains("WatchPlugin"));
 }
 
 #[test]
@@ -419,13 +421,11 @@ fn one_listener_watches_several_sources_of_one_type() {
     assert_eq!(values, vec![(listener, 1), (listener, 10)]);
     assert_eq!(app.world().resource::<Log>().global.len(), 1);
 
+    // The listener owns one delivery entity per watched source.
+    let count = |app: &mut App| app.world_mut().query::<Entity>().iter(app.world()).count();
+    let before = count(&mut app);
     app.world_mut().despawn(listener);
-    let leftovers = app
-        .world_mut()
-        .query::<&bevy_radioactive::SubscriptionOf>()
-        .iter(app.world())
-        .count();
-    assert_eq!(leftovers, 0);
+    assert!(before - count(&mut app) >= 4);
 }
 
 #[test]
@@ -473,7 +473,7 @@ fn bind_writes_target_and_bind_or_handles_despawn() {
 }
 
 #[test]
-fn on_removed_fires_for_component_removal_and_resource_removal() {
+fn watch_removed_fires_for_component_removal_and_resource_removal() {
     let mut app = test_app();
     app.insert_resource(Counter(1))
         .track::<Counter>()
@@ -484,8 +484,8 @@ fn on_removed_fires_for_component_removal_and_resource_removal() {
                 #A SourceA Meter(1)
                 --
                 Listener
-                on_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| log.local.push((r.target(), r.source(), 0)))
-                on_removed(Singleton, |r: Removal<Counter>, mut log: ResMut<Log>| log.global.push((r.source(), 0)))
+                watch_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| log.local.push((r.target(), r.source(), 0)))
+                watch_removed(Singleton, |r: Removal<Counter>, mut log: ResMut<Log>| log.global.push((r.source(), 0)))
             ]
         })
         .unwrap();

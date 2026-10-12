@@ -1,63 +1,63 @@
 # `bevy_radioactive`
 
-`bevy_radioactive` connects Bevy 0.20 state and entity events to local observers in
-code-authored BSN scenes. A UI node can own the handler that keeps it synchronized
-without a global system querying every possible view.
+Reactive UI for Bevy 0.20 BSN scenes. A node declares what it depends on, right
+where it is spawned, instead of a global system querying for it.
 
-It has four layers:
+There are four styles. Each one is a separate module behind its own Cargo feature,
+with its own plugin and runtime: they share no code, so use any one of them alone
+or several side by side.
 
-- **Watching and binding** (`watch`, `bind`, `bind_or`, `on_removed`): source-routed
-  change notifications for tracked components and resources.
-- **Subscriptions** (`subscribe_to`): routing of any entity event from a source to
-  listeners.
-- **`webby`**: React-style `#[component]` functions, used as `@name(props)`, with `use_state`, `use_memo`,
-  `use_effect`, context, and keyed children.
-- **`coat!`**: Topcoat-style templates — BSN plus reactive `if`/`for`/`match` and
-  `$signal` reads.
+| Style | Feature | Plugin | Use it to |
+| --- | --- | --- | --- |
+| [`watch`](#watch) | `watch` | `WatchPlugin` | keep a node in sync with a component or resource |
+| [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
+| [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
+| [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
 
-## Compatibility
+## Install
 
 | `bevy_radioactive` | Bevy | Rust |
 | --- | --- | --- |
-| 0.4 | 0.20 | 1.97.1 or newer |
+| 0.5 | 0.20 | 1.97.1 or newer |
 
 ```toml
 [dependencies]
 bevy = "0.20"
+# All four styles:
 bevy_radioactive = { path = "../bevy_radioactive" }
+# Or only the ones you use:
+# bevy_radioactive = { path = "../bevy_radioactive", default-features = false, features = ["view", "ui"] }
 ```
 
-The default `ui` feature orders the reactive runtime before Bevy UI layout and makes
-`coat!` regions `GhostNode`s. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.3.
+The default `ui` feature runs updates before Bevy UI layout, so changes show in the
+same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
+affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
 
-## Quick start
+## `watch`
 
-Resources are singleton components in Bevy 0.20, so one API covers both. Add
-`RadioactivePlugin`; `watch`, `bind` and `on_removed` start tracking their type the
-first time a scene uses them. Call `app.track::<T>()` only for types you observe
-globally or want registered up front.
+`bind` writes a component of the current entity whenever a value on a source
+changes. `watch` runs a handler instead. Resources are singleton components in
+Bevy 0.20, so the same functions cover both: use `Singleton` as the source.
 
-```rust,no_run
+```rust,ignore
 use bevy::{prelude::*, scene::CommandsSceneExt};
-use bevy_radioactive::prelude::*;
+use bevy_radioactive::watch::*;
 
-#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Counter(u32);
+#[derive(Resource, Clone, Default)]
+struct Score(u32);
 
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Component, Clone)]
 struct Health(u32);
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, RadioactivePlugin))
-        .init_resource::<Counter>()
-        .add_systems(Startup, setup)
+        .add_plugins((DefaultPlugins, WatchPlugin))
+        .init_resource::<Score>()
+        .add_systems(Startup, |mut commands: Commands| {
+            commands.spawn(Camera2d);
+            commands.spawn_scene(hud());
+        })
         .run();
-}
-
-fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
-    commands.spawn_scene(hud());
 }
 
 fn hud() -> impl Scene {
@@ -66,100 +66,104 @@ fn hud() -> impl Scene {
         Children [
             #Player Health(100)
             --
-            // resource source
             Text("0")
-            bind(Singleton, |counter: &Counter, text: &mut Text| **text = counter.0.to_string())
+            bind(Singleton, |score: &Score, text: &mut Text| **text = score.0.to_string())
             --
-            // component source, with a removal fallback
             Text("")
             bind_or(
                 #Player,
                 |hp: &Health, text: &mut Text| **text = format!("HP {}", hp.0),
                 |text: &mut Text| **text = "DEAD".into(),
             )
+            --
+            watch(#Player, |hp: Reaction<Health>| info!("{:?} has {} HP", hp.source(), hp.0))
         ]
     }
 }
 ```
 
-## Sources
-
-Every helper takes a source as its first argument:
-
-| Source | Meaning |
-| --- | --- |
-| `#Name` | A named entity in the same BSN scene |
-| `entity` | An `Entity` value |
-| `Singleton` | The singleton entity of resource `T` (must exist when the scene resolves) |
-| `[#A, #B]` / `vec![...]` | Several sources; the handler runs once per changed source |
-
-One entity may declare any number of watches, bindings, and subscriptions, for the
-same or different sources and types. Use `source()` on the event to tell sources apart.
-
-## Helpers
-
-| Helper | Runs when | Handler |
+| Function | Runs when | Handler |
 | --- | --- | --- |
-| `watch(source, handler)` | `T` is inserted or mutated on a source | observer with `Reaction<T>` input |
-| `bind(source, \|&T, &mut C\|)` | same | writes component `C` on this entity |
-| `bind_or(source, write, \|&mut C\|)` | same, plus removal/despawn | writes `C` for both cases |
-| `on_removed(source, handler)` | `T` is removed or the source despawns | observer with `Removal<T>` input |
-| `subscribe_to(source, handler)` | source receives entity event `E` | observer with `Subscription<E>` input |
+| `bind(source, \|&T, &mut C\|)` | `T` is inserted or changed on `source` | writes `C` on this entity |
+| `bind_or(source, write, \|&mut C\|)` | same, plus removal or despawn | writes `C` in both cases |
+| `watch(source, handler)` | `T` is inserted or changed | observer taking `Reaction<T>` |
+| `watch_removed(source, handler)` | `T` is removed or `source` despawns | observer taking `Removal<T>` |
 
-```rust
-use bevy::prelude::*;
-use bevy_radioactive::prelude::*;
+A source is a `#Name`, an `Entity`, `Singleton` for a resource, or a list such as
+`[#A, #B]`. `Reaction<T>` dereferences to the new value; `target()` is the entity
+that declared the watch and `source()` the entity that owns `T`. One entity can
+declare any number of binds and watches.
 
-#[derive(Component, Clone, Default)]
-struct Health(u32);
+- Insertion and mutable access count as changes; use `set_if_neq` to skip no-op
+  writes. Several writes in one frame are delivered once, with the latest value.
+- The current value isn't replayed when a scene spawns. Values inserted by the same
+  scene are delivered as changes, so they render on spawn; initialize a node from an
+  existing resource yourself.
+- A reaction that writes another watched value is delivered in the same frame.
+- For global observers, call `app.track::<T>()` and observe `ValueChanged<T>` or
+  `ValueRemoved<T>`.
 
-fn duel_log() -> impl Scene {
-    bsn! {
-        Children [
-            #Player Health(100)
-            --
-            #Enemy Health(50)
-            --
-            Text("")
-            watch([#Player, #Enemy], |hit: Reaction<Health>, names: Query<&Name>, mut q: Query<&mut Text>| {
-                if let (Ok(name), Ok(mut text)) = (names.get(hit.source()), q.get_mut(hit.target())) {
-                    **text = format!("{name} now has {} HP", hit.0);
-                }
-            })
-            on_removed(#Enemy, |_: Removal<Health>, mut q: Query<&mut Text>| {
-                for mut text in &mut q {
-                    **text = "Enemy defeated".into();
-                }
-            })
-        ]
-    }
-}
-```
+Examples: `watch_component`, `watch_resource`.
 
-`Reaction<T>` dereferences to the shared `T` snapshot. `source()` is the value owner
-(or the resource entity) and `target()` is the BSN entity that declared the helper.
-For global observers use `app.observe_value::<T>(observer)` with `On<ValueChanged<T>>`,
-or observe `On<ValueRemoved<T>>`.
+## `subscribe`
 
-## `webby`: React-style components
-
-Mark a function with `#[component]` and use it in `bsn!` like a scene function:
-`@counter(5)`. `cx` is supplied by the runtime; the other arguments are props. The
-component re-renders when anything it read changes, and returns plain BSN.
+BSN's `on(...)` observes events on the entity that declares it. `subscribe_to`
+observes events fired on another entity, and `bind_event` writes a component of the
+declaring entity in response. No plugin is needed.
 
 ```rust,ignore
-use bevy_radioactive::webby::*;
+use bevy::{prelude::*, ui_widgets::Activate};
+use bevy_radioactive::subscribe::*;
+
+#[derive(Component, Clone, Default)]
+struct Clicks(u32);
+
+fn toolbar() -> impl Scene {
+    bsn! {
+        Node
+        Children [
+            #Save Button
+            --
+            Clicks(0)
+            bind_event(#Save, |_: &Activate, clicks: &mut Clicks| clicks.0 += 1)
+            --
+            Text("")
+            subscribe_to(#Save, |click: Subscription<Activate>, mut texts: Query<&mut Text>| {
+                if let Ok(mut text) = texts.get_mut(click.target()) {
+                    **text = "Saved".into();
+                }
+            })
+        ]
+    }
+}
+```
+
+`Subscription<E>` dereferences to the event; `target()` is the declaring entity and
+`source()` the entity the event fired on. Sources are the same as for `watch`, without
+`Singleton`. Subscriptions despawn with the entity that declared them.
+
+Example: `subscribe`.
+
+## `hooks`
+
+Mark a function with `#[component]` and use it like a scene function: `@counter(5)`.
+The optional `cx` argument is supplied by the runtime; the others are props. The
+component re-renders when its state, or ECS data it read through `cx`, changes.
+
+```rust,ignore
+use bevy::prelude::*;
+use bevy_radioactive::hooks::*;
+
+#[derive(Component, Clone)]
+struct Health(u32);
 
 #[component]
 fn counter(cx: &Cx, start: i32) -> impl Scene {
     let (count, set_count) = cx.use_state(|| start);
-    let doubled = cx.use_memo(count, |count| count * 2);
-    cx.use_effect(count, |count, _commands| info!("count is now {count}"));
-
     bsn! {
         Button
         on(move |_: On<Pointer<Click>>| set_count(count + 1))
-        Children [ Text({format!("{count} (x2 = {doubled})")}) ]
+        Children [ Text({count.to_string()}) ]
     }
 }
 
@@ -169,78 +173,76 @@ fn health_bar(cx: &Cx, player: Entity) -> impl Scene {
     bsn! { Text({format!("HP {hp}")}) }
 }
 
-#[component]
-fn app(cx: &Cx) -> impl Scene {
-    let todos = cx.use_resource::<Todos>().unwrap_or_default().0;
-    let rows = todos.into_iter().map(|t| todo_row(t).key(t.id)).collect::<Vec<_>>();
+fn hud() -> impl Scene {
     bsn! {
         Node
         Children [
             #Player Health(100)
             --
-            @counter(5)               // <Counter start={5} />
+            @counter(5)            // <Counter start={5} />
             --
-            @health_bar(#Player)      // `Entity` props accept `#Name`
-            --
-            Node Children [ {rows} ]  // {todos.map(t => <TodoRow key={t.id} />)}
+            @health_bar(#Player)   // `Entity` props accept `#Name`
         ]
     }
 }
 
-// mount: commands.spawn_scene(bsn! { @app() })
+// app.add_plugins(HooksPlugin)
 ```
 
-| React | `webby` |
+| React | `hooks` |
 | --- | --- |
 | `<Counter start={5} />` | `@counter(5)` |
 | `<Row key={id} />` | `row(..).key(id)` or `@keyed(id, row(..))` |
 | inline component | `component(\|cx\| bsn! { .. })` |
-| `useState` | `let (count, set_count) = cx.use_state(|| 0); set_count(count + 1)` |
-| `useReducer` | `let (state, dispatch) = cx.use_reducer(init, reducer); dispatch(action)` |
-| signals | `cx.use_signal(init) -> Signal` |
+| `useState` / `useReducer` | `cx.use_state(init)` / `cx.use_reducer(init, reducer)` |
 | `useMemo` / `useEffect` / `useRef` | `cx.use_memo` / `cx.use_effect` / `cx.use_ref` |
 | `createContext` / `useContext` | `cx.provide_context(value)` / `cx.use_context::<T>()` |
-| store/selector hooks | `cx.use_resource::<R>()`, `cx.use_component::<C>(entity)` |
+| store/selector hooks | `cx.use_resource::<R>()` / `cx.use_component::<C>(entity)` |
 
-A component's output is a child of its entity; an entity without a UI `Node` becomes a
-`GhostNode`, so `@counter(5)` works as a list item without affecting layout. A render
-replaces the subtree; child components keep their hook state, matched by position or
-key. Props other than `Entity` must be `Clone + Send + Sync + 'static`.
+The rendered scene is a child of the component's entity. A render replaces that
+subtree; child components keep their state, matched by position or key. Call hooks
+in the same order on every render. Props other than `Entity` must be
+`Clone + Send + Sync + 'static`. Keep components small: a render respawns the
+subtree.
 
-## `coat!`: reactive templates
+Examples: `hooks_counter`, `hooks_todos`.
 
-`coat!` is `bsn!` with a small Rust subset in scene lists, modelled on
-[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. `$name` reads a `Signal`;
-control flow that reads one becomes a region that rebuilds only itself, and a
+## `view`
+
+`view!` is `bsn!` plus signals and reactive control flow, modelled on
+[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. `$name` reads a signal.
+Control flow that reads one becomes a region that rebuilds only itself, and a
 component with `$` in its fields is patched in place.
 
 ```rust,ignore
-use bevy_radioactive::coat::*;
+use bevy::prelude::*;
+use bevy_radioactive::view::*;
 
-let todos = signal(|| vec![Todo { id: 1, title: "Write docs" }]);
-let open = signal(|| true);
+#[derive(Clone, PartialEq)]
+struct Todo { id: u32, title: &'static str }
 
-coat! {
-    Node
-    Children [
-        Button
-        on(move |_: On<Pointer<Click>>| open.set(!$open))
-        --
-        Text($(format!("{} todos", $todos.len())))   // patched when `todos` changes
-        --
-        if $open {
-            #[key(todo.id)]
-            for todo in $todos { Text({todo.title}) }
-        } else {
-            Text("hidden")
-        }
-        --
-        match $filter {
-            Filter::All => Text("all"),
-            Filter::Done => Text("done"),
-        }
-    ]
+fn todo_list() -> impl Scene {
+    let todos = signal(|| vec![Todo { id: 1, title: "Write docs" }]);
+    let open = signal(|| true);
+    view! {
+        Node
+        Children [
+            Button
+            on(move |_: On<Pointer<Click>>| open.set(!$open))
+            --
+            Text($(format!("{} todos", $todos.len())))   // patched when `todos` changes
+            --
+            if $open {
+                #[key(todo.id)]
+                for todo in $todos { Text({todo.title}) }
+            } else {
+                Text("hidden")
+            }
+        ]
+    }
 }
+
+// app.add_plugins(ViewPlugin)
 ```
 
 | Item in a list | Meaning |
@@ -251,10 +253,13 @@ coat! {
 | `match value { pat => .., }` | entities for the matching arm |
 | `let pat = expr;` | binding for the following items |
 
-Without `$`, control flow is evaluated once. Regions are `GhostNode`s with the `ui`
-feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
-`update`, `increment`, ...) also work inside `webby` components and `coat::effect`;
-`coat::shard(args, |args, world| scene)` re-renders a subtree when its arguments change.
+Without `$`, control flow is evaluated once. Signals have `get`, `set`, `update`,
+`set_if_neq` and `with`; `memo(|| ..)` derives a cached value from signals, and
+`effect(|commands| ..)` re-runs a side effect when a signal it read changes. Signals
+are `Send + Sync`, so they can also live in components or resources and be set from
+systems.
+
+Examples: `view_todos`, `view_tabs`.
 
 ## Comparison with plain Bevy
 
@@ -265,19 +270,19 @@ folder with two standalone files: `radioactive.rs` uses `bevy_radioactive`, and
 
 | Style | `bevy_radioactive` | Plain Bevy |
 | --- | --- | --- |
-| Reactivity | `reactivity_radioactive` | `reactivity_bevy` |
-| Subscriptions | `subscription_radioactive` | `subscription_bevy` |
-| `webby` | `webby_radioactive` | `webby_bevy` |
-| `coat!` | `coat_radioactive` | `coat_bevy` |
+| `watch` | `watch_radioactive` | `watch_bevy` |
+| `subscribe` | `subscribe_radioactive` | `subscribe_bevy` |
+| `hooks` | `hooks_radioactive` | `hooks_bevy` |
+| `view` | `view_radioactive` | `view_bevy` |
 
 ```sh
-cargo run --example reactivity_radioactive --features comparison
+cargo run --example watch_radioactive --features comparison
 ```
 
 The snippets below show only the parts that differ; layout and button styling are the
 same in every file.
 
-### Reactivity: `bind` vs change-detection systems
+### `watch`: `bind` vs change-detection systems
 
 The count is a `Count` resource and the buttons write it with `ResMut<Count>`.
 
@@ -314,7 +319,7 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 }
 ```
 
-### Subscriptions: `subscribe_to` vs marker lookups
+### `subscribe`: `subscribe_to` vs marker lookups
 
 There is no shared state: the label owns a `LabelCount` component and announces each
 new value with a `CountChanged` entity event.
@@ -356,7 +361,7 @@ on(|changed: On<CountChanged>, mut resets: Query<&mut Node, With<ResetButton>>| 
 })
 ```
 
-### `webby`: component state vs a re-render system
+### `hooks`: component state vs a re-render system
 
 The count is local to the counter, and every change rebuilds its subtree.
 
@@ -407,7 +412,7 @@ fn counter(root: Entity, count: i32) -> impl Scene {
 }
 ```
 
-### `coat!`: signals vs patching and spawning by hand
+### `view`: signals vs patching and spawning by hand
 
 Only the label's `Text` is patched, and the Reset button exists only while the count
 is not zero.
@@ -416,7 +421,7 @@ With `bevy_radioactive`, a `$` read patches the field and `if` owns the button:
 
 ```rust,ignore
 let count = signal(|| 0);
-coat! {
+view! {
     // ...
     on(move |_: On<Activate>| count.set($count + 1))
     --
@@ -459,37 +464,20 @@ fn toggle_reset_button(
 }
 ```
 
-## Change and delivery semantics
+## Scheduling and performance
 
-- Tracking uses Bevy change ticks: insertion and mutable dereferencing count as
-  changes. Use `set_if_neq` to avoid publishing no-op writes.
-- Multiple writes between runs are coalesced into one snapshot per source.
-- The runtime runs in `PostUpdate` in `ReactiveSet::Publish`, before
-  `UiSystems::Prepare` with the `ui` feature, so reaction output is laid out in the
-  same frame. Writes made later in the frame are published on the next frame.
-- Inside the runtime, publishing, components and regions repeat until nothing changes, up
-  to `ReactiveSettings::max_passes` (default 8). A reaction that writes another
-  tracked value is therefore delivered in the same frame.
-- When a type is first tracked by a scene, its publisher's first run reports the current
-  values once, so the first watcher of a resource also receives its current value.
-- `watch` and `bind` do not replay the current value when a listener attaches. Values
-  inserted by the same scene are published as changes, so same-scene sources render
-  on spawn; for an existing resource, initialize the node from it or use `webby`/`coat!`.
-- Removal is delivered synchronously, while the source still exists.
-- Ordering between different local observers is unspecified.
-- Sources with Bevy's `Disabled` marker still publish and route events.
+Each plugin runs in its own system set in `PostUpdate` — `WatchSystems`,
+`HooksSystems` and `ViewSystems` — before UI layout with the `ui` feature. Order
+systems that write watched values `.before(...)` the set to show them the same frame.
+Each runtime repeats until nothing changes, up to 8 rounds per frame.
 
-## Performance model
-
-`track::<T>` adds one publisher that uses Bevy's `Changed<T>` filter, clones one `T`
-snapshot per changed source, and shares it through `Arc` with every listener of that
-source. Each `watch`/`bind` creates one small subscription entity per source, owned
-by (and despawned with) its listener.
-
-`webby` components and `coat!` regions check the change ticks and signal versions of
-their recorded dependencies each pass, and do no work when nothing changed. A component
-re-render respawns its subtree, so keep components small; prefer `coat!` regions or
-`bind` for hot paths and normal systems for thousands of entities changing every frame.
+- `watch` adds one publisher per watched type using Bevy's `Changed<T>` filter. Each
+  changed value is cloned once and shared with every watcher of that source.
+- `subscribe` adds one observer per event type and one small entity per
+  subscription.
+- `hooks` components and `view` regions check what they read each round and do
+  nothing when it didn't change. Prefer `view` regions or `bind` for hot paths, and
+  plain systems for thousands of entities changing every frame.
 
 ## Official Bevy references
 
@@ -497,4 +485,3 @@ re-render respawns its subtree, so keep components small; prefer `coat!` regions
 - [BSN and scene observers](https://docs.rs/bevy/0.20.0/bevy/scene/)
 - [Bevy observer semantics](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/observer/)
 - [Bevy change detection](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/change_detection/)
-- [Bevy ECS relationships](https://docs.rs/bevy_ecs/0.20.0/bevy_ecs/relationship/)

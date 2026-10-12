@@ -1,11 +1,8 @@
-//! React-style `webby` todo list: a resource drives keyed rows, each row keeps
+//! React-style `hooks` todo list: a resource drives keyed rows, each row keeps
 //! its own `use_state`, and a theme flows down through context.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    webby::{Cx, Signal, component},
-};
+use bevy_radioactive::hooks::*;
 
 #[derive(Clone, Copy, PartialEq)]
 struct Todo {
@@ -16,16 +13,18 @@ struct Todo {
 #[derive(Resource, Clone, Default)]
 struct Todos(Vec<Todo>);
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
 enum Theme {
     Light,
     Dark,
 }
 
 #[component]
-fn todo_app(cx: &Cx, theme: Signal<Theme>) -> impl Scene {
-    // Like `<ThemeContext.Provider value={theme}>`.
-    cx.provide_context(theme.clone());
+fn todo_app(cx: &Cx) -> impl Scene {
+    // Like `<ThemeContext.Provider value={theme}>`. Re-renders when `Theme`
+    // changes, and the rows render again with the new context.
+    let theme = cx.use_resource::<Theme>().unwrap_or(Theme::Light);
+    cx.provide_context(theme);
 
     // Re-renders when the `Todos` resource changes.
     let todos = cx.use_resource::<Todos>().unwrap_or_default().0;
@@ -57,9 +56,7 @@ fn todo_row(cx: &Cx, todo: Todo) -> impl Scene {
         set_renders(renders + 1);
     });
 
-    let theme = cx
-        .use_context::<Signal<Theme>>()
-        .map_or(Theme::Light, |theme| theme.get());
+    let theme = cx.use_context::<Theme>().unwrap_or(Theme::Light);
     bsn! { Text({format!("[{theme:?}] #{} {} (mounted {renders}x)", todo.id, todo.title)}) }
 }
 
@@ -72,21 +69,21 @@ fn print_texts(app: &mut App, label: &str) {
 }
 
 fn main() {
-    let theme = Signal::new(Theme::Light);
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
+        HooksPlugin,
     ))
+    .insert_resource(Theme::Light)
     .insert_resource(Todos(vec![Todo {
         id: 1,
         title: "Write docs",
     }]));
 
     app.world_mut()
-        .spawn_scene(bsn! { Node @todo_app(theme.clone()) })
+        .spawn_scene(bsn! { Node @todo_app() })
         .unwrap();
     app.update();
     print_texts(&mut app, "initial");
@@ -101,8 +98,7 @@ fn main() {
     app.update();
     print_texts(&mut app, "after adding a todo");
 
-    // Context consumers that read the signal re-render; the parent does not.
-    theme.set(Theme::Dark);
+    *app.world_mut().resource_mut::<Theme>() = Theme::Dark;
     app.update();
     print_texts(&mut app, "after switching theme");
 }
