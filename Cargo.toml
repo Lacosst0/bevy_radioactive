@@ -35,6 +35,11 @@ module_name_repetitions = "allow"
 type_complexity = "allow"
 
 [[example]]
+name = "comparison_bevy"
+path = "examples/comparison/bevy.rs"
+required-features = ["comparison"]
+
+[[example]]
 name = "comparison_reactivity"
 path = "examples/comparison/reactivity.rs"
 required-features = ["comparison"]
