@@ -1,8 +1,8 @@
-//! Counter in plain Bevy, the counterpart of `hooks_radioactive`.
+//! Counter as a React-style `hooks` component.
 //!
-//! The count is state on the counter's root entity. Like a React re-render,
-//! a system rebuilds the whole subtree from that state whenever it changes;
-//! without `hooks` it has to run for every counter and do the respawn itself.
+//! The count is component state; every change re-renders the component.
+//!
+//! Plain Bevy version: `comparison_bevy`.
 
 use bevy::{
     feathers::{
@@ -17,17 +17,13 @@ use bevy::{
     prelude::*,
     ui_widgets::Activate,
 };
-
-/// The counter's state, stored on its root entity.
-#[derive(Component, Clone, Default)]
-struct CounterState(i32);
+use bevy_radioactive::hooks::*;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, FeathersPlugins))
+        .add_plugins((DefaultPlugins, FeathersPlugins, HooksPlugin))
         .insert_resource(UiTheme(create_dark_theme()))
         .add_systems(Startup, scene.spawn())
-        .add_systems(Update, render_counters)
         .run();
 }
 
@@ -37,30 +33,14 @@ fn scene() -> impl SceneList {
         --
         Node { width: percent(100), height: percent(100) }
         ThemeBackgroundColor(tokens::WINDOW_BG)
-        Children [ CounterState(0) ]
+        @counter()
     }
 }
 
-/// Re-renders every counter whose state was added or changed.
-fn render_counters(
-    counters: Query<(Entity, &CounterState), Changed<CounterState>>,
-    mut commands: Commands,
-) {
-    for (root, state) in &counters {
-        commands
-            .entity(root)
-            .despawn_children()
-            .apply_scene(counter(root, state.0));
-    }
-}
-
-/// Builds the counter's UI for `count`; the buttons write back to `root`.
-fn counter(root: Entity, count: i32) -> impl Scene {
-    let set_count = move |states: &mut Query<&mut CounterState>, value: i32| {
-        if let Ok(mut state) = states.get_mut(root) {
-            state.0 = value;
-        }
-    };
+#[component]
+fn counter(cx: &Cx) -> impl Scene {
+    let (count, set_count) = cx.use_state(|| 0);
+    let (decrement, increment, reset) = (set_count.clone(), set_count.clone(), set_count);
 
     bsn! {
         Node {
@@ -77,7 +57,7 @@ fn counter(root: Entity, count: i32) -> impl Scene {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>, mut states: Query<&mut CounterState>| set_count(&mut states, count - 1))
+                on(move |_: On<Activate>| decrement(count - 1))
                 Children [ @caption("-1") ]
                 --
                 Text({count.to_string()})
@@ -87,15 +67,16 @@ fn counter(root: Entity, count: i32) -> impl Scene {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>, mut states: Query<&mut CounterState>| set_count(&mut states, count + 1))
+                on(move |_: On<Activate>| increment(count + 1))
                 Children [ @caption("+1") ]
             ]
             --
+            // Like `{count !== 0 && <Reset />}` in JSX.
             {(count != 0).then(|| bsn_list! {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(move |_: On<Activate>, mut states: Query<&mut CounterState>| set_count(&mut states, 0))
+                on(move |_: On<Activate>| reset(0))
                 Children [ @caption("Reset") ]
             })}
         ]

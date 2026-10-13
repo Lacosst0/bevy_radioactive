@@ -1,8 +1,9 @@
-//! Counter in plain Bevy, the counterpart of `watch_radioactive`.
+//! Counter in plain Bevy, without `bevy_radioactive`: the baseline for the
+//! other `comparison_*` examples.
 //!
-//! The count is a resource. Buttons mutate it; instead of `bind`, global
-//! systems gated on `resource_changed` find the label and the Reset button by
-//! marker components and write to them.
+//! The count is a resource. Buttons mutate it, and global systems gated on
+//! `resource_changed` find the label and the Reset button by marker components
+//! and write to them.
 
 use bevy::{
     feathers::{

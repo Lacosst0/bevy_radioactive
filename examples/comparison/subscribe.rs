@@ -1,6 +1,6 @@
 //! Counter using event subscriptions.
 //!
-//! Plain Bevy counterpart: `subscribe_bevy`.
+//! Plain Bevy version: `comparison_bevy`.
 //!
 //! There is no shared state: the label owns its count and subscribes to the
 //! `Activate` events of the three buttons. It announces each new count with a

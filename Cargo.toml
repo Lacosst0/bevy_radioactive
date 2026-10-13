@@ -80,41 +80,26 @@ path = "examples/view_todos.rs"
 required-features = ["view"]
 
 [[example]]
-name = "watch_radioactive"
-path = "examples/comparison/watch/radioactive.rs"
+name = "comparison_bevy"
+path = "examples/comparison/bevy.rs"
+required-features = ["comparison"]
+
+[[example]]
+name = "comparison_watch"
+path = "examples/comparison/watch.rs"
 required-features = ["comparison", "watch"]
 
 [[example]]
-name = "watch_bevy"
-path = "examples/comparison/watch/bevy.rs"
-required-features = ["comparison"]
-
-[[example]]
-name = "subscribe_radioactive"
-path = "examples/comparison/subscribe/radioactive.rs"
+name = "comparison_subscribe"
+path = "examples/comparison/subscribe.rs"
 required-features = ["comparison", "subscribe"]
 
 [[example]]
-name = "subscribe_bevy"
-path = "examples/comparison/subscribe/bevy.rs"
-required-features = ["comparison"]
-
-[[example]]
-name = "hooks_radioactive"
-path = "examples/comparison/hooks/radioactive.rs"
+name = "comparison_hooks"
+path = "examples/comparison/hooks.rs"
 required-features = ["comparison", "hooks"]
 
 [[example]]
-name = "hooks_bevy"
-path = "examples/comparison/hooks/bevy.rs"
-required-features = ["comparison"]
-
-[[example]]
-name = "view_radioactive"
-path = "examples/comparison/view/radioactive.rs"
+name = "comparison_view"
+path = "examples/comparison/view.rs"
 required-features = ["comparison", "view"]
-
-[[example]]
-name = "view_bevy"
-path = "examples/comparison/view/bevy.rs"
-required-features = ["comparison"]
