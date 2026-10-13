@@ -1,11 +1,8 @@
-//! `coat!` tabs: a reactive `match`, a patched component, a `memo`, and a
-//! `shard` that queries the world when its argument changes.
+//! `view!` tabs: a reactive `match`, a patched component, a `memo`, and an
+//! `effect`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    coat::{coat, memo, shard, signal},
-};
+use bevy_radioactive::view::*;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Tab {
@@ -13,8 +10,8 @@ enum Tab {
     Settings,
 }
 
-#[derive(Component, Clone, Default)]
-struct Score(u32);
+#[derive(Resource, Default)]
+struct VolumeSetting(u32);
 
 fn main() {
     let mut app = App::new();
@@ -22,10 +19,9 @@ fn main() {
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
-    ));
-    app.world_mut().spawn(Score(10));
-    app.world_mut().spawn(Score(32));
+        ViewPlugin,
+    ))
+    .init_resource::<VolumeSetting>();
 
     let tab = signal(|| Tab::Profile);
     let volume = signal(|| 50_u32);
@@ -36,7 +32,7 @@ fn main() {
 
     let scene = {
         let (tab, volume, title) = (tab.clone(), volume.clone(), title.clone());
-        coat! {
+        view! {
             Node
             Children [
                 // Patched in place whenever the memo changes.
@@ -45,22 +41,17 @@ fn main() {
                 match $tab {
                     Tab::Profile => {
                         Text("Profile")
-                        --
-                        // Like a Topcoat `#[shard]`: renders from the world, and again
-                        // whenever its arguments (none here) change.
-                        Node
-                        shard(move || (), |(), world: &World| {
-                            let total: u32 = world
-                                .try_query::<&Score>()
-                                .map(|mut q| q.iter(world).map(|s| s.0).sum())
-                                .unwrap_or_default();
-                            bsn! { Text({format!("Total score: {total}")}) }
-                        })
                     },
                     Tab::Settings => {
                         Text($(format!("Volume: {}%", $volume)))
                         --
                         if $volume > 80 { Text("Careful, that's loud") }
+                        --
+                        // Runs again whenever `volume` changes.
+                        Node
+                        effect(move |commands: &mut Commands| {
+                            commands.insert_resource(VolumeSetting(volume.get()));
+                        })
                     },
                 }
             ]
@@ -86,4 +77,8 @@ fn main() {
     volume.set(90);
     app.update();
     print(&mut app, "louder");
+    println!(
+        "saved volume: {}",
+        app.world().resource::<VolumeSetting>().0
+    );
 }

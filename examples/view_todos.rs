@@ -1,10 +1,7 @@
-//! A `coat!` template with reactive `if`, keyed `for`, and patched text.
+//! A `view!` template with reactive `if`, keyed `for`, and patched text.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    coat::{coat, signal},
-};
+use bevy_radioactive::view::*;
 
 #[derive(Clone, PartialEq)]
 struct Todo {
@@ -18,7 +15,7 @@ fn main() {
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
+        ViewPlugin,
     ));
 
     let todos = signal(|| {
@@ -29,7 +26,7 @@ fn main() {
     });
     let scene = {
         let todos = todos.clone();
-        coat! {
+        view! {
             Node
             Children [
                 Text($(format!("{} todos", $todos.len())))

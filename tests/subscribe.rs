@@ -1,9 +1,8 @@
+#![cfg(feature = "subscribe")]
 //! Integration coverage for source-preserving event subscriptions.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin, ui_widgets::ValueChange};
-use bevy_radioactive::subscription::{
-    SubscribedTo, Subscription, SubscriptionAppExt, subscribe_to,
-};
+use bevy_radioactive::subscribe::*;
 
 #[derive(Component, Clone, Copy, Default)]
 struct Source;
@@ -122,42 +121,34 @@ fn forwarding_does_not_retrigger_the_original_global_event() {
     assert_eq!(app.world().resource::<NativeEventCount>().0, 1);
 }
 
+#[derive(Component, Clone, Copy, Default)]
+struct First;
+
+#[derive(Component, Clone, Copy, Default)]
+struct Second;
+
 #[test]
-fn cyclic_relationships_do_not_recurse() {
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins)
-        .init_resource::<Log>()
-        .register_subscription::<Ping>();
-
-    let first = app.world_mut().spawn_empty().id();
-    let second = app.world_mut().spawn_empty().id();
-
+fn cyclic_subscriptions_do_not_recurse() {
+    let mut app = subscription_app();
     app.world_mut()
-        .entity_mut(first)
-        .insert(SubscribedTo::<Ping>::new(second))
-        .observe(|event: Subscription<Ping>, mut log: ResMut<Log>| {
-            log.0.push((
-                event.target(),
-                event.source(),
-                event.event().source,
-                event.value,
-                false,
-            ));
-        });
-    app.world_mut()
-        .entity_mut(second)
-        .insert(SubscribedTo::<Ping>::new(first))
-        .observe(|event: Subscription<Ping>, mut log: ResMut<Log>| {
-            log.0.push((
-                event.target(),
-                event.source(),
-                event.event().source,
-                event.value,
-                false,
-            ));
-        });
+        .spawn_scene(bsn! {
+            Children[
+                #First First
+                subscribe_to(#Second, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.source, event.value, false));
+                })
+                --
+                #Second Second
+                subscribe_to(#First, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.source, event.value, false));
+                })
+            ]
+        })
+        .unwrap();
     settle(&mut app);
 
+    let first = single_entity::<First>(app.world_mut());
+    let second = single_entity::<Second>(app.world_mut());
     app.world_mut().trigger(Ping {
         source: first,
         value: 23,
@@ -170,12 +161,32 @@ fn cyclic_relationships_do_not_recurse() {
     );
 }
 
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+struct Total(i32);
+
 #[test]
-#[should_panic(expected = "not registered")]
-fn direct_relationship_requires_app_time_registration() {
+fn bind_event_writes_the_declaring_entity() {
     let mut app = subscription_app();
-    let source = app.world_mut().spawn_empty().id();
-    app.world_mut().spawn(SubscribedTo::<Ping>::new(source));
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children[
+                #Source Source
+                --
+                Subscriber
+                Total(0)
+                bind_event(#Source, |ping: &Ping, total: &mut Total| total.0 += ping.value)
+            ]
+        })
+        .unwrap();
+    settle(&mut app);
+
+    let source = single_entity::<Source>(app.world_mut());
+    app.world_mut().trigger(Ping { source, value: 2 });
+    app.world_mut().trigger(Ping { source, value: 5 });
+    app.world_mut().flush();
+
+    let subscriber = single_entity::<Subscriber>(app.world_mut());
+    assert_eq!(app.world().get::<Total>(subscriber), Some(&Total(7)));
 }
 
 #[test]
@@ -279,24 +290,21 @@ fn bsn_helper_allows_multiple_handlers_for_the_same_source() {
 #[test]
 fn custom_disabled_sources_still_forward() {
     let mut app = subscription_app();
-    app.register_subscription::<Ping>();
     app.world_mut()
         .register_disabling_component::<CustomDisabled>();
 
     let source = app.world_mut().spawn((Source, CustomDisabled)).id();
     let listener = app
         .world_mut()
-        .spawn(SubscribedTo::<Ping>::new(source))
-        .observe(|event: Subscription<Ping>, mut log: ResMut<Log>| {
-            log.0.push((
-                event.target(),
-                event.source(),
-                event.event().source,
-                event.value,
-                false,
-            ));
+        .spawn_scene(bsn! {
+            Subscriber
+            subscribe_to(source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                log.0.push((event.target(), event.source(), event.source, event.value, false));
+            })
         })
+        .unwrap()
         .id();
+    settle(&mut app);
 
     app.world_mut().trigger(Ping { source, value: 29 });
     app.world_mut().flush();

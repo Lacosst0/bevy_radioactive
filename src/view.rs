@@ -1,42 +1,31 @@
-//! Signals and a reactive template language for BSN, modelled on
-//! [Topcoat](https://github.com/tokio-rs/topcoat).
-//!
-//! Topcoat's `view!` mixes markup with a small subset of Rust — `if`/`else`,
-//! `for` with `#[key(...)]`, `match` and `let` — and marks the parts that
-//! re-run when signals change with `$`. [`coat!`] does the same on top of
-//! `bsn!`:
+//! Fine-grained reactive templates: [`view!`] is `bsn!` plus signals and
+//! reactive control flow, modelled on [Topcoat](https://github.com/tokio-rs/topcoat).
 //!
 //! ```ignore
-//! use bevy_radioactive::coat::*;
+//! use bevy_radioactive::view::*;
+//!
+//! app.add_plugins(ViewPlugin);
 //!
 //! fn todo_list() -> impl Scene {
 //!     let todos = signal(|| vec![Todo::new(1, "Write docs")]);
-//!     let filter = signal(|| Filter::All);
 //!     let open = signal(|| true);
 //!
-//!     coat! {
-//!         Node { flex_direction: FlexDirection::Column }
+//!     view! {
+//!         Node
 //!         Children [
 //!             Button
 //!             on(move |_: On<Pointer<Click>>| open.set(!$open))
-//!             Children [ Text("Toggle") ]
 //!             --
-//!             // re-renders only when the branch changes
+//!             // patched in place when `todos` changes
+//!             Text($(format!("{} todos", $todos.len())))
+//!             --
+//!             // rebuilt only when the condition changes
 //!             if $open {
-//!                 Text($(format!("{} todos", $todos.len())))
+//!                 // keyed: unchanged rows keep their entities
+//!                 #[key(todo.id)]
+//!                 for todo in $todos { Text({todo.title.clone()}) }
 //!             } else {
 //!                 Text("hidden")
-//!             }
-//!             --
-//!             // keyed: unchanged rows keep their entities
-//!             #[key(todo.id)]
-//!             for todo in $todos.into_iter().filter(|t| $filter.accepts(t)) {
-//!                 Text({todo.title.clone()})
-//!             }
-//!             --
-//!             match $filter {
-//!                 Filter::All => Text("Showing all"),
-//!                 Filter::Done => Text("Showing done"),
 //!             }
 //!         ]
 //!     }
@@ -45,57 +34,37 @@
 //!
 //! # Template language
 //!
-//! `coat!` accepts everything `bsn!` accepts. Inside relationship lists
+//! `view!` accepts everything `bsn!` accepts. Inside relationship lists
 //! (`Children [ ... ]`) an item may also be:
 //!
-//! | Item                                       | Meaning                                  |
-//! | ------------------------------------------ | ---------------------------------------- |
-//! | `if c { .. } else if c { .. } else { .. }` | conditional entities                     |
-//! | `#[key(expr)] for pat in iter { .. }`      | one set of entities per item, keyed      |
-//! | `for pat in iter { .. }`                   | one set per item, identified by position |
-//! | `match value { pat => .., }`               | entities for the matching arm            |
-//! | `let pat = expr;`                          | binding visible to the following items   |
+//! | Item | Meaning |
+//! | --- | --- |
+//! | `if c { .. } else if c { .. } else { .. }` | conditional entities |
+//! | `#[key(expr)] for pat in iter { .. }` | entities per item; unchanged rows keep their entities |
+//! | `for pat in iter { .. }` | entities per item, identified by position |
+//! | `match value { pat => .., }` | entities for the matching arm |
+//! | `let pat = expr;` | binding for the following items |
 //!
-//! Bodies are themselves `--` separated lists. Control flow is plain Rust
-//! evaluated once, unless its condition, iterator or scrutinee reads a
-//! signal with `$`. Then it becomes a *region*: a [`Region`] entity (a
-//! `GhostNode` with the `ui` feature, so it does not affect layout) whose
-//! children are rebuilt when that value changes. `for` regions keep the
-//! entities of rows whose key and value are unchanged.
-//!
-//! `$name` reads signal `name` (it becomes `name.get()`), and `$(expr)`
-//! groups an expression. A component written with `$` in its fields, such
-//! as `Text($(format!("{}", $count)))` or `Node { width: px($width) }`, is
-//! initialised from the current values and patched in place whenever those
-//! signals change. Elsewhere `$` is an ordinary read. Every closure the
-//! macro generates clones the signals it reads, so one signal can be used
-//! in any number of places without manual clones.
-//!
-//! | Topcoat                              | `coat`                                       |
-//! | ------------------------------------ | -------------------------------------------- |
-//! | `let open = signal(cx, \|\| false)`  | `let open = signal(\|\| false)`              |
-//! | `$(expr)`, `:attr=$(...)`            | `$name`, `$(expr)` in component fields       |
-//! | `@click=$(\|_\| ...)`                | BSN `on(move \|_: On<Pointer<Click>>\| ...)` |
-//! | `if` / `for` + `#[key]` / `match`    | the same, reactive when they read `$`        |
-//! | `#[shard]`                           | [`shard`]                                    |
-//! | `#[memoize]`                         | [`memo`]                                     |
+//! `$name` reads signal `name`, and `$(expr)` groups an expression. Control
+//! flow that reads a signal becomes a *region* that rebuilds only itself when
+//! the signal changes (a `GhostNode` with the `ui` feature, so it doesn't
+//! affect layout). Without `$` it is evaluated once. A component with `$` in
+//! its fields, such as `Text($(format!("{}", $count)))`, is patched in place.
+//! Closures generated by the macro clone the signals they use, so one signal
+//! can be used anywhere in the template.
 //!
 //! # Signals
 //!
-//! A [`Signal`] is a cheaply cloneable shared cell that lives outside the
-//! ECS. Reading it inside a region, a patched component, [`effect`],
-//! [`shard`] arguments, a [`memo`], or a `webby` component subscribes that
-//! code to later `set` calls. Signals are `Send + Sync`, so they can also be
-//! stored in components or resources and set from systems. Everything runs
-//! in [`ReactiveSet::Publish`], before UI layout.
-//!
-//! [`ReactiveSet::Publish`]: crate::reactivity::ReactiveSet::Publish
+//! A [`Signal`] is a cheaply cloneable shared value. Reading it in a region,
+//! a patched component, an [`effect`] or a [`memo`] subscribes that code to
+//! later writes. Signals are `Send + Sync`, so they can be stored in
+//! components or resources and set from systems. Updates run in
+//! [`ViewSystems`] in `PostUpdate`, before UI layout.
 
 use std::{
     cell::RefCell,
     fmt,
     hash::Hash,
-    ops::{Add, Sub},
     sync::{
         Arc, Mutex, PoisonError, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -103,15 +72,42 @@ use std::{
 };
 
 use bevy::{
-    ecs::{component::Mutable, world::CommandQueue},
+    ecs::{
+        component::Mutable,
+        entity::EntityHashSet,
+        entity_disabling::Disabled,
+        lifecycle::HookContext,
+        template::{Template, TemplateContext},
+        world::{CommandQueue, DeferredWorld},
+    },
     platform::collections::HashMap,
     prelude::*,
-    scene::{EmptySceneEffect, Scene, SceneList, WorldSceneExt},
+    scene::{EmptySceneEffect, SceneList, WorldSceneExt},
 };
 
-pub use crate::macros::{coat, coat_list};
+pub use crate::macros::{view, view_list};
 
-use crate::runtime::{RunFn, effect_template, signal_deps, spawn_child, tracked};
+/// Rounds of updates per frame, so a signal set by an effect settles in
+/// one frame.
+const MAX_ROUNDS: usize = 8;
+
+/// Runs view updates each frame. Required by [`view!`] regions, patched
+/// components and [`effect`].
+#[derive(Default)]
+pub struct ViewPlugin;
+
+impl Plugin for ViewPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Hosts>()
+            .add_systems(PostUpdate, update_all.in_set(ViewSystems));
+        #[cfg(feature = "ui")]
+        app.configure_sets(PostUpdate, ViewSystems.before(bevy::ui::UiSystems::Prepare));
+    }
+}
+
+/// System set in `PostUpdate` that updates views.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewSystems;
 
 // ---------------------------------------------------------------------------
 // Dependency tracking
@@ -123,13 +119,13 @@ trait Versioned: Send + Sync {
 
 /// A signal or memo read by a tracking scope, with the version it had.
 #[derive(Clone)]
-pub(crate) struct SignalDep {
+struct SignalDep {
     source: Arc<dyn Versioned>,
     version: u64,
 }
 
 impl SignalDep {
-    pub(crate) fn is_dirty(&self) -> bool {
+    fn is_dirty(&self) -> bool {
         self.source.version() != self.version
     }
 }
@@ -147,7 +143,7 @@ impl Drop for ScopeGuard {
 }
 
 /// Runs `f`, collecting every signal and memo it reads.
-pub(crate) fn scope<R>(f: impl FnOnce() -> R) -> (R, Vec<SignalDep>) {
+fn scope<R>(f: impl FnOnce() -> R) -> (R, Vec<SignalDep>) {
     SCOPES.with(|scopes| scopes.borrow_mut().push(Vec::new()));
     let guard = ScopeGuard;
     let value = f();
@@ -189,8 +185,8 @@ impl<T: Send + Sync> Versioned for SignalInner<T> {
 /// Reactive state shared by the closures of a scene.
 ///
 /// Cloning is cheap and every clone refers to the same value. Reading with
-/// [`get`](Self::get) or [`with`](Self::with) inside a `coat` or `webby`
-/// closure subscribes that closure to later [`set`](Self::set) calls.
+/// [`get`](Self::get) or [`with`](Self::with) inside a `view!`
+/// region, patched component, [`effect`] or [`memo`] subscribes that closure to later [`set`](Self::set) calls.
 pub struct Signal<T>(Arc<SignalInner<T>>);
 
 /// Creates a signal holding the value `init` returns.
@@ -269,45 +265,8 @@ impl<T: Send + Sync + 'static> Signal<T> {
         result
     }
 
-    /// Marks the signal changed without modifying it.
-    pub fn notify(&self) {
+    fn notify(&self) {
         self.0.version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Returns `true` if both handles refer to the same signal.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-/// Values that [`Signal::increment`] and [`Signal::decrement`] can step.
-pub trait Step: Add<Output = Self> + Sub<Output = Self> + Sized {
-    /// The step size.
-    const ONE: Self;
-}
-
-macro_rules! step {
-    ($($ty:ty => $one:expr),* $(,)?) => {
-        $(impl Step for $ty { const ONE: Self = $one; })*
-    };
-}
-
-step!(
-    u8 => 1, u16 => 1, u32 => 1, u64 => 1, u128 => 1, usize => 1,
-    i8 => 1, i16 => 1, i32 => 1, i64 => 1, i128 => 1, isize => 1,
-    f32 => 1.0, f64 => 1.0,
-);
-
-impl<T: Step + Copy + Send + Sync + 'static> Signal<T> {
-    /// Adds one and notifies readers.
-    pub fn increment(&self) {
-        self.update(|value| *value = *value + T::ONE);
-    }
-
-    /// Subtracts one and notifies readers.
-    pub fn decrement(&self) {
-        self.update(|value| *value = *value - T::ONE);
     }
 }
 
@@ -437,38 +396,137 @@ impl<T> Clone for Memo<T> {
     }
 }
 
-/// Clones the listed signals into a closure, so several closures in one
-/// scene can capture the same signal.
-///
-/// ```ignore
-/// on(cloned!(count => move |_: On<Pointer<Click>>| count.increment()))
-/// text(cloned!(count => move || count.get().to_string()))
-/// ```
-#[macro_export]
-macro_rules! cloned {
-    ($($name:ident),+ $(,)? => $body:expr) => {{
-        $(let $name = $name.clone();)+
-        $body
-    }};
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+type RunFn = Box<dyn FnMut(&mut World, Entity) -> Vec<SignalDep> + Send + Sync>;
+
+struct Slot {
+    run: RunFn,
+    deps: Vec<SignalDep>,
+    ran: bool,
 }
 
-pub use crate::cloned;
+/// View updates attached to an entity.
+#[derive(Component)]
+#[component(on_add = add_host, on_remove = remove_host)]
+struct Updates(Vec<Slot>);
 
-// ---------------------------------------------------------------------------
-// Scene helpers
-// ---------------------------------------------------------------------------
+#[derive(Resource, Default)]
+struct Hosts(EntityHashSet);
 
-/// Runs `f` now and again whenever a signal it read changes. Side effects go
-/// through `Commands`, applied right after the run.
+fn add_host(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
+        hosts.0.insert(context.entity);
+    }
+}
+
+fn remove_host(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
+        hosts.0.remove(&context.entity);
+    }
+}
+
+fn update_all(world: &mut World) {
+    for _ in 0..MAX_ROUNDS {
+        if update_dirty(world) == 0 {
+            return;
+        }
+    }
+}
+
+/// Runs every update whose signals changed. Returns how many ran.
+fn update_dirty(world: &mut World) -> usize {
+    let hosts: Vec<Entity> = world.resource::<Hosts>().0.iter().copied().collect();
+    let mut ran = 0;
+    for host in hosts {
+        let Ok(mut entity) = world.get_entity_mut(host) else {
+            continue;
+        };
+        if entity.contains::<Disabled>() {
+            continue;
+        }
+        let Some(mut updates) = entity.get_mut::<Updates>() else {
+            continue;
+        };
+        let mut slots = std::mem::take(&mut updates.bypass_change_detection().0);
+        for slot in &mut slots {
+            if slot.ran && !slot.deps.iter().any(SignalDep::is_dirty) {
+                continue;
+            }
+            slot.deps = (slot.run)(world, host);
+            slot.ran = true;
+            ran += 1;
+            if world.get_entity(host).is_err() {
+                break;
+            }
+        }
+        if let Ok(mut entity) = world.get_entity_mut(host)
+            && let Some(mut current) = entity.get_mut::<Updates>()
+        {
+            let current = current.bypass_change_detection();
+            slots.append(&mut current.0);
+            current.0 = slots;
+        }
+    }
+    ran
+}
+
+struct UpdateTemplate<F>(F);
+
+impl<F> Template for UpdateTemplate<F>
+where
+    F: Fn() -> RunFn + Clone + Send + Sync + 'static,
+{
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        let installed = context
+            .entity
+            .world_scope(|world| world.contains_resource::<Hosts>());
+        if !installed {
+            return Err("reactive views need `ViewPlugin`; add it to the app".into());
+        }
+        let slot = Slot {
+            run: (self.0)(),
+            deps: Vec::new(),
+            ran: false,
+        };
+        if let Some(mut updates) = context.entity.get_mut::<Updates>() {
+            updates.0.push(slot);
+        } else {
+            context.entity.insert(Updates(vec![slot]));
+        }
+        Ok(EmptySceneEffect)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+fn effect_template(
+    make: impl Fn() -> RunFn + Clone + Send + Sync + 'static,
+) -> impl Template<Output = EmptySceneEffect> {
+    UpdateTemplate(make)
+}
+
+/// Runs `f` when the scene spawns and again whenever a signal it read
+/// changes. Side effects go through `Commands`, applied right after.
+///
+/// ```ignore
+/// effect(move |commands| commands.insert_resource(Volume(volume.get())))
+/// ```
 pub fn effect<F>(f: F) -> impl Template<Output = EmptySceneEffect>
 where
     F: Fn(&mut Commands) + Clone + Send + Sync + 'static,
 {
-    effect_template((), move |()| -> RunFn {
+    effect_template(move || -> RunFn {
         let f = f.clone();
-        Box::new(move |world: &mut World, target| {
+        Box::new(move |world: &mut World, _| {
             let mut queue = CommandQueue::default();
-            let ((), deps) = tracked(world, target, |_| {
+            let ((), deps) = scope(|| {
                 let mut commands = Commands::new(&mut queue, world);
                 f(&mut commands);
             });
@@ -478,45 +536,26 @@ where
     })
 }
 
-/// Re-renders a child scene whenever `args()` changes. Like a Topcoat
-/// `#[shard]` called with `$(...)` arguments.
-///
-/// `render` receives the arguments and `&World`, so it can query any state
-/// the way a shard queries the database. Reads of the world are not
-/// tracked: only argument changes re-render the shard. The current entity
-/// should have no other children.
-pub fn shard<A, AF, S, R>(args: AF, render: R) -> impl Template<Output = EmptySceneEffect>
-where
-    A: PartialEq + Send + Sync + 'static,
-    AF: Fn() -> A + Clone + Send + Sync + 'static,
-    S: Scene,
-    R: Fn(&A, &World) -> S + Clone + Send + Sync + 'static,
-{
-    effect_template((), move |()| -> RunFn {
-        let (args, render) = (args.clone(), render.clone());
-        let mut current: Option<(A, Option<Entity>)> = None;
-        Box::new(move |world: &mut World, target| {
-            let (next, deps) = tracked(world, target, |_| args());
-            if current.as_ref().is_none_or(|(args, _)| *args != next) {
-                if let Some((_, Some(child))) = current.take() {
-                    world.despawn(child);
-                }
-                let scene = untracked(|| render(&next, world));
-                let child = spawn_child(world, target, scene);
-                current = Some((next, child));
-            }
-            deps
-        })
-    })
+#[cfg(feature = "ui")]
+fn strip_ghost_transform(mut world: DeferredWorld, context: HookContext) {
+    // `GhostNode` requires `Transform`, which UI layout doesn't use and Bevy
+    // warns about under a UI parent.
+    world
+        .commands()
+        .entity(context.entity)
+        .remove::<(Transform, GlobalTransform)>();
 }
 
-/// Host entity of a reactive `coat!` region.
-///
-/// With the `ui` feature it is a `GhostNode`, so its children are laid out
-/// as if they were children of the region's parent.
+// ---------------------------------------------------------------------------
+// Template building blocks used by `view!`
+// ---------------------------------------------------------------------------
+
+/// Host entity of a reactive region. With the `ui` feature it is a
+/// `GhostNode`, so its children are laid out as children of its parent.
+#[doc(hidden)]
 #[derive(Component, Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "ui", require(bevy::ui::experimental::GhostNode))]
-#[cfg_attr(feature = "ui", component(on_add = crate::runtime::strip_ghost_transform_hook))]
+#[cfg_attr(feature = "ui", component(on_add = strip_ghost_transform))]
 pub struct Region;
 
 type BoxedList = Box<dyn SceneList>;
@@ -534,7 +573,7 @@ fn spawn_list(world: &mut World, parent: Entity, list: BoxedList) -> Vec<Entity>
             handler(
                 BevyError::from(error),
                 bevy::ecs::error::ErrorContext::Command {
-                    name: "coat::spawn_list".into(),
+                    name: "bevy_radioactive::view::spawn".into(),
                 },
             );
             Vec::new()
@@ -555,7 +594,7 @@ where
     C: Component<Mutability = Mutable>,
     F: Fn(&mut C) + Clone + Send + Sync + 'static,
 {
-    effect_template((), move |()| -> RunFn {
+    effect_template(move || -> RunFn {
         let f = f.clone();
         Box::new(move |world: &mut World, target| {
             let ((), signals) = scope(|| {
@@ -563,7 +602,7 @@ where
                     f(&mut component);
                 }
             });
-            signal_deps(signals)
+            signals
         })
     })
 }
@@ -576,11 +615,11 @@ where
     KF: Fn() -> K + Clone + Send + Sync + 'static,
     R: Fn(&K) -> Option<BoxedList> + Clone + Send + Sync + 'static,
 {
-    effect_template((), move |()| -> RunFn {
+    effect_template(move || -> RunFn {
         let (key, render) = (key.clone(), render.clone());
         let mut current: Option<(K, Vec<Entity>)> = None;
         Box::new(move |world: &mut World, target| {
-            let (next, deps) = tracked(world, target, |_| key());
+            let (next, deps) = scope(&key);
             if current.as_ref().is_none_or(|(key, _)| *key != next) {
                 if let Some((_, children)) = current.take() {
                     despawn_all(world, &children);
@@ -609,12 +648,12 @@ where
     KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
     R: Fn(&V) -> BoxedList + Clone + Send + Sync + 'static,
 {
-    effect_template((), move |()| -> RunFn {
+    effect_template(move || -> RunFn {
         let (items, key, render) = (items.clone(), key.clone(), render.clone());
         let mut rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
         let mut order: Vec<Entity> = Vec::new();
         Box::new(move |world: &mut World, target| {
-            let (next, deps) = tracked(world, target, |_| items());
+            let (next, deps) = scope(&items);
             let mut next_rows = HashMap::default();
             let mut next_order = Vec::new();
             for item in next {
@@ -664,25 +703,25 @@ where
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        Region as __CoatRegion, for_indexed as __coat_for_indexed, for_keyed as __coat_for,
-        patch as __coat_patch, region as __coat_region,
+        Region as __ViewRegion, for_indexed as __view_for_indexed, for_keyed as __view_for,
+        patch as __view_patch, region as __view_region,
     };
     pub use bevy::scene::{bsn, bsn_list};
 }
 
 // `bsn!` checks that its call site's source text starts with `bsn!`. These
-// wrappers give it that call site when invoked from `coat!` output, whose
-// own call site is `coat!`. `bsn`/`bsn_list` resolve through `__private`,
-// which `coat!` output glob-imports.
+// wrappers give it that call site when invoked from `view!` output, whose
+// own call site is `view!`. `bsn`/`bsn_list` resolve through `__private`,
+// which `view!` output glob-imports.
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __coat_bsn {
+macro_rules! __view_bsn {
     ($($tokens:tt)*) => { bsn! { $($tokens)* } };
 }
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __coat_bsn_list {
+macro_rules! __view_bsn_list {
     ($($tokens:tt)*) => { bsn_list! { $($tokens)* } };
 }

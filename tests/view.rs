@@ -1,10 +1,8 @@
-//! Integration coverage for `coat!` templates and signals.
+#![cfg(feature = "view")]
+//! Integration coverage for `view!` templates and signals.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    coat::{Signal, coat, memo, signal},
-};
+use bevy_radioactive::view::*;
 
 #[derive(Component, Clone, Default)]
 struct Label(u32);
@@ -30,7 +28,7 @@ fn app() -> App {
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
+        ViewPlugin,
     ));
     app
 }
@@ -64,7 +62,7 @@ fn reactive_if_and_patched_text() {
     let mut app = app();
     let scene = {
         let (open, count) = (open.clone(), count.clone());
-        coat! {
+        view! {
             Root
             Children [
                 Label(0)
@@ -100,7 +98,7 @@ fn keyed_for_reuses_unchanged_rows() {
     let mut app = app();
     let scene = {
         let rows = rows.clone();
-        coat! {
+        view! {
             Root
             Children [
                 #[key(row.id)]
@@ -140,7 +138,7 @@ fn reactive_match_and_memo() {
     let mut app = app();
     let scene = {
         let (tab, title) = (tab.clone(), title.clone());
-        coat! {
+        view! {
             Root
             Children [
                 Label(0) Text($(title.get()))
@@ -173,7 +171,7 @@ fn static_control_flow_and_let() {
     let items = [4_u32, 5];
     let mut app = app();
     app.world_mut()
-        .spawn_scene(coat! {
+        .spawn_scene(view! {
             Root
             Children [
                 let base = 10_u32;
@@ -197,9 +195,7 @@ fn static_control_flow_and_let() {
 #[test]
 fn signal_methods() {
     let count: Signal<i32> = Signal::new(1);
-    count.increment();
-    count.increment();
-    count.decrement();
+    count.update(|count| *count += 1);
     assert_eq!(count.get(), 2);
     assert!(!count.set_if_neq(2));
     assert!(count.set_if_neq(3));
@@ -218,7 +214,7 @@ fn event_handlers_capture_signals_by_clone() {
     let mut app = app();
     let scene = {
         let open = open.clone();
-        coat! {
+        view! {
             Root
             on(move |_: On<Poke>| open.set(!$open))
             Children [
@@ -241,7 +237,7 @@ fn bare_signal_uses_inside_regions_are_cloned() {
     let mut app = app();
     let scene = {
         let count = count.clone();
-        coat! {
+        view! {
             Root
             Children [
                 if $count > 0 {
@@ -262,4 +258,40 @@ fn bare_signal_uses_inside_regions_are_cloned() {
     app.update();
     assert_eq!(count.get(), 0);
     assert_eq!(texts(&mut app), Vec::new());
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+struct Volume(u32);
+
+#[test]
+fn effect_reruns_when_a_signal_it_read_changes() {
+    let volume = signal(|| 1_u32);
+    let mut app = app();
+    app.init_resource::<Volume>();
+    let scene = {
+        let volume = volume.clone();
+        bsn! {
+            effect(move |commands: &mut Commands| commands.insert_resource(Volume(volume.get())))
+        }
+    };
+    app.world_mut().spawn_scene(scene).unwrap();
+    app.update();
+    assert_eq!(*app.world().resource::<Volume>(), Volume(1));
+    volume.set(4);
+    app.update();
+    assert_eq!(*app.world().resource::<Volume>(), Volume(4));
+}
+
+#[test]
+fn views_require_the_plugin() {
+    let open = signal(|| true);
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin));
+    let Err(error) = app.world_mut().spawn_scene(view! {
+        Root
+        Children [ if $open { Label(1) } ]
+    }) else {
+        panic!("view resolved without its plugin");
+    };
+    assert!(error.to_string().contains("ViewPlugin"));
 }

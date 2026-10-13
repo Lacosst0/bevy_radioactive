@@ -1,7 +1,8 @@
-//! Counter using `reactivity`: tracked state plus `bind`.
+//! Counter in plain Bevy, the counterpart of `watch_radioactive`.
 //!
-//! The count is a resource. Buttons mutate it; the label binds to it. `bind`
-//! tracks `Count` automatically, so no `app.track::<Count>()` is needed.
+//! The count is a resource. Buttons mutate it; instead of `bind`, global
+//! systems gated on `resource_changed` find the label and the Reset button by
+//! marker components and write to them.
 
 use bevy::{
     feathers::{
@@ -16,18 +17,47 @@ use bevy::{
     prelude::*,
     ui_widgets::Activate,
 };
-use bevy_radioactive::prelude::*;
 
 #[derive(Resource, Clone, Default)]
 struct Count(i32);
 
+/// Marks the text that shows the count.
+#[derive(Component, Clone, Default)]
+struct CountLabel;
+
+/// Marks the Reset button, shown while the count is not zero.
+#[derive(Component, Clone, Default)]
+struct ResetButton;
+
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, FeathersPlugins, RadioactivePlugin))
+        .add_plugins((DefaultPlugins, FeathersPlugins))
         .insert_resource(UiTheme(create_dark_theme()))
         .init_resource::<Count>()
         .add_systems(Startup, scene.spawn())
+        .add_systems(
+            Update,
+            (sync_count_label, sync_reset_button).run_if(resource_changed::<Count>),
+        )
         .run();
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn sync_count_label(count: Res<Count>, mut labels: Query<&mut Text, With<CountLabel>>) {
+    for mut text in &mut labels {
+        **text = count.0.to_string();
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<ResetButton>>) {
+    for mut node in &mut buttons {
+        node.display = if count.0 != 0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
 }
 
 fn scene() -> impl SceneList {
@@ -54,10 +84,10 @@ fn counter() -> impl Scene {
                 on(|_: On<Activate>, mut count: ResMut<Count>| count.0 -= 1)
                 Children [ @caption("-1") ]
                 --
+                CountLabel
                 Text("0")
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
-                bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
@@ -66,6 +96,7 @@ fn counter() -> impl Scene {
                 Children [ @caption("+1") ]
             ]
             --
+            ResetButton
             @FeathersButton
             Node {
                 display: Display::None,
@@ -75,9 +106,6 @@ fn counter() -> impl Scene {
             }
             InheritableFont { font_size: FontSize::VMin(6.0) }
             on(|_: On<Activate>, mut count: ResMut<Count>| count.0 = 0)
-            bind(Singleton, |count: &Count, node: &mut Node| {
-                node.display = if count.0 != 0 { Display::Flex } else { Display::None };
-            })
             Children [ @caption("Reset") ]
         ]
     }

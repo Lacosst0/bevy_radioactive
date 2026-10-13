@@ -1,10 +1,7 @@
-//! A React-style `webby` counter, mounted with `@counter(..)`.
+//! A React-style `hooks` counter, mounted with `@counter(..)`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{
-    RadioactivePlugin,
-    webby::{Cx, Dispatch, component},
-};
+use bevy_radioactive::hooks::*;
 
 #[derive(Resource, Default)]
 struct Increment(Option<Dispatch<u32>>);
@@ -25,7 +22,7 @@ fn main() {
         MinimalPlugins,
         AssetPlugin::default(),
         ScenePlugin,
-        RadioactivePlugin,
+        HooksPlugin,
     ))
     .init_resource::<Increment>();
 

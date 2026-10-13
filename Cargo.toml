@@ -1,6 +1,6 @@
 [package]
 name = "bevy_radioactive"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
@@ -10,17 +10,25 @@ keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [features]
-default = ["ui"]
-## Orders the runtime before UI layout and enables `webby::text` and `webby::show`.
+default = ["watch", "subscribe", "hooks", "view", "ui"]
+## `watch`, `bind`: react to components and resources on other entities.
+watch = []
+## `subscribe_to`, `bind_event`: react to entity events on other entities.
+subscribe = []
+## `#[component]`: React-style function components with hooks.
+hooks = []
+## `view!`: fine-grained templates with signals.
+view = []
+## Runs updates before UI layout and makes component hosts and regions `GhostNode`s.
 ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]
-## Full Bevy with Feathers, for the `comparison_*` examples.
+## Full Bevy with Feathers, for the `examples/comparison` examples.
 comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
 
 [workspace]
 members = ["macros"]
 
 [dependencies]
-bevy_radioactive_macros = { path = "macros", version = "0.4.0" }
+bevy_radioactive_macros = { path = "macros", version = "0.5.0" }
 bevy = { version = "0.20", default-features = false, features = ["bevy_scene"] }
 
 [dev-dependencies]
@@ -33,23 +41,80 @@ bevy = { version = "0.20", default-features = false, features = [
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 type_complexity = "allow"
+## Each style is meant to be glob-imported: `use bevy_radioactive::view::*`.
+wildcard_imports = "allow"
 
 [[example]]
-name = "comparison_reactivity"
-path = "examples/comparison/reactivity.rs"
+name = "watch_component"
+path = "examples/watch_component.rs"
+required-features = ["watch"]
+
+[[example]]
+name = "watch_resource"
+path = "examples/watch_resource.rs"
+required-features = ["watch"]
+
+[[example]]
+name = "subscribe"
+path = "examples/subscribe.rs"
+required-features = ["subscribe"]
+
+[[example]]
+name = "hooks_counter"
+path = "examples/hooks_counter.rs"
+required-features = ["hooks"]
+
+[[example]]
+name = "hooks_todos"
+path = "examples/hooks_todos.rs"
+required-features = ["hooks"]
+
+[[example]]
+name = "view_tabs"
+path = "examples/view_tabs.rs"
+required-features = ["view"]
+
+[[example]]
+name = "view_todos"
+path = "examples/view_todos.rs"
+required-features = ["view"]
+
+[[example]]
+name = "watch_radioactive"
+path = "examples/comparison/watch/radioactive.rs"
+required-features = ["comparison", "watch"]
+
+[[example]]
+name = "watch_bevy"
+path = "examples/comparison/watch/bevy.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_subscription"
-path = "examples/comparison/subscription.rs"
+name = "subscribe_radioactive"
+path = "examples/comparison/subscribe/radioactive.rs"
+required-features = ["comparison", "subscribe"]
+
+[[example]]
+name = "subscribe_bevy"
+path = "examples/comparison/subscribe/bevy.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_webby"
-path = "examples/comparison/webby.rs"
+name = "hooks_radioactive"
+path = "examples/comparison/hooks/radioactive.rs"
+required-features = ["comparison", "hooks"]
+
+[[example]]
+name = "hooks_bevy"
+path = "examples/comparison/hooks/bevy.rs"
 required-features = ["comparison"]
 
 [[example]]
-name = "comparison_coat"
-path = "examples/comparison/coat.rs"
+name = "view_radioactive"
+path = "examples/comparison/view/radioactive.rs"
+required-features = ["comparison", "view"]
+
+[[example]]
+name = "view_bevy"
+path = "examples/comparison/view/bevy.rs"
 required-features = ["comparison"]

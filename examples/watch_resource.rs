@@ -1,5 +1,5 @@
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
-use bevy_radioactive::{Reaction, ReactiveAppExt, Singleton, watch};
+use bevy_radioactive::watch::*;
 
 #[derive(Resource, Clone, Copy, PartialEq)]
 struct Counter {
