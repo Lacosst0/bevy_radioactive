@@ -1,9 +1,10 @@
-//! Counter using `watch`: a resource plus `bind`.
+//! Counter using `watch`: a resource plus watch systems.
 //!
 //! Plain Bevy version: `comparison_bevy`.
 //!
-//! The count is a resource. Buttons mutate it; the label binds to it. `bind`
-//! tracks `Count` automatically, so no `app.track::<Count>()` is needed.
+//! The count is a resource. Buttons mutate it; the label and the Reset button
+//! each run a `watch` system that reads `Res<Count>`, so they re-run whenever
+//! it changes. Nothing is registered up front.
 
 use bevy::{
     feathers::{
@@ -59,7 +60,11 @@ fn counter() -> impl Scene {
                 Text("0")
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
-                bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
+                watch(|count: Res<Count>, mut text: This<&mut Text>| {
+                    if let Some(mut text) = text.get_mut() {
+                        **text = count.0.to_string();
+                    }
+                })
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
@@ -77,8 +82,10 @@ fn counter() -> impl Scene {
             }
             InheritableFont { font_size: FontSize::VMin(6.0) }
             on(|_: On<Activate>, mut count: ResMut<Count>| count.0 = 0)
-            bind(Singleton, |count: &Count, node: &mut Node| {
-                node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+            watch(|count: Res<Count>, mut node: This<&mut Node>| {
+                if let Some(mut node) = node.get_mut() {
+                    node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+                }
             })
             Children [ @caption("Reset") ]
         ]

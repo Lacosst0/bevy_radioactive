@@ -1,461 +1,187 @@
 #![cfg(feature = "watch")]
-use bevy::{
-    asset::AssetPlugin,
-    ecs::{entity_disabling::Disabled, resource::IsResource},
-    prelude::*,
-    scene::ScenePlugin,
-};
+use bevy::{asset::AssetPlugin, ecs::entity_disabling::Disabled, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::watch::*;
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 struct Counter(u32);
 
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Unrelated(u32);
+
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Meter(u32);
+
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Echo(u32);
+
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Label(u32);
 
 #[derive(Component, Clone, Copy, Default)]
 struct SourceA;
 
 #[derive(Component, Clone, Copy, Default)]
-struct SourceB;
+struct Selected;
 
 #[derive(Component, Clone, Copy, Default)]
 struct Listener;
 
 #[derive(Resource, Default)]
-struct Log {
-    global: Vec<(Entity, u32)>,
-    local: Vec<(Entity, Entity, u32)>,
-}
+struct Log(Vec<(Entity, u32)>);
 
 fn test_app() -> App {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
-        .init_resource::<Log>();
-    app
-}
-
-fn test_app_with_plugin() -> App {
-    let mut app = test_app();
-    app.add_plugins(WatchPlugin);
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin::default(),
+        ScenePlugin,
+        WatchPlugin,
+    ))
+    .init_resource::<Log>()
+    .init_resource::<Unrelated>();
     app
 }
 
 fn settle(app: &mut App) {
-    app.update();
     app.world_mut().flush();
+    app.update();
+}
+
+fn runs(app: &App) -> usize {
+    app.world().resource::<Log>().0.len()
+}
+
+fn label(app: &mut App) -> u32 {
+    app.world_mut()
+        .query_filtered::<&Label, With<Listener>>()
+        .single(app.world())
+        .unwrap()
+        .0
+}
+
+fn listener(app: &mut App) -> Entity {
+    app.world_mut()
+        .query_filtered::<Entity, With<Listener>>()
+        .single(app.world())
+        .unwrap()
 }
 
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "Bevy observer systems receive SystemInput parameters by value"
+    reason = "Bevy systems receive parameters by value"
 )]
-fn record_counter(event: Reaction<Counter>, mut log: ResMut<Log>) {
-    log.local.push((event.target(), event.source(), event.0));
+fn record_counter(counter: Res<Counter>, this: This<Entity>, mut log: ResMut<Log>) {
+    log.0.push((this.entity(), counter.0));
 }
 
 #[test]
-fn resource_change_runs_global_once_and_each_local_watcher_once() {
+fn runs_on_spawn_and_when_a_resource_changes() {
     let mut app = test_app();
-    app.insert_resource(Counter(1))
-        .track::<Counter>()
-        .add_observer(|event: On<ValueChanged<Counter>>, mut log: ResMut<Log>| {
-            log.global.push((event.source(), event.0));
-        });
-
+    app.insert_resource(Counter(1));
     let first = app
         .world_mut()
-        .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
-        })
+        .spawn_scene(bsn! { Listener watch(record_counter) })
         .unwrap()
         .id();
     let second = app
         .world_mut()
-        .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
-        })
+        .spawn_scene(bsn! { watch(record_counter) })
         .unwrap()
         .id();
-
     settle(&mut app);
+    let mut log = app.world().resource::<Log>().0.clone();
+    log.sort_unstable();
+    let mut expected = vec![(first, 1), (second, 1)];
+    expected.sort_unstable();
+    assert_eq!(log, expected);
 
-    let source = {
-        let world = app.world_mut();
-        let mut query = world.query_filtered::<Entity, (With<Counter>, With<IsResource>)>();
-        query.single(world).unwrap()
-    };
-    assert_eq!(app.world().resource::<Log>().global, vec![(source, 1)]);
-    let mut local = app.world().resource::<Log>().local.clone();
-    local.sort_unstable_by_key(|entry| entry.0);
-    let mut expected = vec![(first, source, 1), (second, source, 1)];
-    expected.sort_unstable_by_key(|entry| entry.0);
-    assert_eq!(local, expected);
+    // Nothing changed: no re-run.
+    settle(&mut app);
+    assert_eq!(runs(&app), 2);
 
+    // An equal write via `set_if_neq` is not a change.
     app.world_mut()
         .resource_mut::<Counter>()
         .set_if_neq(Counter(1));
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local.len(), 2);
+    assert_eq!(runs(&app), 2);
 
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(2));
+    // A resource the system doesn't read is not a dependency.
+    app.world_mut().resource_mut::<Unrelated>().0 += 1;
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 2);
-    assert_eq!(app.world().resource::<Log>().local.len(), 4);
+    assert_eq!(runs(&app), 2);
 
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(3));
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(4));
+    // Several writes in one frame run each watch once, with the latest value.
+    app.world_mut().resource_mut::<Counter>().0 = 2;
+    app.world_mut().resource_mut::<Counter>().0 = 3;
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 3);
-    assert_eq!(app.world().resource::<Log>().global[2].1, 4);
-    assert_eq!(app.world().resource::<Log>().local.len(), 6);
+    assert_eq!(runs(&app), 4);
     assert!(
-        app.world().resource::<Log>().local[4..]
+        app.world().resource::<Log>().0[2..]
             .iter()
-            .all(|entry| entry.2 == 4)
+            .all(|e| e.1 == 3)
     );
 }
 
 #[test]
-fn duplicate_registration_is_idempotent_and_reinsertion_is_published() {
+fn an_optional_resource_reruns_when_it_is_inserted() {
     let mut app = test_app();
-    app.insert_resource(Counter(1))
-        .track::<Counter>()
-        .track::<Counter>()
-        .add_observer(|event: On<ValueChanged<Counter>>, mut log: ResMut<Log>| {
-            log.global.push((event.source(), event.0));
-        });
-
     app.world_mut()
         .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
+            watch(|counter: Option<Res<Counter>>, mut log: ResMut<Log>| {
+                log.0.push((Entity::PLACEHOLDER, counter.map_or(0, |counter| counter.0)));
+            })
         })
         .unwrap();
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
+    assert_eq!(runs(&app), 1);
 
-    app.world_mut().remove_resource::<Counter>();
+    app.insert_resource(Counter(5));
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-
-    app.world_mut().insert_resource(Counter(2));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().global.len(), 2);
-    assert_eq!(app.world().resource::<Log>().global[1].1, 2);
-    assert_eq!(app.world().resource::<Log>().local.len(), 2);
-    assert_eq!(app.world().resource::<Log>().local[1].2, 2);
+    assert_eq!(app.world().resource::<Log>().0.last().unwrap().1, 5);
 }
 
 #[test]
-fn app_update_flushes_scheduled_publication_to_local_watchers() {
+fn writes_to_this_entity_update_it() {
     let mut app = test_app();
-    app.insert_resource(Counter(1)).track::<Counter>();
-    app.world_mut()
-        .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
-        })
-        .unwrap();
-
-    // Resolve the scene commands before the frame, then rely only on App::update
-    // for publication and nested subscription delivery.
-    app.world_mut().flush();
-    app.update();
-
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local[0].2, 1);
-}
-
-#[test]
-fn disabled_sources_still_publish() {
-    let mut component_app = test_app();
-    component_app.track::<Meter>();
-    component_app
-        .world_mut()
-        .spawn_scene(bsn! {
-            Children [
-                #A SourceA Meter(7) Disabled
-                --
-                Listener
-                watch(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.local.push((event.target(), event.source(), event.0));
-                })
-            ]
-        })
-        .unwrap();
-    component_app.world_mut().flush();
-    component_app.update();
-    assert_eq!(component_app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(component_app.world().resource::<Log>().local[0].2, 7);
-
-    let mut resource_app = test_app();
-    resource_app.insert_resource(Counter(8)).track::<Counter>();
-    let source = {
-        let world = resource_app.world_mut();
-        let mut query = world.query_filtered::<Entity, (With<Counter>, With<IsResource>)>();
-        query.single(world).unwrap()
-    };
-    resource_app.world_mut().entity_mut(source).insert(Disabled);
-    resource_app
-        .world_mut()
-        .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
-        })
-        .unwrap();
-    resource_app.world_mut().flush();
-    resource_app.update();
-    assert_eq!(resource_app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(resource_app.world().resource::<Log>().local[0].2, 8);
-}
-
-#[test]
-fn component_watch_is_scoped_to_its_source() {
-    let mut app = test_app();
-    app.track::<Meter>();
-
-    app.world_mut()
-        .spawn_scene(bsn! {
-            Children [
-                #A SourceA Meter(1)
-                --
-            #B SourceB Meter(10)
-                --
-                Listener
-                watch(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.local.push((event.target(), event.source(), event.0));
-                })
-            ]
-        })
-        .unwrap();
-    settle(&mut app);
-
-    let source_a = app
-        .world_mut()
-        .query_filtered::<Entity, With<SourceA>>()
-        .single(app.world())
-        .unwrap();
-    let source_b = app
-        .world_mut()
-        .query_filtered::<Entity, With<SourceB>>()
-        .single(app.world())
-        .unwrap();
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local[0].1, source_a);
-
-    app.world_mut()
-        .entity_mut(source_b)
-        .get_mut::<Meter>()
-        .unwrap()
-        .set_if_neq(Meter(11));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-
-    app.world_mut()
-        .entity_mut(source_a)
-        .get_mut::<Meter>()
-        .unwrap()
-        .set_if_neq(Meter(2));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 2);
-    assert_eq!(app.world().resource::<Log>().local[1].2, 2);
-}
-
-fn spawn_dynamic_listener(mut commands: Commands) {
-    commands.spawn_scene(bsn! {
-        Listener
-        watch(Singleton, record_counter)
-    });
-}
-
-#[test]
-fn watcher_spawned_during_update_uses_pre_registered_publisher() {
-    let mut app = test_app();
-    app.insert_resource(Counter(1)).track::<Counter>();
-    settle(&mut app);
-
-    app.add_systems(Update, spawn_dynamic_listener.run_if(run_once));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 0);
-
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(2));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local[0].2, 2);
-}
-
-#[test]
-fn despawned_watcher_stops_receiving_changes() {
-    let mut app = test_app();
-    app.insert_resource(Counter(1)).track::<Counter>();
-    let listener = app
-        .world_mut()
-        .spawn_scene(bsn! {
-            Listener
-            watch(Singleton, record_counter)
-        })
-        .unwrap()
-        .id();
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-
-    app.world_mut().despawn(listener);
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(2));
-    settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-}
-
-#[test]
-fn watch_tracks_its_type_on_first_use() {
-    let mut app = test_app_with_plugin();
     app.insert_resource(Counter(1));
-
     app.world_mut()
         .spawn_scene(bsn! {
             Listener
-            watch(Singleton, record_counter)
+            Label(0)
+            watch(|counter: Res<Counter>, mut this: This<&mut Label>| {
+                if let Some(mut label) = this.get_mut() {
+                    label.0 = counter.0 * 10;
+                }
+            })
         })
         .unwrap();
     settle(&mut app);
-    // The first publisher run reports the current value once.
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
+    assert_eq!(label(&mut app), 10);
 
-    app.world_mut()
-        .resource_mut::<Counter>()
-        .set_if_neq(Counter(2));
+    app.world_mut().resource_mut::<Counter>().0 = 2;
     settle(&mut app);
-    assert_eq!(app.world().resource::<Log>().local.len(), 2);
-    assert_eq!(app.world().resource::<Log>().local[1].2, 2);
+    assert_eq!(label(&mut app), 20);
 }
 
 #[test]
-fn watch_without_runtime_reports_the_plugin() {
+fn component_queries_react_to_change_insert_and_despawn() {
     let mut app = test_app();
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Children [
-            #A SourceA Meter(1)
-            --
-            Listener
-            watch(#A, |_: Reaction<Meter>| {})
-        ]
-    }) else {
-        panic!("watch unexpectedly resolved without the runtime");
-    };
-    assert!(error.to_string().contains("WatchPlugin"));
-}
-
-#[test]
-fn watch_resource_requires_a_current_resource_value() {
-    let mut app = test_app();
-    app.insert_resource(Counter(1)).track::<Counter>();
-    app.world_mut().remove_resource::<Counter>();
-
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Listener
-        watch(Singleton, record_counter)
-    }) else {
-        panic!("watch unexpectedly resolved without its resource");
-    };
-
-    assert!(error.to_string().contains("must exist"));
-}
-
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Label(u32);
-
-#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Echo(u32);
-
-#[test]
-fn one_listener_watches_several_sources_of_one_type() {
-    let mut app = test_app();
-    app.track::<Meter>();
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                #A SourceA Meter(1)
-                --
-                #B SourceB Meter(10)
-                --
-                Listener
-                watch([#A, #B], |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.local.push((event.target(), event.source(), event.0));
-                })
-                watch(#A, |event: Reaction<Meter>, mut log: ResMut<Log>| {
-                    log.global.push((event.source(), event.0));
-                })
-            ]
-        })
-        .unwrap();
-    settle(&mut app);
-
-    let listener = app
-        .world_mut()
-        .query_filtered::<Entity, With<Listener>>()
-        .single(app.world())
-        .unwrap();
-    let mut values: Vec<_> = app
-        .world()
-        .resource::<Log>()
-        .local
-        .iter()
-        .map(|e| (e.0, e.2))
-        .collect();
-    values.sort_unstable_by_key(|entry| entry.1);
-    assert_eq!(values, vec![(listener, 1), (listener, 10)]);
-    assert_eq!(app.world().resource::<Log>().global.len(), 1);
-
-    // The listener owns one delivery entity per watched source.
-    let count = |app: &mut App| app.world_mut().query::<Entity>().iter(app.world()).count();
-    let before = count(&mut app);
-    app.world_mut().despawn(listener);
-    assert!(before - count(&mut app) >= 4);
-}
-
-#[test]
-fn bind_writes_target_and_bind_or_handles_despawn() {
-    let mut app = test_app();
-    app.track::<Meter>();
-    app.world_mut()
-        .spawn_scene(bsn! {
-            Children [
-                #A SourceA Meter(3)
+                SourceA Meter(3)
                 --
                 Listener
                 Label(0)
-                bind_or(
-                    #A,
-                    |meter: &Meter, label: &mut Label| label.0 = meter.0,
-                    |label: &mut Label| label.0 = 999,
-                )
+                watch(|meters: Query<&Meter, With<SourceA>>, mut this: This<&mut Label>| {
+                    let Some(mut label) = this.get_mut() else { return };
+                    label.0 = meters.single().map_or(999, |meter| meter.0);
+                })
             ]
         })
         .unwrap();
     settle(&mut app);
-
-    let label = |app: &mut App| {
-        app.world_mut()
-            .query_filtered::<&Label, With<Listener>>()
-            .single(app.world())
-            .unwrap()
-            .0
-    };
     assert_eq!(label(&mut app), 3);
 
     let source = app
@@ -468,67 +194,204 @@ fn bind_writes_target_and_bind_or_handles_despawn() {
     assert_eq!(label(&mut app), 4);
 
     app.world_mut().despawn(source);
-    app.world_mut().flush();
+    settle(&mut app);
     assert_eq!(label(&mut app), 999);
+
+    app.world_mut().spawn((SourceA, Meter(7)));
+    settle(&mut app);
+    assert_eq!(label(&mut app), 7);
 }
 
 #[test]
-fn watch_removed_fires_for_component_removal_and_resource_removal() {
+fn filters_are_dependencies() {
     let mut app = test_app();
-    app.insert_resource(Counter(1))
-        .track::<Counter>()
-        .track::<Meter>();
+    let a = app.world_mut().spawn(Meter(1)).id();
+    let b = app.world_mut().spawn(Meter(2)).id();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            Label(0)
+            watch(|selected: Query<Entity, With<Selected>>, mut this: This<&mut Label>| {
+                if let Some(mut label) = this.get_mut() {
+                    label.0 = u32::try_from(selected.iter().count()).unwrap();
+                }
+            })
+        })
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(label(&mut app), 0);
+
+    app.world_mut().entity_mut(a).insert(Selected);
+    app.world_mut().entity_mut(b).insert(Selected);
+    settle(&mut app);
+    assert_eq!(label(&mut app), 2);
+
+    app.world_mut().entity_mut(a).remove::<Selected>();
+    settle(&mut app);
+    assert_eq!(label(&mut app), 1);
+}
+
+#[test]
+fn own_writes_do_not_rerun_the_watch() {
+    let mut app = test_app();
+    app.insert_resource(Counter(0));
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|mut counter: ResMut<Counter>, mut log: ResMut<Log>| {
+                counter.0 += 1;
+                log.0.push((Entity::PLACEHOLDER, counter.0));
+            })
+        })
+        .unwrap();
+    settle(&mut app);
+    settle(&mut app);
+    assert_eq!(runs(&app), 1);
+    assert_eq!(app.world().resource::<Counter>().0, 1);
+}
+
+#[test]
+fn chained_watches_settle_in_one_update() {
+    let mut app = test_app();
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                #A SourceA Meter(1)
+                SourceA Meter(1)
+                --
+                Echo(0)
+                watch(|meters: Query<&Meter>, mut this: This<&mut Echo>| {
+                    if let (Ok(meter), Some(mut echo)) = (meters.single(), this.get_mut()) {
+                        echo.0 = meter.0 * 2;
+                    }
+                })
                 --
                 Listener
-                watch_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| log.local.push((r.target(), r.source(), 0)))
-                watch_removed(Singleton, |r: Removal<Counter>, mut log: ResMut<Log>| log.global.push((r.source(), 0)))
+                Label(0)
+                watch(|echoes: Query<&Echo>, mut this: This<&mut Label>| {
+                    if let (Ok(echo), Some(mut label)) = (echoes.single(), this.get_mut()) {
+                        label.0 = echo.0 + 1;
+                    }
+                })
             ]
         })
         .unwrap();
     settle(&mut app);
+    assert_eq!(label(&mut app), 3);
+
     let source = app
         .world_mut()
         .query_filtered::<Entity, With<SourceA>>()
         .single(app.world())
         .unwrap();
-
-    app.world_mut().entity_mut(source).remove::<Meter>();
-    app.world_mut().remove_resource::<Counter>();
-    app.world_mut().flush();
-    assert_eq!(app.world().resource::<Log>().local.len(), 1);
-    assert_eq!(app.world().resource::<Log>().local[0].1, source);
-    assert_eq!(app.world().resource::<Log>().global.len(), 1);
+    app.world_mut().get_mut::<Meter>(source).unwrap().0 = 5;
+    app.update();
+    assert_eq!(label(&mut app), 11);
 }
 
 #[test]
-fn chained_reactions_settle_in_one_update() {
+fn one_entity_declares_several_watches() {
     let mut app = test_app();
-    app.track::<Meter>().track::<Echo>();
+    app.insert_resource(Counter(1));
     app.world_mut()
         .spawn_scene(bsn! {
-            Children [
-                #A SourceA Meter(1)
-                --
-                #E Echo(0)
-                bind(#A, |meter: &Meter, echo: &mut Echo| echo.0 = meter.0 * 2)
-                --
-                Listener
-                Label(0)
-                bind(#E, |echo: &Echo, label: &mut Label| label.0 = echo.0 + 1)
-            ]
+            Listener
+            watch(record_counter)
+            watch(|meters: Query<&Meter>, this: This<Entity>, mut log: ResMut<Log>| {
+                for meter in &meters {
+                    log.0.push((this.entity(), meter.0 + 100));
+                }
+            })
         })
         .unwrap();
-    app.world_mut().flush();
-    app.update();
-    let label = app
+    app.world_mut().spawn(Meter(1));
+    settle(&mut app);
+    assert_eq!(runs(&app), 2);
+
+    app.world_mut().resource_mut::<Counter>().0 = 2;
+    settle(&mut app);
+    assert_eq!(runs(&app), 3);
+    assert_eq!(app.world().resource::<Log>().0[2].1, 2);
+}
+
+#[test]
+fn despawned_listener_stops_running() {
+    let mut app = test_app();
+    app.insert_resource(Counter(1));
+    app.world_mut()
+        .spawn_scene(bsn! { Listener watch(record_counter) })
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(runs(&app), 1);
+
+    let listener = listener(&mut app);
+    let before = app.world_mut().query::<Entity>().iter(app.world()).count();
+    app.world_mut().despawn(listener);
+    let after = app.world_mut().query::<Entity>().iter(app.world()).count();
+    assert_eq!(before - after, 2, "the listener and its watcher despawn");
+
+    app.world_mut().resource_mut::<Counter>().0 = 2;
+    settle(&mut app);
+    assert_eq!(runs(&app), 1);
+}
+
+fn spawn_dynamic_listener(mut commands: Commands) {
+    commands.spawn_scene(bsn! { watch(record_counter) });
+}
+
+#[test]
+fn watch_spawned_during_update_runs() {
+    let mut app = test_app();
+    app.insert_resource(Counter(1));
+    app.add_systems(Update, spawn_dynamic_listener.run_if(run_once));
+    settle(&mut app);
+    assert_eq!(runs(&app), 1);
+
+    app.world_mut().resource_mut::<Counter>().0 = 2;
+    settle(&mut app);
+    assert_eq!(runs(&app), 2);
+}
+
+#[test]
+fn disabled_entities_are_seen_with_allow() {
+    let mut app = test_app();
+    let source = app.world_mut().spawn((Meter(1), Disabled)).id();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            Label(0)
+            watch(|meters: Query<&Meter, Allow<Disabled>>, mut this: This<&mut Label>| {
+                if let (Ok(meter), Some(mut label)) = (meters.single(), this.get_mut()) {
+                    label.0 = meter.0;
+                }
+            })
+        })
+        .unwrap();
+    settle(&mut app);
+    assert_eq!(label(&mut app), 1);
+
+    app.world_mut().get_mut::<Meter>(source).unwrap().0 = 2;
+    settle(&mut app);
+    assert_eq!(label(&mut app), 2);
+}
+
+#[test]
+fn watch_without_plugin_reports_it() {
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
+        .init_resource::<Log>();
+    let Err(error) = app.world_mut().spawn_scene(bsn! { watch(record_counter) }) else {
+        panic!("watch unexpectedly resolved without its plugin");
+    };
+    assert!(error.to_string().contains("WatchPlugin"));
+}
+
+#[test]
+fn whole_world_access_is_rejected() {
+    let mut app = test_app();
+    let Err(error) = app
         .world_mut()
-        .query_filtered::<&Label, With<Listener>>()
-        .single(app.world())
-        .unwrap()
-        .0;
-    assert_eq!(label, 3);
+        .spawn_scene(bsn! { watch(|_: Query<EntityRef>| {}) })
+    else {
+        panic!("whole-world watch unexpectedly resolved");
+    };
+    assert!(error.to_string().contains("can't tell what"));
 }

@@ -1391,7 +1391,7 @@ checksum = "41935a00c02004753bd7ed5094754397800b3f673bf15553bb007b06216872d5"
 
 [[package]]
 name = "bevy_radioactive"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bevy",
  "bevy_radioactive_macros",

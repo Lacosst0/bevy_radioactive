@@ -1,6 +1,6 @@
 [package]
 name = "bevy_radioactive"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
@@ -11,7 +11,7 @@ categories = ["game-development", "gui"]
 
 [features]
 default = ["watch", "subscribe", "hooks", "view", "ui"]
-## `watch`, `bind`: react to components and resources on other entities.
+## `watch`: re-run a system when the components and resources it reads change.
 watch = []
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
 subscribe = []

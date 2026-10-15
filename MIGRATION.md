@@ -1,3 +1,74 @@
+# Migrating from 0.5 to 0.6
+
+`watch` now takes a plain Bevy system and works out what it depends on from the
+system's parameters. The system runs once when the scene spawns, then again whenever
+a component or resource it reads (or filters on) changes, is inserted or is removed.
+There are no sources to name and no types to register.
+
+| 0.5 | 0.6 |
+| --- | --- |
+| `watch(Singleton, \|r: Reaction<T>\| ..)` | `watch(\|t: Res<T>\| ..)` |
+| `watch(#Source, \|r: Reaction<T>\| ..)` | `watch(\|q: Query<&T, With<Source>>\| ..)` with a marker component |
+| `watch([#A, #B], handler)` | one query matching both entities |
+| `bind(source, \|t: &T, c: &mut C\| ..)` | `watch(\|.., mut this: This<&mut C>\| ..)` |
+| `bind_or(source, write, removed)` | one `watch`; handle the query not matching |
+| `watch_removed(source, handler)` | a `watch` re-runs on removal; check whether the query still matches |
+| `Reaction<T>`, `Removal<T>` | read the value through `Res<T>` or a `Query` |
+| `reaction.target()` | `This::entity()` |
+| `reaction.source()` | `Query<(Entity, &T)>` |
+| `Singleton`, `ValueSource` | removed |
+| `WatchAppExt`, `app.track::<T>()` | removed; nothing needs registering |
+| `ValueChanged<T>`, `ValueRemoved<T>` observers | a normal system with `Changed<T>`, or `On<Remove, T>` |
+
+Before:
+
+```rust,ignore
+#Player Health(100)
+--
+Text("")
+bind_or(
+    #Player,
+    |hp: &Health, text: &mut Text| **text = hp.0.to_string(),
+    |text: &mut Text| **text = "DEAD".into(),
+)
+--
+Text("")
+bind(Singleton, |score: &Score, text: &mut Text| **text = score.0.to_string())
+```
+
+After:
+
+```rust,ignore
+Player Health(100)
+--
+Text("")
+watch(|player: Query<&Health, With<Player>>, mut text: This<&mut Text>| {
+    if let Some(mut text) = text.get_mut() {
+        **text = player.single().map_or("DEAD".into(), |hp| hp.0.to_string());
+    }
+})
+--
+Text("")
+watch(|score: Res<Score>, mut text: This<&mut Text>| {
+    if let Some(mut text) = text.get_mut() {
+        **text = score.0.to_string();
+    }
+})
+```
+
+Behavior changes:
+
+- A watch runs once when its scene spawns, so nodes no longer need initializing from
+  the current value by hand.
+- Values a watch only writes (`ResMut<T>`, `&mut T`, `This<&mut T>`) are not
+  dependencies, so a watch doesn't re-run from its own writes. Writes through
+  `Commands` are not visible in the system's parameters and do re-run it if it reads
+  the same value.
+- A missing `Res<T>` is a system error, as in any Bevy system; use `Option<Res<T>>`
+  instead of the old "resource must exist" scene error.
+- Systems with whole-world access (`&World`, `Query<EntityRef>`) are rejected with a
+  scene error.
+
 # Migrating from 0.4 to 0.5
 
 The four styles are now independent modules, each behind its own Cargo feature

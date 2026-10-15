@@ -8,15 +8,22 @@ struct Counter {
 
 fn main() {
     let mut app = App::new();
-    app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
-        .insert_resource(Counter { value: 1 })
-        .track::<Counter>();
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin::default(),
+        ScenePlugin,
+        WatchPlugin,
+    ))
+    .insert_resource(Counter { value: 1 });
 
+    // `Res<Counter>` makes the watch re-run whenever `Counter` changes.
     app.world_mut()
         .spawn_scene(bsn! {
             Name::new("counter-listener")
-            watch(Singleton, |event: Reaction<Counter>| {
-                println!("counter changed to {}", event.value);
+            watch(|counter: Res<Counter>, this: This<&Name>| {
+                if let Some(name) = this.get() {
+                    println!("{name} sees counter {}", counter.value);
+                }
             })
         })
         .unwrap();

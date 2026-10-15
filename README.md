@@ -9,7 +9,7 @@ or several side by side.
 
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
-| [`watch`](#watch) | `watch` | `WatchPlugin` | keep a node in sync with a component or resource |
+| [`watch`](#watch) | `watch` | `WatchPlugin` | re-run a system when the components and resources it reads change |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
 | [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
@@ -18,7 +18,7 @@ or several side by side.
 
 | `bevy_radioactive` | Bevy | Rust |
 | --- | --- | --- |
-| 0.5 | 0.20 | 1.97.1 or newer |
+| 0.6 | 0.20 | 1.97.1 or newer |
 
 ```toml
 [dependencies]
@@ -31,13 +31,16 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
-affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
+affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
 
 ## `watch`
 
-`bind` writes a component of the current entity whenever a value on a source
-changes. `watch` runs a handler instead. Resources are singleton components in
-Bevy 0.20, so the same functions cover both: use `Singleton` as the source.
+`watch` takes an ordinary Bevy system and attaches it to the current entity. The
+system runs once when the scene spawns, and again whenever something it reads
+changes. Dependencies come from the system's parameters, so there are no sources to
+name and nothing to register: `Res<T>`, `&T` in queries, and query filters such as
+`With<T>`, `Without<T>` and `Changed<T>` all count. Resources are singleton
+components in Bevy 0.20, so they work the same way as components.
 
 ```rust,ignore
 use bevy::{prelude::*, scene::CommandsSceneExt};
@@ -45,6 +48,9 @@ use bevy_radioactive::watch::*;
 
 #[derive(Resource, Clone, Default)]
 struct Score(u32);
+
+#[derive(Component, Clone, Default)]
+struct Player;
 
 #[derive(Component, Clone)]
 struct Health(u32);
@@ -64,44 +70,54 @@ fn hud() -> impl Scene {
     bsn! {
         Node
         Children [
-            #Player Health(100)
+            Player Health(100)
             --
             Text("0")
-            bind(Singleton, |score: &Score, text: &mut Text| **text = score.0.to_string())
+            watch(|score: Res<Score>, mut text: This<&mut Text>| {
+                if let Some(mut text) = text.get_mut() {
+                    **text = score.0.to_string();
+                }
+            })
             --
             Text("")
-            bind_or(
-                #Player,
-                |hp: &Health, text: &mut Text| **text = format!("HP {}", hp.0),
-                |text: &mut Text| **text = "DEAD".into(),
-            )
-            --
-            watch(#Player, |hp: Reaction<Health>| info!("{:?} has {} HP", hp.source(), hp.0))
+            watch(|player: Query<&Health, With<Player>>, mut text: This<&mut Text>| {
+                if let Some(mut text) = text.get_mut() {
+                    **text = match player.single() {
+                        Ok(hp) => format!("HP {}", hp.0),
+                        Err(_) => "DEAD".into(),
+                    };
+                }
+            })
         ]
     }
 }
 ```
 
-| Function | Runs when | Handler |
-| --- | --- | --- |
-| `bind(source, \|&T, &mut C\|)` | `T` is inserted or changed on `source` | writes `C` on this entity |
-| `bind_or(source, write, \|&mut C\|)` | same, plus removal or despawn | writes `C` in both cases |
-| `watch(source, handler)` | `T` is inserted or changed | observer taking `Reaction<T>` |
-| `watch_removed(source, handler)` | `T` is removed or `source` despawns | observer taking `Removal<T>` |
+| System reads | Re-runs when |
+| --- | --- |
+| `Res<T>` | resource `T` is inserted or changed |
+| `Option<Res<T>>` | same, or `T` is removed |
+| `Query<&T>`, `Option<&T>`, `Has<T>` | `T` is inserted, changed or removed on any entity |
+| `With<T>`, `Without<T>`, `Changed<T>`, `Added<T>` | same, for the filtered `T` |
+| `ResMut<T>`, `&mut T` | never: values a system writes are not dependencies |
+| `Commands`, `Local<T>`, `This<..>` | never |
 
-A source is a `#Name`, an `Entity`, `Singleton` for a resource, or a list such as
-`[#A, #B]`. `Reaction<T>` dereferences to the new value; `target()` is the entity
-that declared the watch and `source()` the entity that owns `T`. One entity can
-declare any number of binds and watches.
+`This<D, F = ()>` queries the entity that declared the watch: `get()`, `get_mut()`
+and `entity()`. One entity can declare any number of watches, and they despawn with
+it.
 
 - Insertion and mutable access count as changes; use `set_if_neq` to skip no-op
-  writes. Several writes in one frame are delivered once, with the latest value.
-- The current value isn't replayed when a scene spawns. Values inserted by the same
-  scene are delivered as changes, so they render on spawn; initialize a node from an
-  existing resource yourself.
-- A reaction that writes another watched value is delivered in the same frame.
-- For global observers, call `app.track::<T>()` and observe `ValueChanged<T>` or
-  `ValueRemoved<T>`.
+  writes. Several writes in one frame re-run a watch once.
+- A watch that writes a value read by another watch re-runs it in the same frame.
+  Avoid two watches that write each other's dependencies, and writes through
+  `Commands` to values the same watch reads: they re-run every frame.
+- A missing `Res<T>` fails like in any Bevy system; use `Option<Res<T>>` to render
+  before the resource exists.
+- Systems that read the whole world (`&World`, `Query<EntityRef>`) report a scene
+  error, since there is nothing to infer.
+- A system reading `Res<Time>` re-runs every frame. Changes are found by scanning
+  the change ticks of each dependency, so prefer plain systems for values that change
+  on thousands of entities every frame.
 
 Examples: `watch_component`, `watch_resource`.
 
@@ -139,8 +155,8 @@ fn toolbar() -> impl Scene {
 ```
 
 `Subscription<E>` dereferences to the event; `target()` is the declaring entity and
-`source()` the entity the event fired on. Sources are the same as for `watch`, without
-`Singleton`. Subscriptions despawn with the entity that declared them.
+`source()` the entity the event fired on. A source is a `#Name`, an `Entity`, or a list
+such as `[#A, #B]`. Subscriptions despawn with the entity that declared them.
 
 Example: `subscribe`.
 
@@ -309,15 +325,22 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 
 ### `watch`
 
-Same resource and buttons, but each node binds itself to the resource:
+Same resource and buttons, but each node runs a system that reads `Res<Count>`, so
+it re-runs whenever the count changes:
 
 ```rust,ignore
 Text("0")
-bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
+watch(|count: Res<Count>, mut text: This<&mut Text>| {
+    if let Some(mut text) = text.get_mut() {
+        **text = count.0.to_string();
+    }
+})
 --
 @FeathersButton
-bind(Singleton, |count: &Count, node: &mut Node| {
-    node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+watch(|count: Res<Count>, mut node: This<&mut Node>| {
+    if let Some(mut node) = node.get_mut() {
+        node.display = if count.0 != 0 { Display::Flex } else { Display::None };
+    }
 })
 ```
 
@@ -388,12 +411,12 @@ Each plugin runs in its own system set in `PostUpdate` — `WatchSystems`,
 systems that write watched values `.before(...)` the set to show them the same frame.
 Each runtime repeats until nothing changes, up to 8 rounds per frame.
 
-- `watch` adds one publisher per watched type using Bevy's `Changed<T>` filter. Each
-  changed value is cloned once and shared with every watcher of that source.
+- `watch` checks the change ticks of every component and resource its systems
+  depend on once per round, and runs only the watches whose dependencies changed.
 - `subscribe` adds one observer per event type and one small entity per
   subscription.
 - `hooks` components and `view` regions check what they read each round and do
-  nothing when it didn't change. Prefer `view` regions or `bind` for hot paths, and
+  nothing when it didn't change. Prefer `view` regions or `watch` for hot paths, and
   plain systems for thousands of entities changing every frame.
 
 ## Official Bevy references
