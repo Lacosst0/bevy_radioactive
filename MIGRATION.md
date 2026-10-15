@@ -1,5 +1,7 @@
 # Migrating from 0.5 to 0.6
 
+## `watch`
+
 `watch` now takes a plain Bevy system and works out what it depends on from the
 system's parameters. The system runs once when the scene spawns, then again whenever
 a component or resource it reads (or filters on) changes, is inserted or is removed.
@@ -68,6 +70,59 @@ Behavior changes:
   instead of the old "resource must exist" scene error.
 - Systems with whole-world access (`&World`, `Query<EntityRef>`) are rejected with a
   scene error.
+
+## `view`
+
+Signals are gone. A `#[component]` function declares its reactive values as
+`Watch<..>` parameters, and the type says where each comes from.
+
+| 0.5 | 0.6 |
+| --- | --- |
+| `fn counter() -> impl Scene { let count = signal(\|\| 0); .. }` | `#[component] fn counter(count: Watch<Local<i32>>) -> impl Scene { .. }` |
+| `signal(\|\| value)` | `#[init(value)] name: Watch<Local<T>>` |
+| `Signal<T>` | `Watch<Local<T>>` |
+| a signal set from systems | a resource, read with `Watch<Res<T>>` (or `Watch<Option<Res<T>>>`) |
+| `memo(\|\| ..)` | compute inline: `$(format!("{:?}", $tab))` |
+| `signal.get()`, `with`, `set`, `update`, `set_if_neq` | same methods on `Watch`; writes only on `Watch<Local<T>>` |
+| calling `counter()` | `@counter()` in `bsn!`/`view!`, as before |
+
+Before:
+
+```rust,ignore
+fn counter() -> impl Scene {
+    let count = signal(|| 0);
+    view! {
+        Button
+        on(move |_: On<Pointer<Click>>| count.set($count + 1))
+        Children [ Text($(format!("{}", $count))) ]
+    }
+}
+```
+
+After:
+
+```rust,ignore
+#[component]
+fn counter(count: Watch<Local<i32>>) -> impl Scene {
+    view! {
+        Button
+        on(move |_: On<Pointer<Click>>| count.set($count + 1))
+        Children [ Text($(format!("{}", $count))) ]
+    }
+}
+```
+
+Behavior changes:
+
+- `Local` state belongs to one spawn of the component: two `@counter()` calls count
+  separately.
+- Resource watches are bound when the scene spawns. Read them with `$` in component
+  fields, regions and handlers; reading one in a `{ .. }` value, which runs while the
+  scene is built, panics.
+- A component whose fields are all `$` reads, such as `Text($x)`, starts at its
+  default value and is filled in by the first update, before UI layout.
+- `view` and `hooks` both export a `#[component]` attribute. When you glob-import
+  both styles, write `#[view::component]` or `#[hooks::component]`.
 
 # Migrating from 0.4 to 0.5
 

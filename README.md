@@ -12,7 +12,7 @@ or several side by side.
 | [`watch`](#watch) | `watch` | `WatchPlugin` | re-run a system when the components and resources it reads change |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
-| [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
+| [`view`](#view) | `view` | `ViewPlugin` | write templates with typed state and reactive `if`/`for`/`match` |
 
 ## Install
 
@@ -225,10 +225,11 @@ Examples: `hooks_counter`, `hooks_todos`.
 
 ## `view`
 
-`view!` is `bsn!` plus signals and reactive control flow, modelled on
-[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. `$name` reads a signal.
-Control flow that reads one becomes a region that rebuilds only itself, and a
-component with `$` in its fields is patched in place.
+`view!` is `bsn!` plus reactive control flow, modelled on
+[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. A `#[component]` function
+declares what its template reacts to in the types of its parameters, and the runtime
+supplies them. `$name` reads one. Control flow that reads one becomes a region that
+rebuilds only itself, and a component with `$` in its fields is patched in place.
 
 ```rust,ignore
 use bevy::prelude::*;
@@ -237,20 +238,22 @@ use bevy_radioactive::view::*;
 #[derive(Clone, PartialEq)]
 struct Todo { id: u32, title: &'static str }
 
-fn todo_list() -> impl Scene {
-    let todos = signal(|| vec![Todo { id: 1, title: "Write docs" }]);
-    let open = signal(|| true);
+#[derive(Resource, Clone, Default)]
+struct Todos(Vec<Todo>);
+
+#[component]
+fn todo_list(todos: Watch<Res<Todos>>, #[init(true)] open: Watch<Local<bool>>) -> impl Scene {
     view! {
         Node
         Children [
             Button
             on(move |_: On<Pointer<Click>>| open.set(!$open))
             --
-            Text($(format!("{} todos", $todos.len())))   // patched when `todos` changes
+            Text($(format!("{} todos", $todos.0.len())))   // patched when `Todos` changes
             --
             if $open {
                 #[key(todo.id)]
-                for todo in $todos { Text({todo.title}) }
+                for todo in $todos.0 { Text({todo.title}) }
             } else {
                 Text("hidden")
             }
@@ -259,7 +262,16 @@ fn todo_list() -> impl Scene {
 }
 
 // app.add_plugins(ViewPlugin)
+// bsn! { @todo_list() }
 ```
+
+| Parameter | Value |
+| --- | --- |
+| `Watch<Local<T>>` | state of this instance, starting at `T::default()`; `set`, `update`, `set_if_neq` |
+| `#[init(expr)] state: Watch<Local<T>>` | same, starting at `expr`; props are in scope |
+| `Watch<Res<T>>` | resource `T`, read-only; updates when the resource changes |
+| `Watch<Option<Res<T>>>` | resource `T`, or `None` while it doesn't exist |
+| anything else | a prop: `@row(todo)` passes `todo` |
 
 | Item in a list | Meaning |
 | --- | --- |
@@ -269,11 +281,13 @@ fn todo_list() -> impl Scene {
 | `match value { pat => .., }` | entities for the matching arm |
 | `let pat = expr;` | binding for the following items |
 
-Without `$`, control flow is evaluated once. Signals have `get`, `set`, `update`,
-`set_if_neq` and `with`; `memo(|| ..)` derives a cached value from signals, and
-`effect(|commands| ..)` re-runs a side effect when a signal it read changes. Signals
-are `Send + Sync`, so they can also live in components or resources and be set from
-systems.
+Without `$`, control flow is evaluated once. Watches have `get` and `with`, and
+`effect(|commands| ..)` re-runs a side effect when a watch it read changes. Only
+`Local` state can be written from the view; change resources through the ECS as usual,
+and every view watching them follows. Each instance of a component has its own
+`Local` state. Resource watches are bound when the scene spawns, so read them with `$`
+in fields, regions and handlers, not in `{ .. }` values evaluated while the scene is
+built.
 
 Examples: `view_todos`, `view_tabs`.
 
@@ -389,17 +403,19 @@ Only the label's `Text` is patched, and the Reset button exists only while the c
 is not zero: a `$` read patches the field and `if` owns the button:
 
 ```rust,ignore
-let count = signal(|| 0);
-view! {
-    // ...
-    on(move |_: On<Activate>| count.set($count + 1))
-    --
-    Text($(format!("{}", $count)))
-    // ...
-    if $count != 0 {
-        @FeathersButton
-        on(move |_: On<Activate>| count.set(0))
-        Children [ @caption("Reset") ]
+#[component]
+fn counter(count: Watch<Local<i32>>) -> impl Scene {
+    view! {
+        // ...
+        on(move |_: On<Activate>| count.set($count + 1))
+        --
+        Text($(format!("{}", $count)))
+        // ...
+        if $count != 0 {
+            @FeathersButton
+            on(move |_: On<Activate>| count.set(0))
+            Children [ @caption("Reset") ]
+        }
     }
 }
 ```

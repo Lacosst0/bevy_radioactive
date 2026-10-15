@@ -309,7 +309,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
     out
 }
 
-/// `Comp($x)` → `Comp({ x.get() }) __view_patch(move |c: &mut Comp| c.0 = ..)`.
+/// `Comp($x)` → `Comp __view_patch(move |c: &mut Comp| c.0 = ..)`.
 fn reactive_component(
     path: &[TokenTree],
     delimiter: Delimiter,
@@ -317,6 +317,7 @@ fn reactive_component(
     scope: &mut Scope,
 ) -> TokenStream {
     let fields = split_commas(content);
+    let all_reactive = fields.iter().all(|field| contains_dollar(field));
     let mut initial = Vec::new();
     let mut assignments = TokenStream::new();
     for (index, field) in fields.iter().enumerate() {
@@ -340,14 +341,19 @@ fn reactive_component(
             }
         };
         let read = reads(value);
-        let site = scope.site(value, &[]);
+        // The patch writes the value before the first layout; resource
+        // watches aren't bound yet while the scene resolves.
         match &name {
             Some(name) => {
-                initial.push(quote!(#name: {{ #site #read }}));
                 quote!(__c.#name = ::core::convert::Into::into(#read);).to_tokens(&mut assignments);
             }
             None => {
-                initial.push(quote!({{ #site #read }}));
+                // Tuple fields can't be skipped: when other fields are
+                // static, start from the value read while resolving.
+                if !all_reactive {
+                    let site = scope.site(value, &[]);
+                    initial.push(quote!({{ #site #read }}));
+                }
                 let index = Literal::usize_unsuffixed(index);
                 quote!(__c.#index = ::core::convert::Into::into(#read);)
                     .to_tokens(&mut assignments);
@@ -355,7 +361,12 @@ fn reactive_component(
         }
     }
     let path = stream(path);
-    let initial = Group::new(delimiter, quote!(#(#initial),*));
+    let initial = if all_reactive && delimiter == Delimiter::Parenthesis {
+        // `Text($x)` starts as `Text` and is filled in by the patch.
+        quote!()
+    } else {
+        Group::new(delimiter, quote!(#(#initial),*)).into_token_stream()
+    };
     let site = scope.site(content, &[]);
     quote! {
         #path #initial
@@ -869,6 +880,93 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
                     let (#(#captured,)*) = &__props;
                     __render #turbofish (#(#call_args),*)
                 },
+            )
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// #[component] for views
+// ---------------------------------------------------------------------------
+
+/// Turns `fn name(props.., state: Watch<..>) -> impl Scene` into a scene
+/// function used as `@name(props..)`; the runtime supplies each `Watch`.
+///
+/// See `bevy_radioactive::view` for details.
+#[proc_macro_attribute]
+pub fn view_component(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    if !attr.is_empty() {
+        return error(Span::call_site(), "`#[component]` takes no arguments").into();
+    }
+    match syn::parse::<syn::ItemFn>(item) {
+        Ok(function) => view_component_fn(function)
+            .unwrap_or_else(syn::Error::into_compile_error)
+            .into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
+fn view_component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
+    let syn::ItemFn {
+        attrs,
+        vis,
+        mut sig,
+        block,
+    } = function;
+    let view = quote!(::bevy_radioactive::view);
+    let mut props = syn::punctuated::Punctuated::<syn::FnArg, syn::Token![,]>::new();
+    let mut lets = Vec::new();
+    let mut watches = Vec::new();
+    for input in std::mem::take(&mut sig.inputs) {
+        let syn::FnArg::Typed(mut typed) = input else {
+            return Err(syn::Error::new_spanned(
+                input,
+                "components cannot take `self`",
+            ));
+        };
+        if !last_segment_is(&typed.ty, "Watch") {
+            if typed.attrs.iter().any(|attr| attr.path().is_ident("init")) {
+                return Err(syn::Error::new_spanned(
+                    &typed,
+                    "`#[init(..)]` only applies to `Watch<Local<T>>` parameters",
+                ));
+            }
+            props.push(syn::FnArg::Typed(typed));
+            continue;
+        }
+        let syn::Pat::Ident(pat) = &*typed.pat else {
+            return Err(syn::Error::new_spanned(
+                &typed.pat,
+                "`Watch` parameters must be plain names",
+            ));
+        };
+        let name = pat.ident.clone();
+        let init = match typed
+            .attrs
+            .iter()
+            .position(|attr| attr.path().is_ident("init"))
+        {
+            Some(index) => Some(typed.attrs.remove(index).parse_args::<syn::Expr>()?),
+            None => None,
+        };
+        let ty = &typed.ty;
+        lets.push(match init {
+            Some(init) => quote!(let #name: #ty = #view::Watch::new(#init);),
+            None => quote!(let #name: #ty = #view::Watch::__new();),
+        });
+        watches.push(name);
+    }
+    sig.inputs = props;
+    Ok(quote! {
+        #(#attrs)*
+        #vis #sig {
+            #(#lets)*
+            #view::__private::__view_bound(
+                [#(#view::__private::__view_binding(&#watches)),*],
+                (move || #block)(),
             )
         }
     })

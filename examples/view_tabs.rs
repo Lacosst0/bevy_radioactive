@@ -1,17 +1,53 @@
-//! `view!` tabs: a reactive `match`, a patched component, a `memo`, and an
-//! `effect`.
+//! `view!` tabs: a reactive `match` on a resource, local state, a patched
+//! component, and an `effect`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::view::*;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 enum Tab {
+    #[default]
     Profile,
     Settings,
 }
 
-#[derive(Resource, Default)]
-struct VolumeSetting(u32);
+#[derive(Resource, Clone, Copy, Default)]
+struct CurrentTab(Tab);
+
+#[derive(Resource, Clone, Copy)]
+struct Volume(u32);
+
+/// `tab` and `volume` follow resources; `visits` is state of this instance.
+#[component]
+fn tabs(
+    tab: Watch<Res<CurrentTab>>,
+    volume: Watch<Res<Volume>>,
+    visits: Watch<Local<u32>>,
+) -> impl Scene {
+    view! {
+        Node
+        // Runs again whenever `tab` changes, counting tab switches.
+        effect(move |_: &mut Commands| {
+            let _ = tab.get();
+            visits.update(|visits| *visits += 1);
+        })
+        Children [
+            // Patched in place.
+            Text($(format!("Tab: {:?} (visit {})", $tab.0, $visits)))
+            --
+            match $tab.0 {
+                Tab::Profile => {
+                    Text("Profile")
+                },
+                Tab::Settings => {
+                    Text($(format!("Volume: {}%", $volume.0)))
+                    --
+                    if $volume.0 > 80 { Text("Careful, that's loud") }
+                },
+            }
+        ]
+    }
+}
 
 fn main() {
     let mut app = App::new();
@@ -21,43 +57,10 @@ fn main() {
         ScenePlugin,
         ViewPlugin,
     ))
-    .init_resource::<VolumeSetting>();
+    .init_resource::<CurrentTab>()
+    .insert_resource(Volume(50));
 
-    let tab = signal(|| Tab::Profile);
-    let volume = signal(|| 50_u32);
-    let title = {
-        let tab = tab.clone();
-        memo(move || format!("Tab: {:?}", tab.get()))
-    };
-
-    let scene = {
-        let (tab, volume, title) = (tab.clone(), volume.clone(), title.clone());
-        view! {
-            Node
-            Children [
-                // Patched in place whenever the memo changes.
-                Text($(title.get()))
-                --
-                match $tab {
-                    Tab::Profile => {
-                        Text("Profile")
-                    },
-                    Tab::Settings => {
-                        Text($(format!("Volume: {}%", $volume)))
-                        --
-                        if $volume > 80 { Text("Careful, that's loud") }
-                        --
-                        // Runs again whenever `volume` changes.
-                        Node
-                        effect(move |commands: &mut Commands| {
-                            commands.insert_resource(VolumeSetting(volume.get()));
-                        })
-                    },
-                }
-            ]
-        }
-    };
-    app.world_mut().spawn_scene(scene).unwrap();
+    app.world_mut().spawn_scene(bsn! { @tabs() }).unwrap();
 
     let print = |app: &mut App, label: &str| {
         println!("-- {label}");
@@ -70,15 +73,11 @@ fn main() {
     app.update();
     print(&mut app, "profile");
 
-    tab.set(Tab::Settings);
+    app.world_mut().resource_mut::<CurrentTab>().0 = Tab::Settings;
     app.update();
     print(&mut app, "settings");
 
-    volume.set(90);
+    app.world_mut().resource_mut::<Volume>().0 = 90;
     app.update();
     print(&mut app, "louder");
-    println!(
-        "saved volume: {}",
-        app.world().resource::<VolumeSetting>().0
-    );
 }

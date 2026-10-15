@@ -1,4 +1,5 @@
-//! A `view!` template with reactive `if`, keyed `for`, and patched text.
+//! A `view!` component with reactive `if`, keyed `for`, and patched text,
+//! driven by a resource.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::view::*;
@@ -9,6 +10,29 @@ struct Todo {
     title: &'static str,
 }
 
+#[derive(Resource, Clone, Default)]
+struct Todos(Vec<Todo>);
+
+/// `Watch<Res<Todos>>`: the list follows the `Todos` resource.
+#[component]
+fn todo_list(todos: Watch<Res<Todos>>) -> impl Scene {
+    view! {
+        Node
+        Children [
+            Text($(format!("{} todos", $todos.0.len())))
+            --
+            if $todos.0.is_empty() {
+                Text("Nothing to do")
+            }
+            --
+            #[key(todo.id)]
+            for todo in $todos.0 {
+                Text({todo.title})
+            }
+        ]
+    }
+}
+
 fn main() {
     let mut app = App::new();
     app.add_plugins((
@@ -16,40 +40,18 @@ fn main() {
         AssetPlugin::default(),
         ScenePlugin,
         ViewPlugin,
-    ));
+    ))
+    .insert_resource(Todos(vec![Todo {
+        id: 1,
+        title: "Write docs",
+    }]));
 
-    let todos = signal(|| {
-        vec![Todo {
-            id: 1,
-            title: "Write docs",
-        }]
-    });
-    let scene = {
-        let todos = todos.clone();
-        view! {
-            Node
-            Children [
-                Text($(format!("{} todos", $todos.len())))
-                --
-                if $todos.is_empty() {
-                    Text("Nothing to do")
-                }
-                --
-                #[key(todo.id)]
-                for todo in $todos {
-                    Text({todo.title})
-                }
-            ]
-        }
-    };
-    app.world_mut().spawn_scene(scene).unwrap();
-
+    app.world_mut().spawn_scene(bsn! { @todo_list() }).unwrap();
     app.update();
-    todos.update(|todos| {
-        todos.push(Todo {
-            id: 2,
-            title: "Ship it",
-        });
+
+    app.world_mut().resource_mut::<Todos>().0.push(Todo {
+        id: 2,
+        title: "Ship it",
     });
     app.update();
 

@@ -17,7 +17,7 @@ watch = []
 subscribe = []
 ## `#[component]`: React-style function components with hooks.
 hooks = []
-## `view!`: fine-grained templates with signals.
+## `view!`: fine-grained templates; state is declared as `Watch<..>` parameters.
 view = []
 ## Runs updates before UI layout and makes component hosts and regions `GhostNode`s.
 ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]

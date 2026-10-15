@@ -1,6 +1,7 @@
 //! Counter as a `view!` template.
 //!
-//! The count is a signal; only the patched `Text` updates when it changes.
+//! The count is `Watch<Local<i32>>` state declared as a parameter; only the
+//! patched `Text` updates when it changes.
 //!
 //! Plain Bevy version: `comparison_bevy`.
 
@@ -31,8 +32,8 @@ fn scene() -> impl SceneList {
     bsn_list! { Camera2d -- @counter() }
 }
 
-fn counter() -> impl Scene {
-    let count = signal(|| 0);
+#[component]
+fn counter(count: Watch<Local<i32>>) -> impl Scene {
     view! {
         Node {
             width: percent(100),
