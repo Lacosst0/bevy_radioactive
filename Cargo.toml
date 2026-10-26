@@ -62,3 +62,7 @@ required-features = ["comparison"]
 [[test]]
 name = "widgets"
 required-features = ["widgets"]
+
+[[bench]]
+name = "runtime"
+harness = false
