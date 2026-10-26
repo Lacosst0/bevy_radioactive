@@ -324,6 +324,35 @@ fn run_unmounted(world: &mut World) -> usize {
     }
 }
 
+/// An async task watched by the runtime, such as a `webby` `use_task` hook.
+pub(crate) trait PollTask: Send + Sync {
+    /// Polls once; returns `true` when the task finished and was handled.
+    fn poll_task(&self) -> bool;
+}
+
+/// Tasks the runtime polls at the start of every main pass. Entries are
+/// weak: dropping the owner (a hook, on unmount) cancels and forgets the
+/// task.
+#[derive(Resource, Clone, Default)]
+pub(crate) struct PendingTasks(pub(crate) Arc<Mutex<Vec<std::sync::Weak<dyn PollTask>>>>);
+
+fn poll_tasks(world: &World) -> usize {
+    let Some(pending) = world.get_resource::<PendingTasks>() else {
+        return 0;
+    };
+    let mut pending = pending.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut finished = 0;
+    pending.retain(|task| match task.upgrade() {
+        Some(task) if task.poll_task() => {
+            finished += 1;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    });
+    finished
+}
+
 /// Every effect host, plus the hosts added since the current pass started.
 #[derive(Resource, Default)]
 struct EffectHosts {
@@ -381,6 +410,10 @@ fn depth(world: &World, mut entity: Entity) -> usize {
 /// whole tree rather than one level of it. Hosts spawned during a
 /// post-layout pass wait for the next main pass.
 pub(crate) fn run_effects(world: &mut World, phase: Phase) -> usize {
+    if phase == Phase::Main {
+        // Finished tasks notify their hosts, which then run below.
+        poll_tasks(world);
+    }
     let mut queue: Vec<Entity> = {
         let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() else {
             return 0;
@@ -476,6 +509,7 @@ pub(crate) fn init(world: &mut World) {
     world.init_resource::<EffectHosts>();
     world.init_resource::<PostEffects>();
     world.init_resource::<Unmounted>();
+    world.init_resource::<PendingTasks>();
 }
 
 /// Entity dependencies resolved when a `webby` scene spawns.

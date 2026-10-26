@@ -62,6 +62,7 @@
 //! | `useMemo`                              | [`Cx::use_memo`]                                |
 //! | `useEffect`                            | [`Cx::use_effect`]                              |
 //! | `useRef`                               | [`Cx::use_ref`]                                 |
+//! | `use` / Suspense-style data loading    | [`Cx::use_task`]                                |
 //! | `createContext` / `useContext`         | [`Cx::provide_context`] / [`Cx::use_context`]   |
 //! | store/selector hooks                   | [`Cx::use_resource`] / [`Cx::use_component`]    |
 //! | `onClick={...}`                        | BSN `on(move \|_: On<Pointer<Click>>\| ...)`    |
@@ -126,7 +127,12 @@ use bevy::{
     },
 };
 
-use crate::runtime::{PostEffects, RunFn, Unmounted, attach, ensure_runtime, spawn_child, tracked};
+use bevy::tasks::{AsyncComputeTaskPool, Task, TaskPool, futures::check_ready};
+
+use crate::runtime::{
+    PendingTasks, PollTask, PostEffects, RunFn, Unmounted, attach, ensure_runtime, spawn_child,
+    tracked,
+};
 pub use crate::{
     coat::{Signal, cloned},
     macros::component,
@@ -459,6 +465,63 @@ impl Cx<'_, '_> {
         )
     }
 
+    /// Runs an async task for `deps` and re-renders when it finishes.
+    ///
+    /// The first render with new `deps` starts `start(deps)` on Bevy's
+    /// [`AsyncComputeTaskPool`] and returns [`TaskState::Pending`]; once the
+    /// future completes, the component re-renders and gets
+    /// [`TaskState::Ready`] with a clone of its output until `deps` change.
+    /// Changing `deps` drops the running task, which cancels it, and so does
+    /// unmounting the component (despawning its host).
+    ///
+    /// ```ignore
+    /// #[component]
+    /// fn profile(cx: &Cx, user_id: u32) -> impl Scene {
+    ///     let name = match cx.use_task(user_id, |id| async move { load_user(id).await }) {
+    ///         TaskState::Pending => "Loading...".to_string(),
+    ///         TaskState::Ready(user) => user.name,
+    ///     };
+    ///     bsn! { Text({name}) }
+    /// }
+    /// ```
+    ///
+    /// [`AsyncComputeTaskPool`]: bevy::tasks::AsyncComputeTaskPool
+    pub fn use_task<D, T, F, Fut>(&self, deps: D, start: F) -> TaskState<T>
+    where
+        D: PartialEq + Clone + Send + Sync + 'static,
+        T: Clone + Send + Sync + 'static,
+        F: FnOnce(D) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let slot = self.hook(
+            || None::<(D, Arc<TaskSlot<T>>)>,
+            |hook| {
+                if let Some((previous, slot)) = hook
+                    && *previous == deps
+                {
+                    return Arc::clone(slot);
+                }
+                let pool = AsyncComputeTaskPool::get_or_init(TaskPool::default);
+                let slot = Arc::new(TaskSlot {
+                    task: Mutex::new(Some(pool.spawn(start(deps.clone())))),
+                    output: Mutex::new(None),
+                    done: Signal::new(()),
+                });
+                if let Some(pending) = self.reads.untracked().get_resource::<PendingTasks>() {
+                    let weak: Weak<dyn PollTask> = Arc::downgrade(&slot) as Weak<dyn PollTask>;
+                    lock(&pending.0).push(weak);
+                }
+                // Replacing the previous slot drops its task, cancelling it.
+                *hook = Some((deps, Arc::clone(&slot)));
+                slot
+            },
+        );
+        slot.done.with(|()| {});
+        lock(&slot.output)
+            .clone()
+            .map_or(TaskState::Pending, TaskState::Ready)
+    }
+
     /// Like React's `useRef`: a mutable box that persists across renders
     /// without triggering them.
     pub fn use_ref<T>(&self, init: impl FnOnce() -> T) -> Ref<T>
@@ -511,6 +574,54 @@ impl Cx<'_, '_> {
             ancestor = instance.parent.as_ref().and_then(Weak::upgrade);
         }
         None
+    }
+}
+
+/// Progress of a [`Cx::use_task`] task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskState<T> {
+    /// The task is running.
+    Pending,
+    /// The task finished with this output.
+    Ready(T),
+}
+
+impl<T> TaskState<T> {
+    /// The output, if the task finished.
+    #[must_use]
+    pub fn ready(self) -> Option<T> {
+        match self {
+            Self::Pending => None,
+            Self::Ready(value) => Some(value),
+        }
+    }
+
+    /// Whether the task is still running.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+/// A `use_task` hook's running task and its output.
+struct TaskSlot<T> {
+    task: Mutex<Option<Task<T>>>,
+    output: Mutex<Option<T>>,
+    /// Notified when the output arrives, re-rendering the component.
+    done: Signal<()>,
+}
+
+impl<T: Send + Sync + 'static> PollTask for TaskSlot<T> {
+    fn poll_task(&self) -> bool {
+        let mut task = lock(&self.task);
+        let Some(output) = task.as_mut().and_then(check_ready) else {
+            return task.is_none();
+        };
+        *task = None;
+        drop(task);
+        *lock(&self.output) = Some(output);
+        self.done.notify();
+        true
     }
 }
 

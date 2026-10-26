@@ -328,6 +328,11 @@ may return a cleanup, `move |commands: &mut Commands| ..`, which runs before the
 run and when the component unmounts. `cx.on_unmount(|commands| ..)` registers a
 cleanup without an effect.
 
+`cx.use_task(deps, |deps| async move { .. })` runs a future on Bevy's `AsyncComputeTaskPool`
+and returns `TaskState::Pending` until it finishes, then re-renders with
+`TaskState::Ready(output)`. Changing `deps` or unmounting the component drops the task,
+which cancels it, so a slow stale result never overwrites a newer one.
+
 ```rust,ignore
 use bevy_radioactive::webby::*;
 
@@ -381,6 +386,7 @@ fn app(cx: &Cx) -> impl Scene {
 | effect cleanup / unmount | return `move \|commands: &mut Commands\| ..` from `use_effect`, or `cx.on_unmount(..)` |
 | signals | `cx.use_signal(init) -> Signal` |
 | `useMemo` / `useEffect` / `useRef` | `cx.use_memo` / `cx.use_effect` / `cx.use_ref` |
+| `use(promise)` / Suspense | `cx.use_task(deps, \|d\| async move { .. })` returns `TaskState::Pending` / `Ready(v)` |
 | `createContext` / `useContext` | `cx.provide_context(value)` / `cx.use_context::<T>()` |
 | store/selector hooks | `cx.use_resource::<R>()`, `cx.use_component::<C>(entity)` |
 
@@ -438,6 +444,7 @@ coat! {
 | `if c { .. } else if c { .. } else { .. }` | conditional entities |
 | `#[key(expr)] for pat in iter { .. }` | entities per item; unchanged rows keep their entities |
 | `for pat in iter { .. }` | entities per item, identified by position |
+| `#[key(expr)] for $name in iter { .. }` / `for $name in ..` | rows kept per key / position; `$name` is the item signal, patched in place |
 | `match value { pat => .., }` | entities for the matching arm; rebuilt when the arm, or a binding it uses, changes |
 | `let pat = expr;` | binding for the following items |
 
@@ -452,6 +459,42 @@ arguments change.
 `coat::effect(|r: &Reads, commands| ..)` runs once when spawned and again when a
 signal or ECS value it read changes. It may return a cleanup closure, which runs before
 the next run and when its entity despawns.
+
+### Rows that patch in place
+
+Write the loop variable with `$` to give each row its item as a signal, like Solid's
+`<For>`/`<Index>`. Rows then live as long as their key (or, without `#[key]`, their
+position) and a changed item is written to the row's signal, so only that row's `$`
+reads update instead of the row being respawned. Inside `#[key(..)]` the variable is the
+plain item.
+
+```rust,ignore
+#[key(todo.id)]
+for $todo in $todos {
+    Text($(format!("{} {}", $&todo.title, if $&todo.done { "[x]" } else { "[ ]" })))
+}
+```
+
+### `Value<T>` props
+
+`Value<T>` is a constant, a `Signal<T>` or a `Memo<T>`, converted with `.into()`. A
+scene function or `#[component]` taking `impl Into<Value<T>>` accepts all three, and
+reading it (`$value` in `coat!`, `value.get()` in a component) tracks only when it is
+reactive.
+
+```rust
+use bevy::prelude::*;
+use bevy_radioactive::prelude::*;
+
+fn caption(text: impl Into<Value<String>>) -> impl Scene {
+    let text: Value<String> = text.into();
+    coat! { Text($text) }
+}
+
+fn captions(name: Signal<String>) -> impl Scene {
+    bsn! { Node Children [ @caption("fixed") -- @caption(name.clone()) ] }
+}
+```
 
 ## Change and delivery semantics
 

@@ -36,10 +36,10 @@ pub use crate::{
 #[allow(deprecated)]
 pub use crate::{bind_or, on_removed};
 
-pub use crate::coat::{Signal, coat, coat_list, effect, layout_effect, memo, signal};
+pub use crate::coat::{Signal, Value, coat, coat_list, effect, layout_effect, memo, signal};
 pub use crate::monitor::{Monitor, MonitorAppExt};
 pub use crate::select::{SelectCommandsExt, SelectEntityCommandsExt, Selected, Selection};
-pub use crate::webby::{Cx, Either, either};
+pub use crate::webby::{Cx, Either, TaskState, either};
 #[cfg(feature = "widgets")]
 pub use crate::widgets::{
     ControlledWidget, bind_checkbox, bind_radio, bind_slider, bind_tabs, bind_widget,

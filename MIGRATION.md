@@ -25,7 +25,10 @@ signal reads in `coat!`, `ReactiveDiagnostics`, `ReactiveSet::Settled`, and the
 `SelectCommandsExt`/`SelectEntityCommandsExt`, and query monitors
 (`Monitor`, `MonitorAppExt::add_monitor`), and with the new `widgets` feature, two-way
 widget binding (`bind_slider`, `bind_checkbox`, `bind_tabs`, `bind_radio`,
-`bind_widget`, `bind_widget_with`). The prelude now also exports `ReactiveSet`,
+`bind_widget`, `bind_widget_with`). `coat!` loops can bind an item signal
+(`#[key(..)] for $item in ..` / `for $item in ..`) so rows patch in place, `coat::Value<T>`
+props accept a constant, a signal or a memo, and `Cx::use_task` returns a `TaskState`
+for an async task that is cancelled when its deps change or the component unmounts. The prelude now also exports `ReactiveSet`,
 `ReactiveSettings`, `ReactiveDiagnostics`, `Reads`, `Signal`, `signal`, `memo`,
 `effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed` and the new helpers. It
 does not export `#[component]`, which would clash with Bevy's `#[component(..)]` derive
