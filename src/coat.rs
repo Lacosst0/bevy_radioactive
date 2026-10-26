@@ -53,6 +53,8 @@
 //! | `if c { .. } else if c { .. } else { .. }` | conditional entities                     |
 //! | `#[key(expr)] for pat in iter { .. }`      | one set of entities per item, keyed      |
 //! | `for pat in iter { .. }`                   | one set per item, identified by position |
+//! | `#[key(expr)] for $name in iter { .. }`    | rows kept per key, `$name` a signal      |
+//! | `for $name in iter { .. }`                 | rows per position, `$name` a signal      |
 //! | `match value { pat => .., }`               | entities for the matching arm            |
 //! | `let pat = expr;`                          | binding visible to the following items   |
 //!
@@ -65,6 +67,18 @@
 //! matched arm changes, or a value its pattern bound and the arm uses;
 //! otherwise the arm's patched components update in place. `for` regions
 //! keep the entities of rows whose key and value are unchanged.
+//!
+//! Writing the loop variable with `$`, as in `#[key(todo.id)] for $todo in
+//! $todos`, gives each row its item as a [`Signal`] instead of a value, like
+//! Solid's `<For>` (keyed) and `<Index>` (without a key). A row then keeps
+//! its entities for as long as its key (or position) exists, and a changed
+//! item is written to the row's signal with `set_if_neq`, so only the
+//! row's `$todo` reads update: `Text($(format!("{}", $&todo.title)))` is
+//! patched in place instead of the row being respawned. Inside `#[key]`
+//! the loop variable is the plain item.
+//!
+//! [`Value<T>`] is a prop that is either a constant, a signal or a memo;
+//! `$value` reads it like a signal.
 //!
 //! `$name` reads signal `name` (it becomes `name.get()`, a clone of the
 //! value), `$&name.method(..)` borrows it instead (it becomes
@@ -524,6 +538,128 @@ impl<T> Clone for Memo<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Value
+// ---------------------------------------------------------------------------
+
+/// A prop that is either a constant or reactive, after `bevy_reactor`'s
+/// `IntoSignal`.
+///
+/// Components and scene functions that take a `Value<T>` accept a plain
+/// `T`, a [`Signal<T>`] or a [`Memo<T>`] through `.into()`. Reading it with
+/// [`get`](Self::get) or [`with`](Self::with) tracks the read when it is
+/// reactive, so `$value` in `coat!` and `value.get()` in a `webby`
+/// component update when a signal behind it changes, and cost nothing extra
+/// when it is a constant.
+///
+/// ```
+/// use bevy_radioactive::coat::{Value, signal};
+///
+/// fn label(text: impl Into<Value<String>>) -> Value<String> {
+///     text.into()
+/// }
+///
+/// let fixed = label("Volume".to_string());
+/// let name = signal(|| "Player".to_string());
+/// let live = label(name.clone());
+/// name.set("Ada".into());
+/// assert_eq!(fixed.get(), "Volume");
+/// assert_eq!(live.get(), "Ada");
+/// assert!(live.is_reactive() && !fixed.is_reactive());
+/// ```
+pub enum Value<T> {
+    /// A value that never changes.
+    Const(T),
+    /// The current value of a signal.
+    Signal(Signal<T>),
+    /// The current value of a memo.
+    Memo(Memo<T>),
+}
+
+impl<T: PartialEq + Send + Sync + 'static> Value<T> {
+    /// Reads the value through `f`, tracking the read when it is reactive.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        match self {
+            Self::Const(value) => f(value),
+            Self::Signal(signal) => signal.with(f),
+            Self::Memo(memo) => memo.with(f),
+        }
+    }
+
+    /// Reads the value through `f` without tracking.
+    pub fn with_untracked<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        match self {
+            Self::Const(value) => f(value),
+            Self::Signal(signal) => signal.with_untracked(f),
+            Self::Memo(memo) => memo.with_untracked(f),
+        }
+    }
+
+    /// Clones the value, tracking the read when it is reactive.
+    #[must_use]
+    pub fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        self.with(T::clone)
+    }
+
+    /// Clones the value without tracking.
+    #[must_use]
+    pub fn get_untracked(&self) -> T
+    where
+        T: Clone,
+    {
+        self.with_untracked(T::clone)
+    }
+
+    /// Whether the value can change: a signal or a memo.
+    #[must_use]
+    pub fn is_reactive(&self) -> bool {
+        !matches!(self, Self::Const(_))
+    }
+}
+
+impl<T: Clone> Clone for Value<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Const(value) => Self::Const(value.clone()),
+            Self::Signal(signal) => Self::Signal(signal.clone()),
+            Self::Memo(memo) => Self::Memo(memo.clone()),
+        }
+    }
+}
+
+impl<T: Default> Default for Value<T> {
+    fn default() -> Self {
+        Self::Const(T::default())
+    }
+}
+
+impl<T> From<T> for Value<T> {
+    fn from(value: T) -> Self {
+        Self::Const(value)
+    }
+}
+
+impl<T> From<Signal<T>> for Value<T> {
+    fn from(signal: Signal<T>) -> Self {
+        Self::Signal(signal)
+    }
+}
+
+impl<T> From<Memo<T>> for Value<T> {
+    fn from(memo: Memo<T>) -> Self {
+        Self::Memo(memo)
+    }
+}
+
+impl From<&str> for Value<String> {
+    fn from(value: &str) -> Self {
+        Self::Const(value.to_owned())
+    }
+}
+
 /// Clones the listed signals into a closure, so several closures in one
 /// scene can capture the same signal.
 ///
@@ -656,11 +792,15 @@ pub struct Region;
 
 type BoxedList = Box<dyn SceneList>;
 
-fn spawn_list(world: &mut World, parent: Entity, list: BoxedList) -> Vec<Entity> {
+/// Spawns `list`, as children of `parent` if given. Keyed lists pass `None`
+/// and parent their rows once, in order, with `replace_children`.
+fn spawn_list(world: &mut World, parent: Option<Entity>, list: BoxedList) -> Vec<Entity> {
     match world.spawn_scene_list(list) {
         Ok(entities) => {
-            for &entity in &entities {
-                world.entity_mut(entity).insert(ChildOf(parent));
+            if let Some(parent) = parent {
+                for &entity in &entities {
+                    world.entity_mut(entity).insert(ChildOf(parent));
+                }
             }
             entities
         }
@@ -737,7 +877,7 @@ where
                     despawn_all(world, &children);
                 }
                 let children = untracked(|| render(&next))
-                    .map(|list| spawn_list(world, target, list))
+                    .map(|list| spawn_list(world, Some(target), list))
                     .unwrap_or_default();
                 current = Some((next, children));
             }
@@ -760,9 +900,65 @@ where
     KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
     R: Fn(&V) -> BoxedList + Clone + Send + Sync + 'static,
 {
+    keyed_rows(
+        items,
+        key,
+        |item| item,
+        // A changed value respawns the row.
+        |old: &V, item| if *old == item { None } else { Some(item) },
+        render,
+    )
+}
+
+/// Like [`for_keyed`], but each row keeps its entities for as long as its
+/// key is present and receives its item as a signal, updated in place
+/// (`set_if_neq`) when the item changes. Generated by
+/// `#[key(..)] for $item in ..` in `coat!`.
+#[doc(hidden)]
+pub fn for_keyed_signal<V, K, IF, KF, R>(
+    items: IF,
+    key: KF,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: PartialEq + Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
+    R: Fn(&Signal<V>) -> BoxedList + Clone + Send + Sync + 'static,
+{
+    keyed_rows(
+        items,
+        key,
+        Signal::new,
+        |signal: &Signal<V>, item| {
+            signal.set_if_neq(item);
+            None
+        },
+        render,
+    )
+}
+
+/// One set of children per key. `update` receives a kept row's state and
+/// its new item, and returns the item back to respawn the row.
+fn keyed_rows<V, K, S, IF, KF, R>(
+    items: IF,
+    key: KF,
+    make: fn(V) -> S,
+    update: fn(&S, V) -> Option<V>,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    S: Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
+    R: Fn(&S) -> BoxedList + Clone + Send + Sync + 'static,
+{
     effect_template((), move |()| -> RunFn {
         let (items, key, render) = (items.clone(), key.clone(), render.clone());
-        let mut rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
+        let mut rows: HashMap<K, (S, Vec<Entity>)> = HashMap::default();
         let mut order: Vec<Entity> = Vec::new();
         Box::new(move |world: &mut World, target| {
             let (next, deps) = tracked(world, target, |_| items());
@@ -770,18 +966,28 @@ where
             let mut next_order = Vec::new();
             for item in next {
                 let item_key = untracked(|| key(&item));
-                let children = match rows.remove(&item_key) {
-                    Some((old, children)) if old == item => children,
-                    previous => {
-                        if let Some((_, children)) = previous {
+                // Kept rows update in place or hand the item back to respawn.
+                let respawn = match rows.remove(&item_key) {
+                    Some((state, children)) => match update(&state, item) {
+                        None => Err((state, children)),
+                        Some(item) => {
                             despawn_all(world, &children);
+                            Ok(item)
                         }
-                        let list = untracked(|| render(&item));
-                        spawn_list(world, target, list)
-                    }
+                    },
+                    None => Ok(item),
                 };
+                let (state, children) = respawn.map_or_else(
+                    |kept| kept,
+                    |item| {
+                        let state = make(item);
+                        let list = untracked(|| render(&state));
+                        let children = spawn_list(world, None, list);
+                        (state, children)
+                    },
+                );
                 next_order.extend(children.iter().copied());
-                if let Some((_, duplicate)) = next_rows.insert(item_key, (item, children)) {
+                if let Some((_, duplicate)) = next_rows.insert(item_key, (state, children)) {
                     warn_once!(
                         "coat!: two items in a keyed `for` have the same `#[key]`; only the last                          one is shown"
                     );
@@ -816,6 +1022,44 @@ where
         |(index, _): &(usize, V)| *index,
         move |(_, item): &(usize, V)| render(item),
     )
+}
+
+/// One set of children per position, each receiving the item at its
+/// position as a signal updated in place, like Solid's `<Index>`. Rows are
+/// added and removed only at the end. Generated by `for $item in ..`
+/// without `#[key]` in `coat!`.
+#[doc(hidden)]
+pub fn for_indexed_signal<V, IF, R>(
+    items: IF,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: PartialEq + Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    R: Fn(&Signal<V>) -> BoxedList + Clone + Send + Sync + 'static,
+{
+    effect_template((), move |()| -> RunFn {
+        let (items, render) = (items.clone(), render.clone());
+        let mut rows: Vec<(Signal<V>, Vec<Entity>)> = Vec::new();
+        Box::new(move |world: &mut World, target| {
+            let (next, deps) = tracked(world, target, |_| items());
+            let len = next.len();
+            for (index, item) in next.into_iter().enumerate() {
+                if let Some((signal, _)) = rows.get(index) {
+                    signal.set_if_neq(item);
+                } else {
+                    let signal = Signal::new(item);
+                    let list = untracked(|| render(&signal));
+                    let children = spawn_list(world, Some(target), list);
+                    rows.push((signal, children));
+                }
+            }
+            for (_, children) in rows.drain(len.min(rows.len())..) {
+                despawn_all(world, &children);
+            }
+            deps.into()
+        })
+    })
 }
 
 /// Region key of a reactive `match`: the matched arm, and the values its
@@ -859,8 +1103,9 @@ pub fn arm_key<T: PartialEq + Send + Sync + 'static>(arm: usize, values: T) -> A
 pub mod __private {
     pub use super::{
         ArmKey as __CoatArmKey, Region as __CoatRegion, arm_key as __coat_arm_key,
-        assign as __coat_assign, for_indexed as __coat_for_indexed, for_keyed as __coat_for,
-        patch as __coat_patch, region as __coat_region,
+        assign as __coat_assign, for_indexed as __coat_for_indexed,
+        for_indexed_signal as __coat_for_indexed_signal, for_keyed as __coat_for,
+        for_keyed_signal as __coat_for_signal, patch as __coat_patch, region as __coat_region,
     };
     pub use bevy::scene::{bsn, bsn_list};
 }

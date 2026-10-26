@@ -643,13 +643,30 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
     let Some(in_index) = item.iter().position(|t| is_ident(Some(t), "in")) else {
         return error(item[0].span(), "expected `for pattern in items { ... }`");
     };
-    let pattern_tokens = &item[1..in_index];
+    let mut pattern_tokens = &item[1..in_index];
+    // `for $item in ..`: each row receives its item as a signal.
+    let item_signal = is_punct(pattern_tokens.first(), '$');
+    if item_signal {
+        if !matches!(pattern_tokens, [_, TokenTree::Ident(_)]) {
+            return error(
+                pattern_tokens[0].span(),
+                "expected `for $name in ..`: an item signal binds a single name",
+            );
+        }
+        pattern_tokens = &pattern_tokens[1..];
+    }
     let pattern = stream(pattern_tokens);
     let Some((iter, body, next)) = until_block(item, in_index + 1) else {
         return error(item[0].span(), "expected `for pattern in items { ... }`");
     };
     if next < item.len() {
         return error(item[next].span(), "unexpected tokens after `for`");
+    }
+    if item_signal && !contains_dollar(&iter) {
+        return error(
+            item[1].span(),
+            "`for $name in ..` needs a reactive iterator that reads a signal with `$`",
+        );
     }
 
     if !contains_dollar(&iter) {
@@ -677,13 +694,18 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
             #body
         } }
     };
+    let (keyed, indexed) = if item_signal {
+        (quote!(__coat_for_signal), quote!(__coat_for_indexed_signal))
+    } else {
+        (quote!(__coat_for), quote!(__coat_for_indexed))
+    };
     match key {
         Some(key) => {
             let key_site = scope.site(key, &bound);
             let key = reads(key);
             quote! {
                 __CoatRegion
-                __coat_for(
+                #keyed(
                     #items,
                     { #key_site move |__item: &_| {
                         #[allow(unused_variables)]
@@ -696,7 +718,7 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
         }
         None => quote! {
             __CoatRegion
-            __coat_for_indexed(#items, #render)
+            #indexed(#items, #render)
         },
     }
 }
