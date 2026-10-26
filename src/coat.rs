@@ -172,6 +172,50 @@ fn untracked<R>(f: impl FnOnce() -> R) -> R {
 }
 
 // ---------------------------------------------------------------------------
+// Re-entrancy checks
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Signals and memos this thread is accessing, and whether exclusively.
+    static HELD: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Marks a signal or memo as accessed by this thread until dropped.
+struct Held(usize);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|&(cell, _)| cell == self.0) {
+                held.remove(index);
+            }
+        });
+    }
+}
+
+/// Records an access to the cell at `cell`, panicking when it conflicts
+/// with an access this thread already holds. Locking again would deadlock.
+fn hold(cell: usize, exclusive: bool, conflict: &str) -> Held {
+    let conflicts = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        let conflicts = held
+            .iter()
+            .any(|&(other, other_exclusive)| other == cell && (exclusive || other_exclusive));
+        if !conflicts {
+            held.push((cell, exclusive));
+        }
+        conflicts
+    });
+    assert!(!conflicts, "{conflict}");
+    Held(cell)
+}
+
+const SIGNAL_REENTERED: &str = "a `Signal` was set or read while this thread is updating or     reading it, for example `s.set(..)` inside `s.with(..)` or `s.get()` inside `s.update(..)`;     read the value first, or use the closure's argument";
+
+const MEMO_REENTERED: &str = "a `Memo` was read while it is being computed or read on this     thread; a memo cannot depend on itself";
+
+// ---------------------------------------------------------------------------
 // Signal
 // ---------------------------------------------------------------------------
 
@@ -218,8 +262,18 @@ impl<T: Send + Sync + 'static> Signal<T> {
     }
 
     /// Reads the value through `f` without tracking.
+    ///
+    /// # Panics
+    ///
+    /// If `f` sets or updates this signal, and if called inside this
+    /// signal's own [`update`](Self::update). Nested reads are allowed.
     pub fn with_untracked<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let _held = hold(self.cell(), false, SIGNAL_REENTERED);
         f(&self.0.value.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn cell(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
     }
 
     /// Clones the value and tracks the read.
@@ -248,23 +302,37 @@ impl<T: Send + Sync + 'static> Signal<T> {
     /// Replaces the value, notifying readers only if it changed.
     ///
     /// Returns whether the value changed.
+    ///
+    /// # Panics
+    ///
+    /// Like [`update`](Self::update).
     pub fn set_if_neq(&self, value: T) -> bool
     where
         T: PartialEq,
     {
+        let held = hold(self.cell(), true, SIGNAL_REENTERED);
         let mut current = self.0.value.write().unwrap_or_else(PoisonError::into_inner);
         if *current == value {
             return false;
         }
         *current = value;
         drop(current);
+        drop(held);
         self.notify();
         true
     }
 
     /// Mutates the value in place and notifies readers.
+    ///
+    /// # Panics
+    ///
+    /// When called while this thread is reading or updating the signal,
+    /// such as `s.set(..)` inside `s.with(..)`, or when `f` reads it. Locking
+    /// again would deadlock.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let held = hold(self.cell(), true, SIGNAL_REENTERED);
         let result = f(&mut self.0.value.write().unwrap_or_else(PoisonError::into_inner));
+        drop(held);
         self.notify();
         result
     }
@@ -325,6 +393,7 @@ impl<T: Default + Send + Sync + 'static> Default for Signal<T> {
 
 impl<T: fmt::Debug> fmt::Debug for Signal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _held = hold(Arc::as_ptr(&self.0).addr(), false, SIGNAL_REENTERED);
         let value = self.0.value.read().unwrap_or_else(PoisonError::into_inner);
         f.debug_tuple("Signal").field(&*value).finish()
     }
@@ -346,6 +415,10 @@ struct MemoInner<T> {
 }
 
 impl<T: PartialEq + Send + Sync> MemoInner<T> {
+    fn cell(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
     fn refresh(&self) {
         let needs_refresh = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -354,7 +427,9 @@ impl<T: PartialEq + Send + Sync> MemoInner<T> {
         if !needs_refresh {
             return;
         }
+        let held = hold(self.cell(), true, MEMO_REENTERED);
         let (value, deps) = scope(|| (self.compute)());
+        drop(held);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.value.as_ref() != Some(&value) {
             state.value = Some(value);
@@ -405,9 +480,10 @@ impl<T: PartialEq + Send + Sync + 'static> Memo<T> {
     ///
     /// # Panics
     ///
-    /// Never: the memo is refreshed before it is read.
+    /// When the memo reads itself, directly or through `f`.
     pub fn with_untracked<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         self.0.refresh();
+        let _held = hold(self.0.cell(), true, MEMO_REENTERED);
         let state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         f(state.value.as_ref().expect("memo was refreshed"))
     }
@@ -549,23 +625,39 @@ fn despawn_all(world: &mut World, entities: &[Entity]) {
 }
 
 /// Patches component `C` whenever a signal read by `f` changes.
+///
+/// `f` returns whether it changed a field; only then is `C` marked changed,
+/// so tracked components are not republished for identical values.
 #[doc(hidden)]
 pub fn patch<C, F>(f: F) -> impl Template<Output = EmptySceneEffect>
 where
     C: Component<Mutability = Mutable>,
-    F: Fn(&mut C) + Clone + Send + Sync + 'static,
+    F: Fn(&mut C) -> bool + Clone + Send + Sync + 'static,
 {
     effect_template((), move |()| -> RunFn {
         let f = f.clone();
         Box::new(move |world: &mut World, target| {
             let ((), signals) = scope(|| {
-                if let Some(mut component) = world.get_mut::<C>(target) {
-                    f(&mut component);
+                if let Some(mut component) = world.get_mut::<C>(target)
+                    && f(component.bypass_change_detection())
+                {
+                    component.set_changed();
                 }
             });
             signal_deps(signals)
         })
     })
+}
+
+/// Writes `value` into `field` if it differs. Returns whether it did.
+#[doc(hidden)]
+pub fn assign<T: PartialEq>(field: &mut T, value: T) -> bool {
+    if *field == value {
+        false
+    } else {
+        *field = value;
+        true
+    }
 }
 
 /// Rebuilds the region's children whenever `key()` changes.
@@ -630,7 +722,13 @@ where
                     }
                 };
                 next_order.extend(children.iter().copied());
-                next_rows.insert(item_key, (item, children));
+                if let Some((_, duplicate)) = next_rows.insert(item_key, (item, children)) {
+                    warn_once!(
+                        "coat!: two items in a keyed `for` have the same `#[key]`; only the last                          one is shown"
+                    );
+                    next_order.retain(|entity| !duplicate.contains(entity));
+                    despawn_all(world, &duplicate);
+                }
             }
             for (_, (_, children)) in rows.drain() {
                 despawn_all(world, &children);
@@ -664,8 +762,8 @@ where
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        Region as __CoatRegion, for_indexed as __coat_for_indexed, for_keyed as __coat_for,
-        patch as __coat_patch, region as __coat_region,
+        Region as __CoatRegion, assign as __coat_assign, for_indexed as __coat_for_indexed,
+        for_keyed as __coat_for, patch as __coat_patch, region as __coat_region,
     };
     pub use bevy::scene::{bsn, bsn_list};
 }

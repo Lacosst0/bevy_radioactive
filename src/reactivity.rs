@@ -59,7 +59,9 @@ pub struct ReactiveSettings {
     ///
     /// A reaction that writes another tracked value is published in the next
     /// pass of the same frame. Passes stop when nothing changes or this limit
-    /// is reached; remaining changes are published on the next frame.
+    /// is reached; remaining changes are published on the next frame, a
+    /// warning is logged once, and [`ReactiveDiagnostics::exhausted_frames`]
+    /// is incremented. Nested components and regions do not use up passes.
     pub max_passes: usize,
 }
 
@@ -78,6 +80,7 @@ impl Plugin for RadioactivePlugin {
         app.init_resource::<ReactiveSettings>()
             .init_resource::<ReactiveRegistry>()
             .init_resource::<PublishCounter>()
+            .init_resource::<ReactiveDiagnostics>()
             .init_schedule(ReactivePublish)
             .add_systems(PostUpdate, run_reactive.in_set(ReactiveSet::Publish));
         crate::runtime::init(app.world_mut());
@@ -94,6 +97,8 @@ impl Plugin for RadioactivePlugin {
 #[derive(Default, Resource)]
 struct ReactiveRegistry {
     tracked: HashSet<TypeId>,
+    /// `ValueChanged<T>` and `ValueRemoved<T>` of every tracked `T`.
+    events: HashSet<TypeId>,
     pending: Vec<fn(&mut Schedule)>,
 }
 
@@ -104,6 +109,8 @@ fn register<T: Component + Clone>(world: &mut World) {
     if !registry.tracked.insert(TypeId::of::<T>()) {
         return;
     }
+    registry.events.insert(TypeId::of::<ValueChanged<T>>());
+    registry.events.insert(TypeId::of::<ValueRemoved<T>>());
     registry.pending.push(|schedule| {
         schedule.add_systems(publish::<T>);
     });
@@ -127,8 +134,23 @@ fn add_pending_publishers(world: &mut World) {
 #[derive(Default, Resource)]
 struct PublishCounter(AtomicUsize);
 
+/// Counters describing the reactive runtime, inserted by [`RadioactivePlugin`].
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct ReactiveDiagnostics {
+    /// Passes run in the last frame.
+    pub passes: usize,
+    /// Effects, component renders and region updates run in the last frame.
+    pub effects_run: usize,
+    /// [`ValueChanged`] events published in the last frame.
+    pub publications: usize,
+    /// Frames that stopped at [`ReactiveSettings::max_passes`] with work left.
+    pub exhausted_frames: u64,
+}
+
 fn run_reactive(world: &mut World) {
     let max_passes = world.resource::<ReactiveSettings>().max_passes.max(1);
+    let mut frame = ReactiveDiagnostics::default();
+    let mut settled = false;
     for _ in 0..max_passes {
         add_pending_publishers(world);
         world
@@ -139,9 +161,21 @@ fn run_reactive(world: &mut World) {
         world.flush();
         let published = world.resource::<PublishCounter>().0.load(Ordering::Relaxed);
         let ran = crate::runtime::run_effects(world);
+        frame.passes += 1;
+        frame.publications += published;
+        frame.effects_run += ran;
         if published == 0 && ran == 0 {
-            return;
+            settled = true;
+            break;
         }
+    }
+    let mut diagnostics = world.resource_mut::<ReactiveDiagnostics>();
+    frame.exhausted_frames = diagnostics.exhausted_frames + u64::from(!settled);
+    *diagnostics = frame;
+    if !settled {
+        warn_once!(
+            "bevy_radioactive: reached `ReactiveSettings::max_passes` ({max_passes}) with              reactive work left; it continues next frame. This usually means a feedback              cycle, such as an effect that writes a value it reads."
+        );
     }
 }
 
@@ -206,8 +240,9 @@ impl<T: Component> EntityEvent for ValueChanged<T> {
 /// Published when a tracked value is removed from its source, including when
 /// the source is despawned or a resource is removed.
 ///
-/// Delivered synchronously while the source still exists, so subscriptions
-/// are routed before the source's relationships are torn down.
+/// Routed while the source still exists, before its relationships are torn
+/// down, so despawning a source reaches its subscribers. Handlers run at the
+/// next command flush, after the removal or despawn has finished.
 pub struct ValueRemoved<T: Component> {
     source: Entity,
     marker: PhantomData<fn() -> T>,
@@ -287,6 +322,23 @@ impl ReactiveAppExt for App {
         observer: impl IntoObserverSystem<ValueChanged<T>, M>,
     ) -> &mut Self {
         self.track::<T>().add_observer(observer)
+    }
+}
+
+/// Warns when a raw [`subscribe_to`](crate::subscribe_to) names a value
+/// event whose type is not tracked, which would never be delivered.
+pub(crate) fn warn_if_untracked<E: 'static>(world: &World) {
+    if !type_name::<E>().starts_with("bevy_radioactive::reactivity::Value") {
+        return;
+    }
+    let tracked = world
+        .get_resource::<ReactiveRegistry>()
+        .is_some_and(|registry| registry.events.contains(&TypeId::of::<E>()));
+    if !tracked {
+        warn_once!(
+            "bevy_radioactive: `subscribe_to::<{}>` is delivered only once its value type is              tracked; use `watch`/`watch_removed`, or call `app.track::<T>()`",
+            type_name::<E>(),
+        );
     }
 }
 

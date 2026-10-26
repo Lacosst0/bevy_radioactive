@@ -19,9 +19,9 @@ pub mod subscription;
 pub mod webby;
 
 pub use reactivity::{
-    RadioactivePlugin, Reaction, ReactiveAppExt, ReactivePublish, ReactiveSet, ReactiveSettings,
-    Removal, Singleton, ValueChanged, ValueRemoved, Watch, WatchRemoval, bind, bind_or, on_removed,
-    watch,
+    RadioactivePlugin, Reaction, ReactiveAppExt, ReactiveDiagnostics, ReactivePublish, ReactiveSet,
+    ReactiveSettings, Removal, Singleton, ValueChanged, ValueRemoved, Watch, WatchRemoval, bind,
+    bind_or, on_removed, watch,
 };
 pub use subscription::{
     Source, Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt,

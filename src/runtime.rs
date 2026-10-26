@@ -139,68 +139,103 @@ struct Slot {
 #[component(on_add = register_host, on_remove = unregister_host)]
 pub struct Effects(Vec<Slot>);
 
+/// Every effect host, plus the hosts added since the current pass started.
 #[derive(Resource, Default)]
-struct EffectHosts(EntityHashSet);
+struct EffectHosts {
+    all: EntityHashSet,
+    fresh: Vec<Entity>,
+}
 
 fn register_host(mut world: DeferredWorld, context: HookContext) {
     if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
-        hosts.0.insert(context.entity);
+        hosts.all.insert(context.entity);
+        hosts.fresh.push(context.entity);
     }
 }
 
 fn unregister_host(mut world: DeferredWorld, context: HookContext) {
     if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
-        hosts.0.remove(&context.entity);
+        hosts.all.remove(&context.entity);
     }
 }
 
+/// Number of `ChildOf` ancestors of `entity`.
+fn depth(world: &World, mut entity: Entity) -> usize {
+    let mut depth = 0;
+    while let Some(parent) = world.get::<ChildOf>(entity) {
+        entity = parent.parent();
+        depth += 1;
+    }
+    depth
+}
+
 /// Runs every dirty effect once. Returns the number of effects that ran.
+///
+/// Hosts run parent-first, so a parent that re-renders despawns stale
+/// children before they run. Hosts spawned during the pass (child
+/// components and nested regions) run in the same pass, so a pass settles a
+/// whole tree rather than one level of it.
 pub(crate) fn run_effects(world: &mut World) -> usize {
-    let Some(hosts) = world.get_resource::<EffectHosts>() else {
+    let mut queue: Vec<Entity> = {
+        let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() else {
+            return 0;
+        };
+        hosts.fresh.clear();
+        hosts.all.iter().copied().collect()
+    };
+    queue.sort_by_cached_key(|&host| depth(world, host));
+    let mut ran = 0;
+    let mut next = 0;
+    while next < queue.len() {
+        let host = queue[next];
+        next += 1;
+        ran += run_host(world, host);
+        let fresh = std::mem::take(&mut world.resource_mut::<EffectHosts>().fresh);
+        queue.extend(fresh);
+    }
+    ran
+}
+
+fn run_host(world: &mut World, host: Entity) -> usize {
+    let Ok(mut entity) = world.get_entity_mut(host) else {
         return 0;
     };
-    let hosts: Vec<Entity> = hosts.0.iter().copied().collect();
+    if entity.contains::<Disabled>() {
+        return 0;
+    }
+    let Some(mut effects) = entity.get_mut::<Effects>() else {
+        return 0;
+    };
+    let mut slots = std::mem::take(&mut effects.bypass_change_detection().0);
     let mut ran = 0;
-    for host in hosts {
-        let Ok(mut entity) = world.get_entity_mut(host) else {
-            continue;
-        };
-        if entity.contains::<Disabled>() {
+    for slot in &mut slots {
+        let this_run = world.read_change_tick();
+        let dirty = slot.last_run.is_none_or(|last_run| {
+            slot.deps
+                .iter()
+                .any(|dep| dep.is_dirty(world, last_run, this_run))
+        });
+        if !dirty {
             continue;
         }
-        let Some(mut effects) = entity.get_mut::<Effects>() else {
-            continue;
-        };
-        let mut slots = std::mem::take(&mut effects.bypass_change_detection().0);
-        for slot in &mut slots {
-            let this_run = world.read_change_tick();
-            let dirty = slot.last_run.is_none_or(|last_run| {
-                slot.deps
-                    .iter()
-                    .any(|dep| dep.is_dirty(world, last_run, this_run))
-            });
-            if !dirty {
-                continue;
-            }
-            // Writes made by this effect get a tick no newer than its own
-            // `last_run`, so an effect never re-triggers itself, while later
-            // effects still see those writes as changes.
-            world.increment_change_tick();
-            let tick = world.read_change_tick();
-            slot.deps = (slot.run)(world, host);
-            slot.last_run = Some(tick);
-            ran += 1;
-            if world.get_entity(host).is_err() {
-                break;
-            }
+        // Writes made by this effect get a tick no newer than its own
+        // `last_run`, so an effect never re-triggers itself, while later
+        // effects still see those writes as changes.
+        world.increment_change_tick();
+        let tick = world.read_change_tick();
+        slot.deps = (slot.run)(world, host);
+        slot.last_run = Some(tick);
+        ran += 1;
+        if world.get_entity(host).is_err() {
+            break;
         }
-        if let Ok(mut entity) = world.get_entity_mut(host)
-            && let Some(mut effects) = entity.get_mut::<Effects>()
-        {
-            let effects = effects.bypass_change_detection();
-            slots.append(&mut effects.0);
-            effects.0 = slots;
-        }
+    }
+    if let Ok(mut entity) = world.get_entity_mut(host)
+        && let Some(mut effects) = entity.get_mut::<Effects>()
+    {
+        let effects = effects.bypass_change_detection();
+        slots.append(&mut effects.0);
+        effects.0 = slots;
     }
     ran
 }

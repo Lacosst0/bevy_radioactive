@@ -21,7 +21,10 @@ members = ["macros"]
 
 [dependencies]
 bevy_radioactive_macros = { path = "macros", version = "0.4.0" }
-bevy = { version = "0.20", default-features = false, features = ["bevy_scene"] }
+bevy = { version = "0.20", default-features = false, features = [
+    "bevy_log",
+    "bevy_scene",
+] }
 
 [dev-dependencies]
 bevy = { version = "0.20", default-features = false, features = [

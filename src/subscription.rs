@@ -15,7 +15,7 @@ use bevy::{
         template::{EntityTemplate, Template, TemplateContext},
         world::DeferredWorld,
     },
-    platform::collections::HashSet,
+    platform::collections::HashMap,
     prelude::*,
     scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
@@ -124,8 +124,16 @@ impl<E: EntityEvent + Clone> Deref for Subscription<'_, '_, E> {
 ///
 /// Call [`SubscriptionAppExt::register_subscription`] before inserting this
 /// relationship directly. Prefer [`subscribe_to`] in BSN scenes.
+///
+/// When the source is despawned the relationship is removed. Internal
+/// subscription entities spawned by BSN helpers (those with
+/// [`SubscriptionOf`]) are then despawned too; entities holding the
+/// relationship directly are kept.
 #[derive(Component, FromTemplate, Clone, Copy, Debug)]
-#[component(on_add = assert_subscription_registered::<E>)]
+#[component(
+    on_add = assert_subscription_registered::<E>,
+    on_remove = despawn_internal_subscription,
+)]
 #[relationship(relationship_target = Subscribers<E>)]
 pub struct SubscribedTo<E: EntityEvent + Clone> {
     #[relationship]
@@ -284,6 +292,10 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         if let Some(check) = self.check {
             check(context)?;
+        } else {
+            context
+                .entity
+                .world_scope(|world| crate::reactivity::warn_if_untracked::<E>(world));
         }
         let mut sources = Vec::new();
         self.source.resolve(context, &mut sources)?;
@@ -293,7 +305,11 @@ where
             install_subscription::<E>(world);
             for source in sources {
                 world
-                    .spawn((SubscriptionOf(listener), SubscribedTo::<E>::new(source)))
+                    .spawn((
+                        SubscriptionOf(listener),
+                        Deliveries::default(),
+                        SubscribedTo::<E>::new(source),
+                    ))
                     .observe(observer.clone());
             }
         });
@@ -357,18 +373,25 @@ impl SubscriptionAppExt for App {
     }
 }
 
+/// Registered event types, with the entity of their generic forwarder, or
+/// `None` for events the crate routes itself.
 #[derive(Default, Resource)]
-struct SubscriptionRegistry(HashSet<TypeId>);
+struct SubscriptionRegistry(HashMap<TypeId, Option<Entity>>);
 
 pub(crate) fn install_subscription<E: EntityEvent + Clone>(world: &mut World) {
     world.init_resource::<SubscriptionRegistry>();
     if world
+        .resource::<SubscriptionRegistry>()
+        .0
+        .contains_key(&TypeId::of::<E>())
+    {
+        return;
+    }
+    let forwarder = world.add_observer(forward::<E>).id();
+    world
         .resource_mut::<SubscriptionRegistry>()
         .0
-        .insert(TypeId::of::<E>())
-    {
-        world.add_observer(forward::<E>);
-    }
+        .insert(TypeId::of::<E>(), Some(forwarder));
 }
 
 #[expect(
@@ -379,10 +402,51 @@ fn assert_subscription_registered<E: EntityEvent + Clone>(world: DeferredWorld, 
     assert!(
         world
             .get_resource::<SubscriptionRegistry>()
-            .is_some_and(|registry| registry.0.contains(&TypeId::of::<E>())),
+            .is_some_and(|registry| registry.0.contains_key(&TypeId::of::<E>())),
         "subscription event `{0}` is not registered; call `app.register_subscription::<{0}>()` during app construction or use `subscribe_to(...)`",
         type_name::<E>(),
     );
+}
+
+/// Bookkeeping on internal subscription entities: deliveries routed but not
+/// yet run, and whether the source is gone.
+#[derive(Component, Default)]
+struct Deliveries {
+    pending: u32,
+    orphaned: bool,
+}
+
+/// Despawns a BSN subscription entity once it no longer has a source.
+///
+/// Despawning a source routes its removal events before the relationship is
+/// removed, but runs them later; the entity then stays until they ran.
+fn despawn_internal_subscription(mut world: DeferredWorld, context: HookContext) {
+    let Some(mut deliveries) = world.get_mut::<Deliveries>(context.entity) else {
+        return;
+    };
+    if deliveries.pending == 0 {
+        world.commands().entity(context.entity).try_despawn();
+    } else {
+        deliveries.orphaned = true;
+    }
+}
+
+/// Runs one routed delivery, then despawns an orphaned subscription entity
+/// once its last delivery ran.
+fn deliver<E: EntityEvent + Clone>(world: &mut World, event: SubscriptionEvent<E>) {
+    let delivery = event.delivery;
+    world.trigger(event);
+    let Some(mut deliveries) = world
+        .get_entity_mut(delivery)
+        .ok()
+        .and_then(EntityWorldMut::into_mut::<Deliveries>)
+    else {
+        return;
+    };
+    deliveries.pending = deliveries.pending.saturating_sub(1);
+    if deliveries.pending == 0 && deliveries.orphaned {
+        world.despawn(delivery);
+    }
 }
 
 #[expect(
@@ -393,14 +457,20 @@ fn forward<E: EntityEvent + Clone>(event: On<E>, world: DeferredWorld) {
     route(world, event.event_target(), event.event());
 }
 
-/// Marks `E` as registered without installing the generic forwarder; the
-/// caller routes `E` itself with [`route`].
+/// Marks `E` as registered without the generic forwarder; the caller routes
+/// `E` itself with [`route`].
+///
+/// A forwarder installed earlier, by subscribing to `E` before the crate
+/// routed it, is removed so events are not delivered twice.
 pub(crate) fn register_routed<E: EntityEvent + Clone>(world: &mut World) {
     world.init_resource::<SubscriptionRegistry>();
-    world
+    let previous = world
         .resource_mut::<SubscriptionRegistry>()
         .0
-        .insert(TypeId::of::<E>());
+        .insert(TypeId::of::<E>(), None);
+    if let Some(Some(forwarder)) = previous {
+        world.despawn(forwarder);
+    }
 }
 
 /// Queues one [`SubscriptionEvent`] per subscriber of `source`.
@@ -414,17 +484,26 @@ pub(crate) fn route<E: EntityEvent + Clone>(mut world: DeferredWorld, source: En
         return;
     };
     let event = Arc::new(event.clone());
+    let mut internal = Vec::new();
     for delivery in subscribers.iter() {
-        let target = entities
+        let owner = entities
             .get(delivery)
             .ok()
-            .and_then(|entity| entity.get::<SubscriptionOf>())
-            .map_or(delivery, |owner| owner.0);
-        commands.trigger(SubscriptionEvent {
+            .and_then(|entity| entity.get::<SubscriptionOf>());
+        if owner.is_some() {
+            internal.push(delivery);
+        }
+        let event = SubscriptionEvent {
             delivery,
-            target,
+            target: owner.map_or(delivery, |owner| owner.0),
             source,
             event: Arc::clone(&event),
-        });
+        };
+        commands.queue(move |world: &mut World| deliver(world, event));
+    }
+    for delivery in internal {
+        if let Some(mut deliveries) = world.get_mut::<Deliveries>(delivery) {
+            deliveries.pending += 1;
+        }
     }
 }

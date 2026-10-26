@@ -126,8 +126,8 @@ fn duel_log() -> impl Scene {
                     **text = format!("{name} now has {} HP", hit.0);
                 }
             })
-            on_removed(#Enemy, |_: Removal<Health>, mut q: Query<&mut Text>| {
-                for mut text in &mut q {
+            on_removed(#Enemy, |removal: Removal<Health>, mut q: Query<&mut Text>| {
+                if let Ok(mut text) = q.get_mut(removal.target()) {
                     **text = "Enemy defeated".into();
                 }
             })
@@ -266,13 +266,17 @@ feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
   same frame. Writes made later in the frame are published on the next frame.
 - Inside the runtime, publishing, components and regions repeat until nothing changes, up
   to `ReactiveSettings::max_passes` (default 8). A reaction that writes another
-  tracked value is therefore delivered in the same frame.
+  tracked value is therefore delivered in the same frame. Nested components and regions
+  settle within one pass. Hitting the limit logs a warning and increments
+  `ReactiveDiagnostics::exhausted_frames`.
 - When a type is first tracked by a scene, its publisher's first run reports the current
   values once, so the first watcher of a resource also receives its current value.
 - `watch` and `bind` do not replay the current value when a listener attaches. Values
   inserted by the same scene are published as changes, so same-scene sources render
   on spawn; for an existing resource, initialize the node from it or use `webby`/`coat!`.
-- Removal is delivered synchronously, while the source still exists.
+- Removal is routed while the source still exists, so despawning a source reaches its
+  listeners, but the handler runs at the next command flush, after the despawn has
+  finished. Don't expect to read the source's components from a removal handler.
 - Ordering between different local observers is unspecified.
 - Sources with Bevy's `Disabled` marker still publish and route events.
 
@@ -281,7 +285,7 @@ feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
 `track::<T>` adds one publisher that uses Bevy's `Changed<T>` filter, clones one `T`
 snapshot per changed source, and shares it through `Arc` with every listener of that
 source. Each `watch`/`bind` creates one small subscription entity per source, owned
-by (and despawned with) its listener.
+by (and despawned with) its listener, and despawned when its source is despawned.
 
 `webby` components and `coat!` regions check the change ticks and signal versions of
 their recorded dependencies each pass, and do no work when nothing changed. A component

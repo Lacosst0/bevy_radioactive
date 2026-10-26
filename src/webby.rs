@@ -99,7 +99,7 @@ use std::{
     cell::{Cell, RefCell},
     hash::{BuildHasher, Hash},
     ops::Deref,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
 };
 
 use bevy::{
@@ -143,15 +143,19 @@ struct ChildSlots {
 type PendingEffect = Box<dyn FnOnce(&mut Commands) + Send + Sync>;
 
 /// State of one mounted component: hooks, child instances and contexts.
+///
+/// A host's effect slot owns its instance, and an instance owns its child
+/// instances; the parent link is weak, so unmounting a host frees its whole
+/// instance tree.
 struct Instance {
-    parent: Option<Arc<Instance>>,
+    parent: Option<Weak<Instance>>,
     hooks: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
     children: Mutex<ChildSlots>,
     contexts: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
 impl Instance {
-    fn new(parent: Option<Arc<Instance>>) -> Arc<Self> {
+    fn new(parent: Option<Weak<Instance>>) -> Arc<Self> {
         Arc::new(Self {
             parent,
             hooks: Mutex::default(),
@@ -173,7 +177,7 @@ impl Instance {
         let instance = slots
             .previous
             .remove(&key)
-            .unwrap_or_else(|| Self::new(Some(Arc::clone(self))));
+            .unwrap_or_else(|| Self::new(Some(Arc::downgrade(self))));
         slots.current.insert(key, Arc::clone(&instance));
         instance
     }
@@ -234,19 +238,32 @@ impl Cx<'_, '_> {
     {
         let index = self.hook.get();
         self.hook.set(index + 1);
+        let mut init = Some(init);
         let mut slot = {
             let mut hooks = lock(&self.instance.hooks);
-            if index == hooks.len() {
+            if index == hooks.len()
+                && let Some(init) = init.take()
+            {
                 hooks.push(Box::new(init()));
             }
             std::mem::replace(&mut hooks[index], Box::new(()))
         };
-        let hook = slot.downcast_mut::<H>().unwrap_or_else(|| {
-            panic!(
-                "hook #{index} changed type to `{}`; call hooks in the same order on every render",
+        if !slot.is::<H>() {
+            // Usually an unkeyed component inherited another component's
+            // state. Start over from this hook rather than crashing the app.
+            warn!(
+                "webby: hook #{index} changed type to `{}`; resetting the component's state from                  this hook on. Call hooks in the same order on every render, and give                  conditionally rendered sibling components a `.key(..)`.",
                 type_name::<H>(),
-            )
-        });
+            );
+            lock(&self.instance.hooks).truncate(index + 1);
+            let init = init
+                .take()
+                .unwrap_or_else(|| unreachable!("a new hook has the right type"));
+            slot = Box::new(init());
+        }
+        let hook = slot
+            .downcast_mut::<H>()
+            .unwrap_or_else(|| unreachable!("hook #{index} was just initialised"));
         let result = use_hook(hook);
         lock(&self.instance.hooks)[index] = slot;
         result
@@ -389,7 +406,7 @@ impl Cx<'_, '_> {
     /// Like React's `useContext`: the nearest ancestor's provided `T`.
     #[must_use]
     pub fn use_context<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
-        let mut ancestor = self.instance.parent.clone();
+        let mut ancestor = self.instance.parent.as_ref().and_then(Weak::upgrade);
         while let Some(instance) = ancestor {
             if let Some(value) = lock(&instance.contexts)
                 .get(&TypeId::of::<T>())
@@ -397,13 +414,7 @@ impl Cx<'_, '_> {
             {
                 return Some(value.clone());
             }
-            #[expect(
-                clippy::assigning_clones,
-                reason = "`instance` is moved out of `ancestor`"
-            )]
-            {
-                ancestor = instance.parent.clone();
-            }
+            ancestor = instance.parent.as_ref().and_then(Weak::upgrade);
         }
         None
     }

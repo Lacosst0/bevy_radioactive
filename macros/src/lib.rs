@@ -309,7 +309,8 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
     out
 }
 
-/// `Comp($x)` → `Comp({ x.get() }) __coat_patch(move |c: &mut Comp| c.0 = ..)`.
+/// `Comp($x)` → `Comp({ x.get() }) __coat_patch(move |c: &mut Comp| ..)`,
+/// where the patch assigns only fields whose value changed.
 fn reactive_component(
     path: &[TokenTree],
     delimiter: Delimiter,
@@ -344,12 +345,13 @@ fn reactive_component(
         match &name {
             Some(name) => {
                 initial.push(quote!(#name: {{ #site #read }}));
-                quote!(__c.#name = ::core::convert::Into::into(#read);).to_tokens(&mut assignments);
+                quote!(__changed |= __coat_assign(&mut __c.#name, ::core::convert::Into::into(#read));)
+                    .to_tokens(&mut assignments);
             }
             None => {
                 initial.push(quote!({{ #site #read }}));
                 let index = Literal::usize_unsuffixed(index);
-                quote!(__c.#index = ::core::convert::Into::into(#read);)
+                quote!(__changed |= __coat_assign(&mut __c.#index, ::core::convert::Into::into(#read));)
                     .to_tokens(&mut assignments);
             }
         }
@@ -359,7 +361,11 @@ fn reactive_component(
     let site = scope.site(content, &[]);
     quote! {
         #path #initial
-        __coat_patch({ #site move |__c: &mut #path| { #assignments } })
+        __coat_patch({ #site move |__c: &mut #path| -> bool {
+            let mut __changed = false;
+            #assignments
+            __changed
+        } })
     }
 }
 
