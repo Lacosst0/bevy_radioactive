@@ -112,11 +112,11 @@ use bevy::{
     scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
 
-use crate::runtime::{RunFn, attach, ensure_runtime, spawn_child, tracked};
+use crate::runtime::{PostEffects, RunFn, Unmounted, attach, ensure_runtime, spawn_child, tracked};
 pub use crate::{
     coat::{Signal, cloned},
     macros::component,
-    runtime::{Deps, Effects, Reads},
+    runtime::{Cleanup, Deps, Effects, IntoCleanup, Reads},
 };
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -142,6 +142,9 @@ struct ChildSlots {
 
 type PendingEffect = Box<dyn FnOnce(&mut Commands) + Send + Sync>;
 
+/// A cleanup slot shared between a hook and its instance, run on unmount.
+type CleanupCell = Arc<Mutex<Option<Cleanup>>>;
+
 /// State of one mounted component: hooks, child instances and contexts.
 ///
 /// A host's effect slot owns its instance, and an instance owns its child
@@ -152,15 +155,20 @@ struct Instance {
     hooks: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
     children: Mutex<ChildSlots>,
     contexts: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    /// Effect cleanups and `on_unmount` callbacks, run when dropped.
+    cleanups: Mutex<Vec<CleanupCell>>,
+    unmounted: Unmounted,
 }
 
 impl Instance {
-    fn new(parent: Option<Weak<Instance>>) -> Arc<Self> {
+    fn new(parent: Option<Weak<Instance>>, unmounted: Unmounted) -> Arc<Self> {
         Arc::new(Self {
             parent,
             hooks: Mutex::default(),
             children: Mutex::default(),
             contexts: Mutex::default(),
+            cleanups: Mutex::default(),
+            unmounted,
         })
     }
 
@@ -177,9 +185,23 @@ impl Instance {
         let instance = slots
             .previous
             .remove(&key)
-            .unwrap_or_else(|| Self::new(Some(Arc::downgrade(self))));
+            .unwrap_or_else(|| Self::new(Some(Arc::downgrade(self)), self.unmounted.clone()));
         slots.current.insert(key, Arc::clone(&instance));
         instance
+    }
+}
+
+impl Drop for Instance {
+    /// The component unmounted. Its cleanups need `Commands`, so they wait
+    /// for the runtime's next pass.
+    fn drop(&mut self) {
+        let cleanups: Vec<Cleanup> = lock(&self.cleanups)
+            .drain(..)
+            .filter_map(|cell| lock(&cell).take())
+            .collect();
+        if !cleanups.is_empty() {
+            lock(&self.unmounted.0).extend(cleanups);
+        }
     }
 }
 
@@ -196,10 +218,13 @@ impl Drop for RenderingGuard {
     }
 }
 
-fn instance_for(key: Option<u64>) -> Arc<Instance> {
+fn instance_for(key: Option<u64>, unmounted: Unmounted) -> Arc<Instance> {
     RENDERING
         .with(|stack| stack.borrow().last().cloned())
-        .map_or_else(|| Instance::new(None), |parent| parent.child(key))
+        .map_or_else(
+            || Instance::new(None, unmounted),
+            |parent| parent.child(key),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -343,15 +368,29 @@ impl Cx<'_, '_> {
         )
     }
 
-    /// Like React's `useEffect`: runs `effect` after the render is spawned,
-    /// on mount and whenever `deps` change. Pass `()` to run once on mount.
-    pub fn use_effect<D>(
+    /// Like React's `useEffect`: runs `effect` on mount and whenever `deps`
+    /// change. Pass `()` to run once on mount.
+    ///
+    /// Effects run at the end of the reactive pass, after this component's
+    /// subtree, including child components, has rendered; child effects run
+    /// before parent effects. `effect` may return a cleanup closure, which
+    /// runs before the effect runs again and when the component unmounts:
+    ///
+    /// ```ignore
+    /// cx.use_effect(id, |id, commands| {
+    ///     let watcher = commands.spawn(Watching(*id)).id();
+    ///     move |commands: &mut Commands| commands.entity(watcher).despawn()
+    /// });
+    /// ```
+    pub fn use_effect<D, C>(
         &self,
         deps: D,
-        effect: impl FnOnce(&D, &mut Commands) + Send + Sync + 'static,
+        effect: impl FnOnce(&D, &mut Commands) -> C + Send + Sync + 'static,
     ) where
         D: PartialEq + Clone + Send + Sync + 'static,
+        C: IntoCleanup,
     {
+        let cell = self.cleanup_cell();
         let changed = self.hook(
             || None::<D>,
             |previous| {
@@ -363,10 +402,35 @@ impl Cx<'_, '_> {
             },
         );
         if changed {
-            self.effects
-                .borrow_mut()
-                .push(Box::new(move |commands| effect(&deps, commands)));
+            self.effects.borrow_mut().push(Box::new(move |commands| {
+                let previous = lock(&cell).take();
+                if let Some(cleanup) = previous {
+                    cleanup(commands);
+                }
+                let cleanup = effect(&deps, commands).into_cleanup();
+                *lock(&cell) = cleanup;
+            }));
         }
+    }
+
+    /// Runs `f` when the component unmounts: when its host is despawned, or
+    /// when a parent render no longer includes it. The latest `f` passed is
+    /// the one that runs.
+    pub fn on_unmount(&self, f: impl FnOnce(&mut Commands) + Send + Sync + 'static) {
+        let cell = self.cleanup_cell();
+        *lock(&cell) = Some(Box::new(f));
+    }
+
+    /// A cleanup slot that persists across renders and runs on unmount.
+    fn cleanup_cell(&self) -> CleanupCell {
+        self.hook(
+            || {
+                let cell = CleanupCell::default();
+                lock(&self.instance.cleanups).push(Arc::clone(&cell));
+                cell
+            },
+            |cell: &mut CleanupCell| Arc::clone(cell),
+        )
     }
 
     /// Like React's `useRef`: a mutable box that persists across renders
@@ -499,7 +563,10 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         ensure_runtime(context)?;
         let deps = self.deps.resolve(context)?;
-        let run = render_loop(instance_for(self.key), self.render.clone(), deps);
+        let unmounted = context
+            .entity
+            .world_scope(|world| world.resource::<Unmounted>().clone());
+        let run = render_loop(instance_for(self.key, unmounted), self.render.clone(), deps);
         attach(context, run);
         Ok(EmptySceneEffect)
     }
@@ -567,14 +634,19 @@ where
         lock(&instance.children).previous.clear();
 
         if !effects.is_empty() {
-            let mut queue = CommandQueue::default();
-            let mut commands = Commands::new(&mut queue, world);
-            for effect in effects {
-                effect(&mut commands);
-            }
-            queue.apply(world);
+            world
+                .resource_mut::<PostEffects>()
+                .0
+                .push(Box::new(move |world: &mut World| {
+                    let mut queue = CommandQueue::default();
+                    let mut commands = Commands::new(&mut queue, world);
+                    for effect in effects {
+                        effect(&mut commands);
+                    }
+                    queue.apply(world);
+                }));
         }
-        read_deps
+        read_deps.into()
     })
 }
 

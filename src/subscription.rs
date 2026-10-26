@@ -261,8 +261,13 @@ pub struct Subscribe<E, S, I, M> {
     source: S,
     observer: I,
     check: Option<fn(&mut TemplateContext) -> Result>,
+    pub(crate) replay: Option<Replay<E>>,
     marker: PhantomData<fn() -> (E, M)>,
 }
+
+/// Builds the event a new subscription replays from a source's current
+/// state, or `None` to replay nothing.
+pub(crate) type Replay<E> = fn(&World, Entity) -> Option<E>;
 
 impl<E, S, I, M> Subscribe<E, S, I, M> {
     pub(crate) fn new(source: S, observer: I) -> Self {
@@ -270,6 +275,7 @@ impl<E, S, I, M> Subscribe<E, S, I, M> {
             source,
             observer,
             check: None,
+            replay: None,
             marker: PhantomData,
         }
     }
@@ -278,6 +284,57 @@ impl<E, S, I, M> Subscribe<E, S, I, M> {
         self.check = Some(check);
         self
     }
+}
+
+/// Spawns one subscription entity per source for the entity being built.
+///
+/// With `replay`, each subscription also receives the event `replay` builds
+/// from its source, once the whole scene has been spawned.
+pub(crate) fn spawn_subscriptions<E, I, M>(
+    context: &mut TemplateContext,
+    sources: Vec<Entity>,
+    observer: &I,
+    replay: Option<Replay<E>>,
+) where
+    E: EntityEvent + Clone,
+    I: IntoObserverSystem<SubscriptionEvent<E>, M> + Clone,
+    M: 'static,
+{
+    let listener = context.entity.id();
+    context.entity.world_scope(|world| {
+        install_subscription::<E>(world);
+        let mut spawned = Vec::with_capacity(sources.len());
+        for source in sources {
+            let delivery = world
+                .spawn((
+                    SubscriptionOf(listener),
+                    Deliveries::default(),
+                    SubscribedTo::<E>::new(source),
+                ))
+                .observe(observer.clone())
+                .id();
+            spawned.push((delivery, source));
+        }
+        if let Some(replay) = replay {
+            // Deferred to the reactive runtime, so the scene, including
+            // sources and target components after this template, is
+            // complete when the current state is read.
+            crate::reactivity::defer_replay(world, move |world: &mut World| {
+                for (delivery, source) in spawned {
+                    if world.get_entity(delivery).is_ok()
+                        && let Some(event) = replay(world, source)
+                    {
+                        world.trigger(SubscriptionEvent {
+                            delivery,
+                            target: listener,
+                            source,
+                            event: Arc::new(event),
+                        });
+                    }
+                }
+            });
+        }
+    });
 }
 
 impl<E, S, I, M> Template for Subscribe<E, S, I, M>
@@ -299,20 +356,7 @@ where
         }
         let mut sources = Vec::new();
         self.source.resolve(context, &mut sources)?;
-        let listener = context.entity.id();
-        let observer = &self.observer;
-        context.entity.world_scope(|world| {
-            install_subscription::<E>(world);
-            for source in sources {
-                world
-                    .spawn((
-                        SubscriptionOf(listener),
-                        Deliveries::default(),
-                        SubscribedTo::<E>::new(source),
-                    ))
-                    .observe(observer.clone());
-            }
-        });
+        spawn_subscriptions(context, sources, &self.observer, self.replay);
         Ok(EmptySceneEffect)
     }
 
@@ -321,6 +365,7 @@ where
             source: self.source.clone_source(),
             observer: self.observer.clone(),
             check: self.check,
+            replay: self.replay,
             marker: PhantomData,
         }
     }
@@ -455,6 +500,16 @@ fn deliver<E: EntityEvent + Clone>(world: &mut World, event: SubscriptionEvent<E
 )]
 fn forward<E: EntityEvent + Clone>(event: On<E>, world: DeferredWorld) {
     route(world, event.event_target(), event.event());
+}
+
+/// The generic forwarder observer installed for `E`, if any.
+pub(crate) fn forwarder<E: 'static>(world: &World) -> Option<Entity> {
+    world
+        .get_resource::<SubscriptionRegistry>()?
+        .0
+        .get(&TypeId::of::<E>())
+        .copied()
+        .flatten()
 }
 
 /// Marks `E` as registered without the generic forwarder; the caller routes

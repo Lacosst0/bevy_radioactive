@@ -6,7 +6,7 @@ use bevy::{
 };
 use bevy_radioactive::{
     RadioactivePlugin, Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind, bind_or,
-    on_removed, watch,
+    on_removed, testing::settle, watch, watch_immediate,
 };
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +35,6 @@ fn test_app() -> App {
     app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
         .init_resource::<Log>();
     app
-}
-
-fn settle(app: &mut App) {
-    app.update();
-    app.world_mut().flush();
 }
 
 #[expect(
@@ -531,4 +526,105 @@ fn chained_reactions_settle_in_one_update() {
         .unwrap()
         .0;
     assert_eq!(label, 3);
+}
+
+#[test]
+fn bind_writes_the_current_value_on_spawn() {
+    let mut app = test_app();
+    app.insert_resource(Counter(7)).track::<Counter>();
+    settle(&mut app);
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children [
+                Listener
+                Label(0)
+                bind(Singleton, |counter: &Counter, label: &mut Label| label.0 = counter.0)
+                --
+                Echo(0)
+                bind(Singleton, |counter: &Counter, echo: &mut Echo| echo.0 = counter.0)
+                    .deferred()
+            ]
+        })
+        .unwrap();
+    // The resource was inserted long ago: only replay can deliver it.
+    settle(&mut app);
+    settle(&mut app);
+    let label = app
+        .world_mut()
+        .query_filtered::<&Label, With<Listener>>()
+        .single(app.world())
+        .unwrap()
+        .0;
+    assert_eq!(label, 7);
+    let echo = app
+        .world_mut()
+        .query::<&Echo>()
+        .single(app.world())
+        .unwrap()
+        .0;
+    assert_eq!(echo, 0, "a deferred bind waits for a change");
+}
+
+#[test]
+fn bind_or_replays_a_missing_source_and_watch_can_replay() {
+    let mut app = test_app();
+    app.add_plugins(RadioactivePlugin);
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children [
+                #A SourceA
+                --
+                #B SourceB Meter(5)
+                --
+                Listener
+                Label(0)
+                bind_or(#A, |meter: &Meter, label: &mut Label| label.0 = meter.0, |label: &mut Label| label.0 = 999)
+                watch_immediate(#B, |event: Reaction<Meter>, mut log: ResMut<Log>| {
+                    log.local.push((event.target(), event.source(), event.0));
+                })
+            ]
+        })
+        .unwrap();
+    settle(&mut app);
+    let label = app
+        .world_mut()
+        .query_filtered::<&Label, With<Listener>>()
+        .single(app.world())
+        .unwrap()
+        .0;
+    assert_eq!(label, 999);
+    // Once replayed, and once more by the first publisher run for `Meter`.
+    assert!(
+        app.world()
+            .resource::<Log>()
+            .local
+            .iter()
+            .all(|entry| entry.2 == 5)
+    );
+    assert_ne!(app.world().resource::<Log>().local.len(), 0);
+}
+
+#[test]
+fn values_without_listeners_are_not_published() {
+    let mut app = test_app();
+    app.add_plugins(RadioactivePlugin).track::<Meter>();
+    let source = app.world_mut().spawn(Meter(1)).id();
+    settle(&mut app);
+    app.world_mut().get_mut::<Meter>(source).unwrap().0 = 2;
+    settle(&mut app);
+    assert_eq!(
+        app.world()
+            .resource::<bevy_radioactive::ReactiveDiagnostics>()
+            .publications,
+        0
+    );
+
+    app.world_mut().entity_mut(source).observe(
+        |_: On<ValueChanged<Meter>>, mut log: ResMut<Log>| {
+            log.global.push((Entity::PLACEHOLDER, 0));
+        },
+    );
+    app.world_mut().get_mut::<Meter>(source).unwrap().0 = 3;
+    settle(&mut app);
+    assert_eq!(app.world().resource::<Log>().global.len(), 1);
 }

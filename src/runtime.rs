@@ -1,6 +1,10 @@
 //! Shared effect runtime used by `webby` and `coat`.
 
-use std::{any::TypeId, cell::RefCell};
+use std::{
+    any::TypeId,
+    cell::RefCell,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use bevy::{
     ecs::{
@@ -10,7 +14,7 @@ use bevy::{
         entity_disabling::Disabled,
         lifecycle::HookContext,
         template::{EntityTemplate, Template, TemplateContext},
-        world::DeferredWorld,
+        world::{CommandQueue, DeferredWorld},
     },
     prelude::*,
     scene::{
@@ -126,18 +130,105 @@ impl Dep {
     }
 }
 
-pub(crate) type RunFn = Box<dyn FnMut(&mut World, Entity) -> Vec<Dep> + Send + Sync>;
+/// Work queued by an effect to undo what it did, run with `Commands` before
+/// the effect runs again and when its entity is despawned.
+pub type Cleanup = Box<dyn FnOnce(&mut Commands) + Send + Sync>;
+
+/// Values an effect may return: `()` for no cleanup, or a closure taking
+/// `&mut Commands` that undoes the effect.
+///
+/// ```ignore
+/// effect(move |reads: &Reads, commands: &mut Commands| {
+///     let tooltip = commands.spawn(Tooltip).id();
+///     move |commands: &mut Commands| commands.entity(tooltip).despawn()
+/// })
+/// ```
+pub trait IntoCleanup {
+    /// Converts into an optional cleanup.
+    fn into_cleanup(self) -> Option<Cleanup>;
+}
+
+impl IntoCleanup for () {
+    fn into_cleanup(self) -> Option<Cleanup> {
+        None
+    }
+}
+
+impl<F: FnOnce(&mut Commands) + Send + Sync + 'static> IntoCleanup for F {
+    fn into_cleanup(self) -> Option<Cleanup> {
+        Some(Box::new(self))
+    }
+}
+
+impl IntoCleanup for Option<Cleanup> {
+    fn into_cleanup(self) -> Option<Cleanup> {
+        self
+    }
+}
+
+/// Result of one effect run: what it read, and how to undo it.
+pub(crate) struct Ran {
+    pub(crate) deps: Vec<Dep>,
+    pub(crate) cleanup: Option<Cleanup>,
+}
+
+impl From<Vec<Dep>> for Ran {
+    fn from(deps: Vec<Dep>) -> Self {
+        Self {
+            deps,
+            cleanup: None,
+        }
+    }
+}
+
+pub(crate) type RunFn = Box<dyn FnMut(&mut World, Entity) -> Ran + Send + Sync>;
 
 struct Slot {
     run: RunFn,
     deps: Vec<Dep>,
     last_run: Option<Tick>,
+    cleanup: Option<Cleanup>,
 }
 
-/// Effects owned by an entity. Inserted by `webby` helpers.
+/// Effects owned by an entity, inserted by `effect`, `computed`, `coat!`
+/// regions and `webby` components.
 #[derive(Component, Default)]
 #[component(on_add = register_host, on_remove = unregister_host)]
 pub struct Effects(Vec<Slot>);
+
+/// Runs `cleanups` with commands applied to `world` right away.
+fn run_cleanups(world: &mut World, cleanups: impl IntoIterator<Item = Cleanup>) -> usize {
+    let mut queue = CommandQueue::default();
+    let mut commands = Commands::new(&mut queue, world);
+    let mut ran = 0;
+    for cleanup in cleanups {
+        cleanup(&mut commands);
+        ran += 1;
+    }
+    queue.apply(world);
+    ran
+}
+
+/// Effect work deferred to the end of a pass: `webby` effects, which run
+/// after the components rendered in that pass, children first.
+#[derive(Resource, Default)]
+pub(crate) struct PostEffects(pub(crate) Vec<Box<dyn FnOnce(&mut World) + Send + Sync>>);
+
+/// Cleanups of unmounted `webby` components, waiting for world access.
+#[derive(Resource, Clone, Default)]
+pub(crate) struct Unmounted(pub(crate) Arc<Mutex<Vec<Cleanup>>>);
+
+fn run_unmounted(world: &mut World) -> usize {
+    let Some(unmounted) = world.get_resource::<Unmounted>() else {
+        return 0;
+    };
+    let cleanups = std::mem::take(&mut *unmounted.0.lock().unwrap_or_else(PoisonError::into_inner));
+    if cleanups.is_empty() {
+        0
+    } else {
+        run_cleanups(world, cleanups)
+    }
+}
 
 /// Every effect host, plus the hosts added since the current pass started.
 #[derive(Resource, Default)]
@@ -156,6 +247,21 @@ fn register_host(mut world: DeferredWorld, context: HookContext) {
 fn unregister_host(mut world: DeferredWorld, context: HookContext) {
     if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
         hosts.all.remove(&context.entity);
+    }
+    let cleanups: Vec<Cleanup> = world
+        .get_mut::<Effects>(context.entity)
+        .map(|mut effects| {
+            effects
+                .bypass_change_detection()
+                .0
+                .iter_mut()
+                .filter_map(|slot| slot.cleanup.take())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut commands = world.commands();
+    for cleanup in cleanups {
+        cleanup(&mut commands);
     }
 }
 
@@ -184,7 +290,7 @@ pub(crate) fn run_effects(world: &mut World) -> usize {
         hosts.all.iter().copied().collect()
     };
     queue.sort_by_cached_key(|&host| depth(world, host));
-    let mut ran = 0;
+    let mut ran = run_unmounted(world);
     let mut next = 0;
     while next < queue.len() {
         let host = queue[next];
@@ -192,6 +298,15 @@ pub(crate) fn run_effects(world: &mut World) -> usize {
         ran += run_host(world, host);
         let fresh = std::mem::take(&mut world.resource_mut::<EffectHosts>().fresh);
         queue.extend(fresh);
+    }
+    ran += run_unmounted(world);
+    let post = world
+        .get_resource_mut::<PostEffects>()
+        .map(|mut post| std::mem::take(&mut post.0))
+        .unwrap_or_default();
+    for effect in post.into_iter().rev() {
+        effect(world);
+        ran += 1;
     }
     ran
 }
@@ -221,9 +336,14 @@ fn run_host(world: &mut World, host: Entity) -> usize {
         // Writes made by this effect get a tick no newer than its own
         // `last_run`, so an effect never re-triggers itself, while later
         // effects still see those writes as changes.
+        if let Some(cleanup) = slot.cleanup.take() {
+            run_cleanups(world, [cleanup]);
+        }
         world.increment_change_tick();
         let tick = world.read_change_tick();
-        slot.deps = (slot.run)(world, host);
+        let result = (slot.run)(world, host);
+        slot.deps = result.deps;
+        slot.cleanup = result.cleanup;
         slot.last_run = Some(tick);
         ran += 1;
         if world.get_entity(host).is_err() {
@@ -236,12 +356,17 @@ fn run_host(world: &mut World, host: Entity) -> usize {
         let effects = effects.bypass_change_detection();
         slots.append(&mut effects.0);
         effects.0 = slots;
+    } else {
+        // The host was despawned by one of its own effects.
+        run_cleanups(world, slots.into_iter().filter_map(|slot| slot.cleanup));
     }
     ran
 }
 
 pub(crate) fn init(world: &mut World) {
     world.init_resource::<EffectHosts>();
+    world.init_resource::<PostEffects>();
+    world.init_resource::<Unmounted>();
 }
 
 /// Entity dependencies resolved when a `webby` scene spawns.
@@ -402,6 +527,17 @@ pub(crate) fn tracked<R>(
     (value, deps)
 }
 
+/// Removes the dependency on `C` of `target`, so an effect that writes `C`
+/// does not depend on its own output.
+pub(crate) fn forget<C: Component>(world: &World, deps: &mut Vec<Dep>, target: Entity) {
+    let id = world.component_id::<C>();
+    deps.retain(|dep| match dep.key {
+        DepKey::Component(entity, other) => entity != target || Some(other) != id,
+        DepKey::Unregistered(type_id) => type_id != TypeId::of::<C>(),
+        _ => true,
+    });
+}
+
 pub(crate) fn spawn_child<S: Scene>(world: &mut World, parent: Entity, scene: S) -> Option<Entity> {
     match world.spawn_scene(scene) {
         Ok(mut child) => Some(child.insert(ChildOf(parent)).id()),
@@ -447,6 +583,7 @@ pub(crate) fn attach(context: &mut TemplateContext, run: RunFn) {
         run,
         deps: Vec::new(),
         last_run: None,
+        cleanup: None,
     };
     if let Some(mut effects) = context.entity.get_mut::<Effects>() {
         effects.0.push(slot);

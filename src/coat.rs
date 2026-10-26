@@ -21,9 +21,9 @@
 //!             on(move |_: On<Pointer<Click>>| open.set(!$open))
 //!             Children [ Text("Toggle") ]
 //!             --
-//!             // re-renders only when the branch changes
+//!             // rebuilt only when the branch changes; the text is patched
 //!             if $open {
-//!                 Text($(format!("{} todos", $todos.len())))
+//!                 Text($(format!("{} todos", $&todos.len())))
 //!             } else {
 //!                 Text("hidden")
 //!             }
@@ -60,11 +60,16 @@
 //! evaluated once, unless its condition, iterator or scrutinee reads a
 //! signal with `$`. Then it becomes a *region*: a [`Region`] entity (a
 //! `GhostNode` with the `ui` feature, so it does not affect layout) whose
-//! children are rebuilt when that value changes. `for` regions keep the
-//! entities of rows whose key and value are unchanged.
+//! children are rebuilt when that value changes. An `if` region rebuilds
+//! when the chosen branch changes. A `match` region rebuilds when the
+//! matched arm changes, or a value its pattern bound and the arm uses;
+//! otherwise the arm's patched components update in place. `for` regions
+//! keep the entities of rows whose key and value are unchanged.
 //!
-//! `$name` reads signal `name` (it becomes `name.get()`), and `$(expr)`
-//! groups an expression. A component written with `$` in its fields, such
+//! `$name` reads signal `name` (it becomes `name.get()`, a clone of the
+//! value), `$&name.method(..)` borrows it instead (it becomes
+//! `name.with(|name| name.method(..))`), and `$(expr)` groups an
+//! expression. A component written with `$` in its fields, such
 //! as `Text($(format!("{}", $count)))` or `Node { width: px($width) }`, is
 //! initialised from the current values and patched in place whenever those
 //! signals change. Elsewhere `$` is an ordinary read. Every closure the
@@ -85,13 +90,16 @@
 //! A [`Signal`] is a cheaply cloneable shared cell that lives outside the
 //! ECS. Reading it inside a region, a patched component, [`effect`],
 //! [`shard`] arguments, a [`memo`], or a `webby` component subscribes that
-//! code to later `set` calls. Signals are `Send + Sync`, so they can also be
+//! code to later `set` calls. Reading or writing a signal from inside its
+//! own `update`/`with` closure, or a memo from inside its own computation,
+//! panics instead of deadlocking. Signals are `Send + Sync`, so they can also be
 //! stored in components or resources and set from systems. Everything runs
 //! in [`ReactiveSet::Publish`], before UI layout.
 //!
 //! [`ReactiveSet::Publish`]: crate::reactivity::ReactiveSet::Publish
 
 use std::{
+    any::Any,
     cell::RefCell,
     fmt,
     hash::Hash,
@@ -111,7 +119,8 @@ use bevy::{
 
 pub use crate::macros::{coat, coat_list};
 
-use crate::runtime::{RunFn, effect_template, signal_deps, spawn_child, tracked};
+pub use crate::runtime::{Cleanup, IntoCleanup, Reads};
+use crate::runtime::{Ran, RunFn, effect_template, signal_deps, spawn_child, tracked};
 
 // ---------------------------------------------------------------------------
 // Dependency tracking
@@ -534,22 +543,35 @@ pub use crate::cloned;
 // Scene helpers
 // ---------------------------------------------------------------------------
 
-/// Runs `f` now and again whenever a signal it read changes. Side effects go
+/// Runs `f` now and again whenever something it read changes: a signal or
+/// memo, or ECS data read through the [`Reads`] argument. Side effects go
 /// through `Commands`, applied right after the run.
-pub fn effect<F>(f: F) -> impl Template<Output = EmptySceneEffect>
+///
+/// `f` may return a cleanup closure, which runs before the next run and when
+/// the entity is despawned:
+///
+/// ```ignore
+/// effect(move |reads: &Reads, commands: &mut Commands| {
+///     let hp = reads.get::<Health>(player).map_or(0, |hp| hp.0);
+///     let tooltip = commands.spawn(Text(format!("HP {hp}"))).id();
+///     move |commands: &mut Commands| commands.entity(tooltip).despawn()
+/// })
+/// ```
+pub fn effect<F, C>(f: F) -> impl Template<Output = EmptySceneEffect>
 where
-    F: Fn(&mut Commands) + Clone + Send + Sync + 'static,
+    F: Fn(&Reads, &mut Commands) -> C + Clone + Send + Sync + 'static,
+    C: IntoCleanup,
 {
     effect_template((), move |()| -> RunFn {
         let f = f.clone();
         Box::new(move |world: &mut World, target| {
             let mut queue = CommandQueue::default();
-            let ((), deps) = tracked(world, target, |_| {
+            let (cleanup, deps) = tracked(world, target, |reads| {
                 let mut commands = Commands::new(&mut queue, world);
-                f(&mut commands);
+                f(reads, &mut commands).into_cleanup()
             });
             queue.apply(world);
-            deps
+            Ran { deps, cleanup }
         })
     })
 }
@@ -581,7 +603,7 @@ where
                 let child = spawn_child(world, target, scene);
                 current = Some((next, child));
             }
-            deps
+            deps.into()
         })
     })
 }
@@ -644,7 +666,7 @@ where
                     component.set_changed();
                 }
             });
-            signal_deps(signals)
+            signal_deps(signals).into()
         })
     })
 }
@@ -682,7 +704,7 @@ where
                     .unwrap_or_default();
                 current = Some((next, children));
             }
-            deps
+            deps.into()
         })
     })
 }
@@ -740,7 +762,7 @@ where
                 entity.replace_children(&next_order);
             }
             order = next_order;
-            deps
+            deps.into()
         })
     })
 }
@@ -759,11 +781,49 @@ where
     )
 }
 
+/// Region key of a reactive `match`: the matched arm, and the values its
+/// pattern bound that the arm uses.
+#[doc(hidden)]
+pub struct ArmKey {
+    arm: usize,
+    values: Box<dyn DynEq>,
+}
+
+trait DynEq: Any + Send + Sync {
+    fn eq_dyn(&self, other: &dyn Any) -> bool;
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: PartialEq + Send + Sync + 'static> DynEq for T {
+    fn eq_dyn(&self, other: &dyn Any) -> bool {
+        other.downcast_ref::<T>() == Some(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl PartialEq for ArmKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.arm == other.arm && self.values.eq_dyn(other.values.as_any())
+    }
+}
+
+#[doc(hidden)]
+pub fn arm_key<T: PartialEq + Send + Sync + 'static>(arm: usize, values: T) -> ArmKey {
+    ArmKey {
+        arm,
+        values: Box::new(values),
+    }
+}
+
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        Region as __CoatRegion, assign as __coat_assign, for_indexed as __coat_for_indexed,
-        for_keyed as __coat_for, patch as __coat_patch, region as __coat_region,
+        ArmKey as __CoatArmKey, Region as __CoatRegion, arm_key as __coat_arm_key,
+        assign as __coat_assign, for_indexed as __coat_for_indexed, for_keyed as __coat_for,
+        patch as __coat_patch, region as __coat_region,
     };
     pub use bevy::scene::{bsn, bsn_list};
 }

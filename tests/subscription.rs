@@ -1,8 +1,9 @@
 //! Integration coverage for source-preserving event subscriptions.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin, ui_widgets::ValueChange};
-use bevy_radioactive::subscription::{
-    SubscribedTo, Subscription, SubscriptionAppExt, subscribe_to,
+use bevy_radioactive::{
+    subscription::{SubscribedTo, Subscription, SubscriptionAppExt, subscribe_to},
+    testing::settle,
 };
 
 #[derive(Component, Clone, Copy, Default)]
@@ -25,12 +26,6 @@ struct Ping {
     #[event_target]
     source: Entity,
     value: i32,
-}
-
-fn settle(app: &mut App) {
-    app.world_mut().flush();
-    app.update();
-    app.world_mut().flush();
 }
 
 fn single_entity<T: Component>(world: &mut World) -> Entity {

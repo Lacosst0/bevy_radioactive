@@ -165,7 +165,7 @@ fn signals(tokens: &[TokenTree], out: &mut Vec<Ident>) {
                 out.push(name.clone());
             }
             TokenTree::Punct(p) if p.as_char() == '$' => {
-                if let Some(TokenTree::Ident(name)) = tokens.get(i + 1)
+                if let Some(name) = dollar_name(tokens, i)
                     && !out.contains(name)
                 {
                     out.push(name.clone());
@@ -192,13 +192,59 @@ fn bindings(pattern: &[TokenTree]) -> Vec<Ident> {
     out
 }
 
-/// Rewrites `$name` to `name.get()` and `$(expr)` to `(expr)`, deeply.
+/// The signal named by the `$` at `index`: `$name` or `$&name`.
+fn dollar_name(tokens: &[TokenTree], index: usize) -> Option<&Ident> {
+    let next = if is_punct(tokens.get(index + 1), '&') {
+        index + 2
+    } else {
+        index + 1
+    };
+    match tokens.get(next) {
+        Some(TokenTree::Ident(name)) => Some(name),
+        _ => None,
+    }
+}
+
+/// End of the method-call and index chain starting at `from`, such as
+/// `.len()` or `.items[0].name`.
+fn postfix_end(tokens: &[TokenTree], from: usize) -> usize {
+    let mut i = from;
+    loop {
+        if is_punct(tokens.get(i), '.') && matches!(tokens.get(i + 1), Some(TokenTree::Ident(_))) {
+            i += 2;
+            if matches!(tokens.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+            {
+                i += 1;
+            }
+        } else if matches!(tokens.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+        {
+            i += 1;
+        } else {
+            return i;
+        }
+    }
+}
+
+/// Rewrites `$name` to `name.get()`, `$&name.chain` to
+/// `name.with(|name| name.chain)`, and `$(expr)` to `(expr)`, deeply.
 fn reads(tokens: &[TokenTree]) -> TokenStream {
     let mut out = TokenStream::new();
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
             TokenTree::Punct(p) if p.as_char() == '$' => match tokens.get(i + 1) {
+                Some(TokenTree::Punct(amp)) if amp.as_char() == '&' => {
+                    let Some(TokenTree::Ident(name)) = tokens.get(i + 2) else {
+                        error(p.span(), "expected `$&name`").to_tokens(&mut out);
+                        i += 2;
+                        continue;
+                    };
+                    let end = postfix_end(tokens, i + 3);
+                    let chain = reads(&tokens[i + 3..end]);
+                    quote!(#name.with(|#name| #name #chain)).to_tokens(&mut out);
+                    i = end;
+                    continue;
+                }
                 Some(TokenTree::Ident(name)) => {
                     quote!(#name.get()).to_tokens(&mut out);
                     i += 2;
@@ -209,7 +255,7 @@ fn reads(tokens: &[TokenTree]) -> TokenStream {
                     i += 2;
                     continue;
                 }
-                _ => error(p.span(), "expected `$name` or `$(expr)`").to_tokens(&mut out),
+                _ => error(p.span(), "expected `$name`, `$&name` or `$(expr)`").to_tokens(&mut out),
             },
             TokenTree::Group(g) => {
                 let mut group = Group::new(g.delimiter(), reads(&tokens_of(g)));
@@ -710,14 +756,31 @@ fn match_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
         return quote!({ match #scrutinee { #(#arms)* } });
     }
 
-    let scrutinee_site = scope.site(&scrutinee, &[]);
-    let scrutinee = reads(&scrutinee);
+    // The region is keyed by the matched arm plus the bound values the arm
+    // uses, so a change elsewhere in the scrutinee does not rebuild the arm.
+    let key_site = scope.site(&scrutinee, &[]);
+    let scrutinee_reads = reads(&scrutinee);
     let bound: Vec<Ident> = arms
         .iter()
-        .flat_map(|(pattern, _)| bindings(pattern))
+        .flat_map(|(pattern, _)| pattern_bindings(pattern))
         .collect();
     let body_tokens: Tokens = arms.iter().flat_map(|(_, body)| body.stream()).collect();
+    // Signals the arms capture are already in scope for the scrutinee.
+    let mut shared = Vec::new();
+    signals(&body_tokens, &mut shared);
+    shared.retain(|name| !bound.contains(name));
+    let render_site = scope.site(&scrutinee, &shared);
     let body_site = scope.site(&body_tokens, &bound);
+    let keys = arms.iter().enumerate().map(|(index, (pattern, body))| {
+        let body = tokens_of(body);
+        let used: Vec<Ident> = pattern_bindings(pattern)
+            .into_iter()
+            .filter(|name| mentions(&body, name))
+            .collect();
+        let pattern = stream(pattern);
+        let index = Literal::usize_unsuffixed(index);
+        quote!(#pattern => __coat_arm_key(#index, (#(#used,)*)),)
+    });
     let arms = arms.iter().map(|(pattern, body)| {
         let pattern = stream(pattern);
         let body = rendered_list(body);
@@ -726,13 +789,67 @@ fn match_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
     quote! {
         __CoatRegion
         __coat_region(
-            { #scrutinee_site move || #scrutinee },
-            { #body_site move |__value: &_| {
+            { #key_site move || {
                 #[allow(unused_variables, clippy::match_single_binding)]
-                match ::core::clone::Clone::clone(__value) { #(#arms)* }
+                match #scrutinee_reads { #(#keys)* }
+            } },
+            { #render_site #body_site move |_: &__CoatArmKey| {
+                #[allow(unused_variables, clippy::match_single_binding)]
+                match #scrutinee_reads { #(#arms)* }
             } }
         )
     }
+}
+
+/// Identifiers bound by a `match` pattern: lowercase names that are not path
+/// segments, field names, keywords or part of a guard.
+fn pattern_bindings(pattern: &[TokenTree]) -> Vec<Ident> {
+    let guard = pattern
+        .iter()
+        .position(|token| is_ident(Some(token), "if"))
+        .unwrap_or(pattern.len());
+    let pattern = &pattern[..guard];
+    let mut out: Vec<Ident> = Vec::new();
+    for (i, token) in pattern.iter().enumerate() {
+        match token {
+            TokenTree::Ident(ident) => {
+                let name = ident.to_string();
+                let path_segment = (is_punct(pattern.get(i + 1), ':')
+                    && is_punct(pattern.get(i + 2), ':'))
+                    || (i >= 2
+                        && is_punct(pattern.get(i - 1), ':')
+                        && is_punct(pattern.get(i - 2), ':'));
+                let field_name = is_punct(pattern.get(i + 1), ':') && !path_segment;
+                let keyword = matches!(name.as_str(), "ref" | "mut" | "box" | "true" | "false");
+                if name.starts_with(char::is_lowercase)
+                    && !path_segment
+                    && !field_name
+                    && !keyword
+                    && !out.contains(ident)
+                {
+                    out.push(ident.clone());
+                }
+            }
+            TokenTree::Group(g) => {
+                for ident in pattern_bindings(&tokens_of(g)) {
+                    if !out.contains(&ident) {
+                        out.push(ident);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `tokens` mention the identifier `name`, deeply.
+fn mentions(tokens: &[TokenTree], name: &Ident) -> bool {
+    tokens.iter().any(|token| match token {
+        TokenTree::Ident(ident) => ident == name,
+        TokenTree::Group(g) => mentions(&tokens_of(g), name),
+        _ => false,
+    })
 }
 
 /// Invokes `bsn!`/`bsn_list!` through `macro_rules!` wrappers, so the call
@@ -894,7 +1011,7 @@ fn remember_signals(tokens: &[TokenTree]) {
         for (i, token) in tokens.iter().enumerate() {
             match token {
                 TokenTree::Punct(p) if p.as_char() == '$' => {
-                    if let Some(TokenTree::Ident(name)) = tokens.get(i + 1) {
+                    if let Some(name) = dollar_name(tokens, i) {
                         out.push(name.to_string());
                     }
                 }

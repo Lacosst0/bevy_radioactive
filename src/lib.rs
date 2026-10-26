@@ -5,6 +5,7 @@
 extern crate self as bevy_radioactive;
 
 pub mod coat;
+pub mod computed;
 /// Convenient imports for common reactive BSN use cases.
 pub mod prelude;
 /// Component and resource change publication plus BSN state watching.
@@ -16,13 +17,16 @@ pub mod macros {
 }
 /// Source-preserving entity-event subscriptions backed by relationships.
 pub mod subscription;
+pub mod testing;
 pub mod webby;
 
+pub use computed::{computed, computed_opt};
 pub use reactivity::{
-    RadioactivePlugin, Reaction, ReactiveAppExt, ReactiveDiagnostics, ReactivePublish, ReactiveSet,
-    ReactiveSettings, Removal, Singleton, ValueChanged, ValueRemoved, Watch, WatchRemoval, bind,
-    bind_or, on_removed, watch,
+    Bind, BindFallback, OrElse, RadioactivePlugin, Reaction, ReactiveAppExt, ReactiveDiagnostics,
+    ReactivePublish, ReactiveSet, ReactiveSettings, Removal, Singleton, ValueChanged, ValueRemoved,
+    Watch, WatchRemoval, bind, bind_deferred, bind_or, on_removed, watch, watch_immediate,
 };
+pub use runtime::{Cleanup, Effects, IntoCleanup, Reads};
 pub use subscription::{
     Source, Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt,
     SubscriptionEvent, SubscriptionOf, Subscriptions, subscribe_to,

@@ -287,3 +287,85 @@ fn use_reducer_applies_actions_to_latest_state() {
     app.update();
     assert_eq!(texts(&mut app), vec![(4, "5".into())]);
 }
+
+#[derive(Resource, Default)]
+struct Events(Vec<String>);
+
+#[component]
+fn tracked_child(cx: &Cx, id: u32) -> impl Scene {
+    cx.use_effect(id, move |id, commands| {
+        let id = *id;
+        commands.queue(move |world: &mut World| {
+            world
+                .resource_mut::<Events>()
+                .0
+                .push(format!("child {id} effect"));
+        });
+        move |commands: &mut Commands| {
+            commands.queue(move |world: &mut World| {
+                world
+                    .resource_mut::<Events>()
+                    .0
+                    .push(format!("child {id} cleanup"));
+            });
+        }
+    });
+    cx.on_unmount(move |commands| {
+        commands.queue(move |world: &mut World| {
+            world
+                .resource_mut::<Events>()
+                .0
+                .push(format!("child {id} unmount"));
+        });
+    });
+    bsn! { Label({id}) }
+}
+
+#[component]
+fn effect_parent(cx: &Cx) -> impl Scene {
+    let ids = cx.use_resource::<Order>().unwrap_or_default().0;
+    let rows = ids
+        .into_iter()
+        .map(|id| tracked_child(id).key(id))
+        .collect::<Vec<_>>();
+    cx.use_effect((), |(), commands| {
+        commands.queue(|world: &mut World| {
+            // Children rendered before this effect ran.
+            let labels = world.query::<&Label>().iter(world).count();
+            world
+                .resource_mut::<Events>()
+                .0
+                .push(format!("parent effect sees {labels}"));
+        });
+    });
+    bsn! { Node Children [ {rows} ] }
+}
+
+#[test]
+fn effects_run_after_children_and_clean_up_on_unmount() {
+    let mut app = app();
+    app.init_resource::<Events>();
+    app.world_mut().resource_mut::<Order>().0 = vec![1, 2];
+    let root = app
+        .world_mut()
+        .spawn_scene(bsn! { @effect_parent() })
+        .unwrap()
+        .id();
+    app.update();
+    let events = std::mem::take(&mut app.world_mut().resource_mut::<Events>().0);
+    assert_eq!(events.last().unwrap(), "parent effect sees 2");
+    assert!(events.contains(&"child 1 effect".to_string()));
+
+    // Child 1 is no longer rendered: it unmounts and cleans up its effect.
+    app.world_mut().resource_mut::<Order>().0 = vec![2];
+    app.update();
+    let mut events = std::mem::take(&mut app.world_mut().resource_mut::<Events>().0);
+    events.sort();
+    assert_eq!(events, vec!["child 1 cleanup", "child 1 unmount"]);
+
+    app.world_mut().despawn(root);
+    app.update();
+    let mut events = std::mem::take(&mut app.world_mut().resource_mut::<Events>().0);
+    events.sort();
+    assert_eq!(events, vec!["child 2 cleanup", "child 2 unmount"]);
+}

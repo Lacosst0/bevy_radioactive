@@ -101,10 +101,43 @@ same or different sources and types. Use `source()` on the event to tell sources
 | Helper | Runs when | Handler |
 | --- | --- | --- |
 | `watch(source, handler)` | `T` is inserted or mutated on a source | observer with `Reaction<T>` input |
-| `bind(source, \|&T, &mut C\|)` | same | writes component `C` on this entity |
-| `bind_or(source, write, \|&mut C\|)` | same, plus removal/despawn | writes `C` for both cases |
+| `watch_immediate(source, handler)` | same, plus once on spawn with the current value | same |
+| `bind(source, \|&T, &mut C\|)` | on spawn with the current value, then like `watch` | writes component `C` on this entity |
+| `bind_deferred(source, write)` | like `watch` (no initial write) | same |
+| `bind_or(source, write, \|&mut C\|)` | like `bind`, plus removal/despawn | writes `C` for both cases |
 | `on_removed(source, handler)` | `T` is removed or the source despawns | observer with `Removal<T>` input |
 | `subscribe_to(source, handler)` | source receives entity event `E` | observer with `Subscription<E>` input |
+| `computed(\|r: &Reads\| C)` | anything it read changed | keeps component `C` on this entity equal to the result |
+| `computed_opt(\|r: &Reads\| Option<C>)` | same | inserts `C`, or removes it on `None` |
+
+`bind` writes the source's current value when the scene spawns (it is delivered at the
+start of the next reactive pass, so a component in the same scene already exists).
+`bind_or` calls the fallback instead when the source lacks `T`.
+
+`computed` is a derived component: it reads through `Reads` (`r.resource::<R>()`,
+`r.get::<C>(entity)`, `r.this::<C>()`), re-runs when any
+of those change, and writes with `set_if_neq` so equal results don't republish.
+
+```rust
+use bevy::prelude::*;
+use bevy_radioactive::prelude::*;
+
+#[derive(Resource, Clone, Copy, Default)]
+struct Score(u32);
+
+#[derive(Component, Clone, Copy, Default, PartialEq)]
+struct Medal(u8);
+
+fn medal() -> impl Scene {
+    bsn! {
+        computed(|r: &Reads| Medal(match r.resource::<Score>().map_or(0, |s| s.0) {
+            0..10 => 0,
+            10..100 => 1,
+            _ => 2,
+        }))
+    }
+}
+```
 
 ```rust
 use bevy::prelude::*;
@@ -146,6 +179,12 @@ or observe `On<ValueRemoved<T>>`.
 Mark a function with `#[component]` and use it in `bsn!` like a scene function:
 `@counter(5)`. `cx` is supplied by the runtime; the other arguments are props. The
 component re-renders when anything it read changes, and returns plain BSN.
+
+`cx.use_effect(deps, |deps, commands| ..)` runs after the render's scene has been
+spawned (children's effects before their parent's), and again when `deps` change. It
+may return a cleanup, `move |commands: &mut Commands| ..`, which runs before the next
+run and when the component unmounts. `cx.on_unmount(|commands| ..)` registers a
+cleanup without an effect.
 
 ```rust,ignore
 use bevy_radioactive::webby::*;
@@ -197,6 +236,7 @@ fn app(cx: &Cx) -> impl Scene {
 | inline component | `component(\|cx\| bsn! { .. })` |
 | `useState` | `let (count, set_count) = cx.use_state(|| 0); set_count(count + 1)` |
 | `useReducer` | `let (state, dispatch) = cx.use_reducer(init, reducer); dispatch(action)` |
+| effect cleanup / unmount | return `move \|commands: &mut Commands\| ..` from `use_effect`, or `cx.on_unmount(..)` |
 | signals | `cx.use_signal(init) -> Signal` |
 | `useMemo` / `useEffect` / `useRef` | `cx.use_memo` / `cx.use_effect` / `cx.use_ref` |
 | `createContext` / `useContext` | `cx.provide_context(value)` / `cx.use_context::<T>()` |
@@ -210,9 +250,12 @@ key. Props other than `Entity` must be `Clone + Send + Sync + 'static`.
 ## `coat!`: reactive templates
 
 `coat!` is `bsn!` with a small Rust subset in scene lists, modelled on
-[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. `$name` reads a `Signal`;
-control flow that reads one becomes a region that rebuilds only itself, and a
-component with `$` in its fields is patched in place.
+[Topcoat](https://github.com/tokio-rs/topcoat)'s `view!`. `$name` reads a `Signal`
+(a clone of its value); `$&name.method()` calls methods on the value in place without
+cloning it. Control flow that reads a signal becomes a region that rebuilds only
+itself, and a component with `$` in its fields is patched in place. Signals used with
+`$` are cloned into the closures that need them, so no manual `let x = x.clone();` is
+needed.
 
 ```rust,ignore
 use bevy_radioactive::coat::*;
@@ -226,7 +269,7 @@ coat! {
         Button
         on(move |_: On<Pointer<Click>>| open.set(!$open))
         --
-        Text($(format!("{} todos", $todos.len())))   // patched when `todos` changes
+        Text($(format!("{} todos", $&todos.len())))  // patched when `todos` changes
         --
         if $open {
             #[key(todo.id)]
@@ -248,13 +291,20 @@ coat! {
 | `if c { .. } else if c { .. } else { .. }` | conditional entities |
 | `#[key(expr)] for pat in iter { .. }` | entities per item; unchanged rows keep their entities |
 | `for pat in iter { .. }` | entities per item, identified by position |
-| `match value { pat => .., }` | entities for the matching arm |
+| `match value { pat => .., }` | entities for the matching arm; rebuilt when the arm, or a binding it uses, changes |
 | `let pat = expr;` | binding for the following items |
 
-Without `$`, control flow is evaluated once. Regions are `GhostNode`s with the `ui`
-feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
-`update`, `increment`, ...) also work inside `webby` components and `coat::effect`;
-`coat::shard(args, |args, world| scene)` re-renders a subtree when its arguments change.
+Without `$`, control flow is evaluated once. An `if` region rebuilds only when the
+chosen branch changes; a `match` region rebuilds when the matched arm or a value its
+pattern bound (and the arm uses) changes, and otherwise patches the arm in place.
+Regions are `GhostNode`s with the `ui` feature, so they don't affect layout. Signals
+(`signal`, `memo`, `get`, `set`, `update`, `increment`, ...) also work inside `webby`
+components. `coat::shard(args, |args, world| scene)` re-renders a subtree when its
+arguments change.
+
+`coat::effect(|r: &Reads, commands| ..)` runs once when spawned and again when a
+signal or ECS value it read changes. It may return a cleanup closure, which runs before
+the next run and when its entity despawns.
 
 ## Change and delivery semantics
 
@@ -271,9 +321,12 @@ feature, so they don't affect layout. Signals (`signal`, `memo`, `get`, `set`,
   `ReactiveDiagnostics::exhausted_frames`.
 - When a type is first tracked by a scene, its publisher's first run reports the current
   values once, so the first watcher of a resource also receives its current value.
-- `watch` and `bind` do not replay the current value when a listener attaches. Values
-  inserted by the same scene are published as changes, so same-scene sources render
-  on spawn; for an existing resource, initialize the node from it or use `webby`/`coat!`.
+- `bind`, `bind_or` and `watch_immediate` replay the source's current value when the
+  listener spawns; `watch` and `bind_deferred` only see later changes.
+- A changed value is published only when something listens to it: a subscription, an
+  entity observer on the source, or a global observer.
+- Systems that read reaction output can run `.after(ReactiveSet::Settled)`. In tests,
+  `bevy_radioactive::testing::settle(&mut app)` flushes commands and runs one frame.
 - Removal is routed while the source still exists, so despawning a source reaches its
   listeners, but the handler runs at the next command flush, after the despawn has
   finished. Don't expect to read the source's components from a removal handler.

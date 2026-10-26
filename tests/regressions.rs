@@ -13,7 +13,7 @@ use bevy::{asset::AssetPlugin, ecs::observer::Observer, prelude::*, scene::Scene
 use bevy_radioactive::{
     RadioactivePlugin, Reaction, ReactiveAppExt, ReactiveDiagnostics, SubscriptionOf, ValueChanged,
     ValueRemoved,
-    coat::{Signal, coat, memo, signal},
+    coat::{Reads, Signal, coat, memo, signal},
     subscription::{Subscription, subscribe_to},
     watch,
     webby::{Cx, component},
@@ -322,7 +322,7 @@ fn max_passes_exhaustion_is_reported() {
         let value = value.clone();
         bsn! {
             Label(0)
-            bevy_radioactive::coat::effect(move |_: &mut Commands| {
+            bevy_radioactive::coat::effect(move |_: &Reads, _: &mut Commands| {
                 let current = value.get();
                 if current < 1000 {
                     value.set(current + 1);

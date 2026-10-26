@@ -27,23 +27,20 @@ fn main() {
             title: "Write docs",
         }]
     });
-    let scene = {
-        let todos = todos.clone();
-        coat! {
-            Node
-            Children [
-                Text($(format!("{} todos", $todos.len())))
-                --
-                if $todos.is_empty() {
-                    Text("Nothing to do")
-                }
-                --
-                #[key(todo.id)]
-                for todo in $todos {
-                    Text({todo.title})
-                }
-            ]
-        }
+    let scene = coat! {
+        Node
+        Children [
+            Text($(format!("{} todos", $&todos.len())))
+            --
+            if $&todos.is_empty() {
+                Text("Nothing to do")
+            }
+            --
+            #[key(todo.id)]
+            for todo in $todos {
+                Text({todo.title})
+            }
+        ]
     };
     app.world_mut().spawn_scene(scene).unwrap();
 

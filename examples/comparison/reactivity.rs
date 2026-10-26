@@ -1,7 +1,8 @@
 //! Counter using `reactivity`: tracked state plus `bind`.
 //!
 //! The count is a resource. Buttons mutate it; the label binds to it. `bind`
-//! tracks `Count` automatically, so no `app.track::<Count>()` is needed.
+//! tracks `Count` automatically, so no `app.track::<Count>()` is needed, and
+//! writes the current count on spawn, so the label needs no initial text.
 
 use bevy::{
     feathers::{
@@ -54,7 +55,7 @@ fn counter() -> impl Scene {
                 on(|_: On<Activate>, mut count: ResMut<Count>| count.0 -= 1)
                 Children [ @caption("-1") ]
                 --
-                Text("0")
+                Text::default()
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
                 bind(Singleton, |count: &Count, text: &mut Text| **text = count.0.to_string())
@@ -67,12 +68,7 @@ fn counter() -> impl Scene {
             ]
             --
             @FeathersButton
-            Node {
-                display: Display::None,
-                height: Val::Auto,
-                min_width: vmin(18),
-                padding: UiRect::axes(vmin(3), vmin(1.5)),
-            }
+            Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
             InheritableFont { font_size: FontSize::VMin(6.0) }
             on(|_: On<Activate>, mut count: ResMut<Count>| count.0 = 0)
             bind(Singleton, |count: &Count, node: &mut Node| {

@@ -34,37 +34,34 @@ fn main() {
         memo(move || format!("Tab: {:?}", tab.get()))
     };
 
-    let scene = {
-        let (tab, volume, title) = (tab.clone(), volume.clone(), title.clone());
-        coat! {
-            Node
-            Children [
-                // Patched in place whenever the memo changes.
-                Text($(title.get()))
-                --
-                match $tab {
-                    Tab::Profile => {
-                        Text("Profile")
-                        --
-                        // Like a Topcoat `#[shard]`: renders from the world, and again
-                        // whenever its arguments (none here) change.
-                        Node
-                        shard(move || (), |(), world: &World| {
-                            let total: u32 = world
-                                .try_query::<&Score>()
-                                .map(|mut q| q.iter(world).map(|s| s.0).sum())
-                                .unwrap_or_default();
-                            bsn! { Text({format!("Total score: {total}")}) }
-                        })
-                    },
-                    Tab::Settings => {
-                        Text($(format!("Volume: {}%", $volume)))
-                        --
-                        if $volume > 80 { Text("Careful, that's loud") }
-                    },
-                }
-            ]
-        }
+    let scene = coat! {
+        Node
+        Children [
+            // Patched in place whenever the memo changes.
+            Text($(title.get()))
+            --
+            match $tab {
+                Tab::Profile => {
+                    Text("Profile")
+                    --
+                    // Like a Topcoat `#[shard]`: renders from the world, and again
+                    // whenever its arguments (none here) change.
+                    Node
+                    shard(move || (), |(), world: &World| {
+                        let total: u32 = world
+                            .try_query::<&Score>()
+                            .map(|mut q| q.iter(world).map(|s| s.0).sum())
+                            .unwrap_or_default();
+                        bsn! { Text({format!("Total score: {total}")}) }
+                    })
+                },
+                Tab::Settings => {
+                    Text($(format!("Volume: {}%", $volume)))
+                    --
+                    if $volume > 80 { Text("Careful, that's loud") }
+                },
+            }
+        ]
     };
     app.world_mut().spawn_scene(scene).unwrap();
 

@@ -20,12 +20,12 @@ use bevy::{
     },
     platform::collections::HashSet,
     prelude::*,
-    scene::EmptySceneEffect,
+    scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
 
 use crate::subscription::{
-    Source, Subscribe, Subscription, SubscriptionEvent, install_subscription, register_routed,
-    route,
+    Replay, Source, Subscribe, Subscribers, Subscription, SubscriptionEvent, forwarder,
+    install_subscription, register_routed, route, spawn_subscriptions,
 };
 
 /// BSN template returned by [`watch`].
@@ -42,8 +42,13 @@ pub type WatchRemoval<T, S, I, M> = Subscribe<ValueRemoved<T>, S, I, M>;
 /// in `PostUpdate` `.before(ReactiveSet::Publish)`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, SystemSet)]
 pub enum ReactiveSet {
-    /// Publishes [`ValueChanged`] events and runs `webby` effects until stable.
+    /// Publishes [`ValueChanged`] events and runs effects, components and
+    /// regions until stable.
     Publish,
+    /// Runs after [`Publish`](Self::Publish) has settled, and with the `ui`
+    /// feature still before UI layout. Put systems that read reactive
+    /// output in this set.
+    Settled,
 }
 
 /// Schedule containing one publisher per tracked type.
@@ -81,13 +86,15 @@ impl Plugin for RadioactivePlugin {
             .init_resource::<ReactiveRegistry>()
             .init_resource::<PublishCounter>()
             .init_resource::<ReactiveDiagnostics>()
+            .init_resource::<PendingReplays>()
             .init_schedule(ReactivePublish)
             .add_systems(PostUpdate, run_reactive.in_set(ReactiveSet::Publish));
         crate::runtime::init(app.world_mut());
+        app.configure_sets(PostUpdate, ReactiveSet::Settled.after(ReactiveSet::Publish));
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
-            ReactiveSet::Publish.before(bevy::ui::UiSystems::Prepare),
+            (ReactiveSet::Publish, ReactiveSet::Settled).before(bevy::ui::UiSystems::Prepare),
         );
     }
 }
@@ -130,6 +137,34 @@ fn add_pending_publishers(world: &mut World) {
     }
 }
 
+/// Replays queued by new subscriptions, run at the start of the next pass.
+#[derive(Default, Resource)]
+struct PendingReplays(Vec<Box<dyn FnOnce(&mut World) + Send + Sync>>);
+
+/// Queues a subscription replay for the start of the next reactive pass.
+pub(crate) fn defer_replay(
+    world: &mut World,
+    replay: impl FnOnce(&mut World) + Send + Sync + 'static,
+) {
+    if let Some(mut pending) = world.get_resource_mut::<PendingReplays>() {
+        pending.0.push(Box::new(replay));
+    } else {
+        world.commands().queue(replay);
+    }
+}
+
+fn run_replays(world: &mut World) -> usize {
+    let replays = std::mem::take(&mut world.resource_mut::<PendingReplays>().0);
+    let count = replays.len();
+    for replay in replays {
+        replay(world);
+    }
+    if count > 0 {
+        world.flush();
+    }
+    count
+}
+
 /// Counts publications in the current pass.
 #[derive(Default, Resource)]
 struct PublishCounter(AtomicUsize);
@@ -153,6 +188,7 @@ fn run_reactive(world: &mut World) {
     let mut settled = false;
     for _ in 0..max_passes {
         add_pending_publishers(world);
+        let replayed = run_replays(world);
         world
             .resource::<PublishCounter>()
             .0
@@ -164,7 +200,7 @@ fn run_reactive(world: &mut World) {
         frame.passes += 1;
         frame.publications += published;
         frame.effects_run += ran;
-        if published == 0 && ran == 0 {
+        if published == 0 && ran == 0 && replayed == 0 {
             settled = true;
             break;
         }
@@ -362,11 +398,34 @@ fn ensure_tracked<T: Component + Clone>(context: &mut TemplateContext) -> Result
     reason = "Bevy system parameters are passed by value"
 )]
 fn publish<T: Component + Clone>(
-    values: Query<(Entity, &T), (Changed<T>, Allow<Disabled>)>,
+    values: Query<(Entity, &T, Has<Subscribers<ValueChanged<T>>>), (Changed<T>, Allow<Disabled>)>,
+    world: &World,
     counter: Res<PublishCounter>,
     mut commands: Commands,
 ) {
-    for (source, value) in &values {
+    if values.is_empty() {
+        return;
+    }
+    // Skip the snapshot for sources nobody listens to: no subscription, no
+    // global observer and no observer on the source itself.
+    let observers = world
+        .event_key::<ValueChanged<T>>()
+        .and_then(|key| world.observers().try_get_observers(key));
+    let forwarder = forwarder::<ValueChanged<T>>(world);
+    let global = observers.is_some_and(|observers| {
+        observers
+            .global_observers()
+            .keys()
+            .any(|&observer| Some(observer) != forwarder)
+    });
+    for (source, value, subscribed) in &values {
+        let observed = global
+            || subscribed
+            || observers
+                .is_some_and(|observers| observers.entity_observers().contains_key(&source));
+        if !observed {
+            continue;
+        }
         counter.0.fetch_add(1, Ordering::Relaxed);
         commands.trigger(ValueChanged {
             source,
@@ -437,8 +496,10 @@ impl<T: Resource> Source<ValueRemoved<T>> for Singleton {
 ///
 /// `source` is a `#Name`, an [`Entity`], [`Singleton`] for a resource, or a
 /// list such as `[#Player, #Enemy]`. One entity may declare any number of
-/// watches. Current state is not replayed; changes made while the scene is
-/// spawned are published in the same frame.
+/// watches. By default only changes are delivered; call
+/// [`immediate`](Subscribe::immediate) to also receive each source's current
+/// value once the scene has spawned. Changes made while the scene is spawned
+/// are published in the same frame.
 pub fn watch<T, S, I, M>(source: S, observer: I) -> Watch<T, S, I, M>
 where
     T: Component + Clone,
@@ -446,6 +507,46 @@ where
     I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, M>,
 {
     Subscribe::new(source, observer).with_check(ensure_tracked::<T>)
+}
+
+impl<T: Component + Clone, S, I, M> Subscribe<ValueChanged<T>, S, I, M> {
+    /// Also delivers each source's current value once, after the scene has
+    /// spawned, like Vue's `immediate` watchers.
+    #[must_use]
+    pub fn immediate(mut self) -> Self {
+        self.replay = Some(current_value::<T>);
+        self
+    }
+}
+
+/// Like [`watch`], and also delivers each source's current value once,
+/// after the scene has spawned.
+///
+/// Same as `watch(..).immediate()`. Use this form with `#Name` sources:
+/// `bsn!` resolves `#Name` only in direct arguments of a call, not in a
+/// call followed by a method.
+pub fn watch_immediate<T, S, I, M>(source: S, observer: I) -> Watch<T, S, I, M>
+where
+    T: Component + Clone,
+    S: Source<ValueChanged<T>>,
+    I: IntoObserverSystem<SubscriptionEvent<ValueChanged<T>>, M>,
+{
+    watch(source, observer).immediate()
+}
+
+fn current_value<T: Component + Clone>(world: &World, source: Entity) -> Option<ValueChanged<T>> {
+    let value = world.get::<T>(source)?;
+    Some(ValueChanged {
+        source,
+        value: Arc::new(value.clone()),
+    })
+}
+
+fn missing_value<T: Component>(world: &World, source: Entity) -> Option<ValueRemoved<T>> {
+    world.get::<T>(source).is_none().then_some(ValueRemoved {
+        source,
+        marker: PhantomData,
+    })
 }
 
 /// Observes removal of tracked `T` from `source`, including despawn.
@@ -462,81 +563,178 @@ where
 /// BSN entity.
 ///
 /// ```ignore
-/// Text("")
+/// Text::default()
 /// bind(#Player, |hp: &Health, text: &mut Text| **text = hp.current.to_string())
 /// ```
 ///
-/// Like [`watch`], `source` may be a `#Name`, [`Singleton`], or a list.
-pub fn bind<T, C, S, F>(source: S, write: F) -> impl Template<Output = EmptySceneEffect>
+/// Like [`watch`], `source` may be a `#Name`, [`Singleton`], or a list. The
+/// current value of each source is written once the scene has spawned, so
+/// `C` needs no hand-written initial value; call
+/// [`deferred`](Bind::deferred) to write only on changes.
+pub fn bind<T, C, S, F>(source: S, write: F) -> Bind<T, C, S, F, ()>
 where
     T: Component + Clone,
     C: Component<Mutability = Mutable>,
     S: Source<ValueChanged<T>>,
     F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
 {
-    watch(
+    Bind {
         source,
-        move |change: Reaction<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
-            if let Ok(mut target) = targets.get_mut(change.target()) {
-                write(&change, &mut target);
-            }
-        },
-    )
+        write,
+        or_else: (),
+        replay: true,
+        marker: PhantomData,
+    }
 }
 
-/// Like [`bind`], and also writes `C` with `removed` when `T` is removed from
-/// a source or the source is despawned.
+/// Like [`bind`], without writing the current value when the scene spawns.
+///
+/// Same as `bind(..).deferred()`, in a form that accepts `#Name` sources
+/// (see [`watch_immediate`]).
+pub fn bind_deferred<T, C, S, F>(source: S, write: F) -> Bind<T, C, S, F, ()>
+where
+    T: Component + Clone,
+    C: Component<Mutability = Mutable>,
+    S: Source<ValueChanged<T>>,
+    F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
+{
+    bind(source, write).deferred()
+}
+
+/// Like [`bind`], and also writes `C` with `or_else` when `T` is removed
+/// from a source or the source is despawned, or is missing when the scene
+/// spawns.
 ///
 /// ```ignore
-/// Text("")
+/// Text::default()
 /// bind_or(
 ///     #Player,
 ///     |hp: &Health, text: &mut Text| **text = hp.current.to_string(),
 ///     |text: &mut Text| **text = "DEAD".into(),
 /// )
 /// ```
-pub fn bind_or<T, C, S, F, R>(
-    source: S,
-    write: F,
-    removed: R,
-) -> impl Template<Output = EmptySceneEffect>
+pub fn bind_or<T, C, S, F, R>(source: S, write: F, or_else: R) -> Bind<T, C, S, F, OrElse<R>>
 where
     T: Component + Clone,
     C: Component<Mutability = Mutable>,
-    S: Source<ValueChanged<T>> + Source<ValueRemoved<T>>,
+    S: Source<ValueChanged<T>>,
     F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
     R: Fn(&mut C) + Clone + Send + Sync + 'static,
 {
-    let removal_source = <S as Source<ValueRemoved<T>>>::clone_source(&source);
-    Both(
-        bind(source, write),
-        on_removed(
-            removal_source,
-            move |removal: Removal<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
-                if let Ok(mut target) = targets.get_mut(removal.target()) {
-                    removed(&mut target);
-                }
-            },
-        ),
-    )
+    Bind {
+        source,
+        write,
+        or_else: OrElse(or_else),
+        replay: true,
+        marker: PhantomData,
+    }
 }
 
-/// Applies two templates in order.
-struct Both<A, B>(A, B);
+/// BSN template returned by [`bind`] and [`bind_or`].
+pub struct Bind<T, C, S, F, R> {
+    source: S,
+    write: F,
+    or_else: R,
+    replay: bool,
+    marker: PhantomData<fn() -> (T, C)>,
+}
 
-impl<A, B> Template for Both<A, B>
+impl<T, C, S, F, R> Bind<T, C, S, F, R> {
+    /// Writes only when a value changes, without writing the current value
+    /// when the scene spawns.
+    #[must_use]
+    pub fn deferred(mut self) -> Self {
+        self.replay = false;
+        self
+    }
+}
+
+/// Removal fallback of a [`bind_or`] binding.
+#[derive(Clone)]
+pub struct OrElse<R>(R);
+
+/// What a [`Bind`] does when `T` is removed: nothing for [`bind`], or the
+/// fallback of [`bind_or`].
+pub trait BindFallback<T, C>: Clone + Send + Sync + 'static {
+    /// Subscribes the entity being built to removals of `T` from `sources`.
+    fn subscribe(&self, context: &mut TemplateContext, sources: Vec<Entity>, replay: bool);
+}
+
+impl<T, C> BindFallback<T, C> for () {
+    fn subscribe(&self, _: &mut TemplateContext, _: Vec<Entity>, _: bool) {}
+}
+
+impl<T, C, R> BindFallback<T, C> for OrElse<R>
 where
-    A: Template<Output = EmptySceneEffect>,
-    B: Template<Output = EmptySceneEffect>,
+    T: Component + Clone,
+    C: Component<Mutability = Mutable>,
+    R: Fn(&mut C) + Clone + Send + Sync + 'static,
+{
+    fn subscribe(&self, context: &mut TemplateContext, sources: Vec<Entity>, replay: bool) {
+        let or_else = self.0.clone();
+        let observer = move |removal: Removal<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
+            if let Ok(mut target) = targets.get_mut(removal.target()) {
+                or_else(&mut target);
+            }
+        };
+        let replay = replay.then_some(missing_value::<T> as Replay<ValueRemoved<T>>);
+        spawn_subscriptions(context, sources, &observer, replay);
+    }
+}
+
+impl<T, C, S, F, R> Template for Bind<T, C, S, F, R>
+where
+    T: Component + Clone,
+    C: Component<Mutability = Mutable>,
+    S: Source<ValueChanged<T>>,
+    F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
+    R: BindFallback<T, C>,
 {
     type Output = EmptySceneEffect;
 
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
-        self.0.build_template(context)?;
-        self.1.build_template(context)
+        ensure_tracked::<T>(context)?;
+        let mut sources = Vec::new();
+        self.source.resolve(context, &mut sources)?;
+        let write = self.write.clone();
+        let observer = move |change: Reaction<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
+            if let Ok(mut target) = targets.get_mut(change.target()) {
+                write(&change, &mut target);
+            }
+        };
+        let replay = self
+            .replay
+            .then_some(current_value::<T> as Replay<ValueChanged<T>>);
+        spawn_subscriptions(context, sources.clone(), &observer, replay);
+        self.or_else.subscribe(context, sources, self.replay);
+        Ok(EmptySceneEffect)
     }
 
     fn clone_template(&self) -> Self {
-        Self(self.0.clone_template(), self.1.clone_template())
+        Self {
+            source: self.source.clone_source(),
+            write: self.write.clone(),
+            or_else: self.or_else.clone(),
+            replay: self.replay,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, C, S, F, R> Scene for Bind<T, C, S, F, R>
+where
+    T: Component + Clone,
+    C: Component<Mutability = Mutable>,
+    S: Source<ValueChanged<T>>,
+    F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
+    R: BindFallback<T, C>,
+{
+    fn resolve(
+        self,
+        _context: &mut ResolveContext,
+        scene: &mut ResolvedScene,
+    ) -> Result<(), ResolveSceneError> {
+        scene.push_template(self);
+        Ok(())
     }
 }
