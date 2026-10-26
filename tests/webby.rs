@@ -8,7 +8,7 @@ use std::sync::{
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::{
     RadioactivePlugin,
-    webby::{Cx, SetState, Signal, component, keyed},
+    webby::{Cx, SetState, Signal, component, either, keyed},
 };
 
 #[derive(Resource, Clone, Debug, Default, PartialEq)]
@@ -268,7 +268,7 @@ struct Dispatcher(Option<bevy_radioactive::webby::Dispatch<i32>>);
 
 #[component]
 fn reducer(cx: &Cx) -> impl Scene {
-    let (total, dispatch) = cx.use_reducer(|| 0, |total, delta: i32| total + delta);
+    let (total, dispatch) = cx.use_reducer(|total, delta: i32| total + delta, || 0);
     cx.use_effect((), move |(), commands| {
         commands.insert_resource(Dispatcher(Some(dispatch.clone())));
     });
@@ -368,4 +368,128 @@ fn effects_run_after_children_and_clean_up_on_unmount() {
     let mut events = std::mem::take(&mut app.world_mut().resource_mut::<Events>().0);
     events.sort();
     assert_eq!(events, vec!["child 2 cleanup", "child 2 unmount"]);
+}
+
+// ---------------------------------------------------------------------------
+// 0.5: call-site keys, `#[entity]` props, `Result` renders and `either`.
+// ---------------------------------------------------------------------------
+
+#[derive(Resource, Clone, Default)]
+struct ShowExtra(bool);
+
+#[derive(Resource, Clone, Default)]
+struct Cells(Vec<(u32, Signal<i32>)>);
+
+#[component]
+fn cell(cx: &Cx, id: u32) -> impl Scene {
+    let value = cx.use_signal(|| 0);
+    let shared = value.clone();
+    cx.use_effect((), move |(), commands| {
+        let shared = shared.clone();
+        commands.queue(move |world: &mut World| {
+            world.resource_mut::<Cells>().0.push((id, shared));
+        });
+    });
+    bsn! { Label({id}) Text({value.get().to_string()}) }
+}
+
+#[component]
+fn cells(cx: &Cx) -> impl Scene {
+    let show = cx.use_resource::<ShowExtra>().unwrap_or_default().0;
+    bsn! {
+        Node Children [
+            {show.then(|| bsn_list! { @cell(1) })}
+            --
+            @cell(2)
+        ]
+    }
+}
+
+#[test]
+fn a_conditional_sibling_does_not_take_another_components_state() {
+    let mut app = app();
+    app.init_resource::<ShowExtra>().init_resource::<Cells>();
+    app.world_mut().spawn_scene(bsn! { @cells() }).unwrap();
+    app.update();
+    let second = app.world().resource::<Cells>().0[0].clone();
+    assert_eq!(second.0, 2);
+    second.1.set(42);
+    app.update();
+    assert_eq!(texts(&mut app), vec![(2, "42".into())]);
+
+    // Both components hold a `Signal<i32>`, so a positional key would hand
+    // cell 2's state to the new cell 1 without any type mismatch.
+    app.world_mut().resource_mut::<ShowExtra>().0 = true;
+    app.update();
+    assert_eq!(texts(&mut app), vec![(1, "0".into()), (2, "42".into())]);
+}
+
+#[component]
+fn party_hp(
+    cx: &Cx,
+    #[entity] leader: Option<Entity>,
+    #[entity] members: Vec<Entity>,
+) -> impl Scene {
+    let hp = |entity: Entity| cx.use_component::<Health>(entity).map_or(0, |hp| hp.0);
+    let leader = leader.map_or(0, hp);
+    let total: u32 = members.into_iter().map(hp).sum();
+    bsn! { Label(6) Text({format!("{leader}/{total}")}) }
+}
+
+#[test]
+fn entity_attribute_props_accept_options_and_lists() {
+    let mut app = app();
+    let a = app.world_mut().spawn(Health(10)).id();
+    let b = app.world_mut().spawn(Health(5)).id();
+    app.world_mut()
+        .spawn_scene(bsn! { @party_hp(Some(a), vec![a, b]) })
+        .unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(6, "10/15".into())]);
+
+    app.world_mut().get_mut::<Health>(b).unwrap().0 = 1;
+    app.update();
+    assert_eq!(texts(&mut app), vec![(6, "10/11".into())]);
+}
+
+static RENDER_ERRORS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_errors(_: BevyError, _: bevy::ecs::error::ErrorContext) {
+    RENDER_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[component]
+fn fallible(cx: &Cx) -> Result<impl Scene> {
+    if cx.use_resource::<ShowExtra>().unwrap_or_default().0 {
+        return Err("no scene".into());
+    }
+    Ok(bsn! { Label(9) Text("ok") })
+}
+
+#[component]
+fn switched(cx: &Cx) -> impl Scene {
+    let show = cx.use_resource::<ShowExtra>().unwrap_or_default().0;
+    either(
+        show,
+        || bsn! { Label(3) Text("left") },
+        || bsn! { Node Children [ Label(4) Text("right") ] },
+    )
+}
+
+#[test]
+fn result_renders_report_errors_and_either_switches_scene_types() {
+    let mut app = app();
+    app.init_resource::<ShowExtra>()
+        .insert_resource(bevy::ecs::error::FallbackErrorHandler(count_errors));
+    app.world_mut()
+        .spawn_scene(bsn! { Node Children [ @fallible() -- @switched() ] })
+        .unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(4, "right".into()), (9, "ok".into())]);
+    assert_eq!(RENDER_ERRORS.load(Ordering::Relaxed), 0);
+
+    app.world_mut().resource_mut::<ShowExtra>().0 = true;
+    app.update();
+    assert_eq!(texts(&mut app), vec![(3, "left".into())]);
+    assert_eq!(RENDER_ERRORS.load(Ordering::Relaxed), 1);
 }

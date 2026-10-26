@@ -43,7 +43,15 @@ impl<'w> Reads<'w> {
         }
     }
 
-    /// Entity that owns the running effect.
+    /// Entity that owns the running effect: the BSN entity that declared
+    /// it, or a `webby` component's host.
+    #[must_use]
+    pub fn entity(&self) -> Entity {
+        self.target
+    }
+
+    /// Old name of [`entity`](Self::entity).
+    #[deprecated(since = "0.5.0", note = "renamed to `entity`")]
     #[must_use]
     pub fn target(&self) -> Entity {
         self.target
@@ -372,7 +380,7 @@ pub(crate) fn init(world: &mut World) {
 /// Entity dependencies resolved when a `webby` scene spawns.
 pub trait Deps: Send + Sync + 'static {
     /// Resolved form passed to effect closures.
-    type Output: Copy + Send + Sync + 'static;
+    type Output: Clone + Send + Sync + 'static;
 
     /// Resolves the dependencies.
     ///
@@ -461,6 +469,30 @@ tuple_deps!(A);
 tuple_deps!(A, B);
 tuple_deps!(A, B, C);
 tuple_deps!(A, B, C, D);
+
+impl<D: Deps> Deps for Option<D> {
+    type Output = Option<D::Output>;
+
+    fn resolve(&self, context: &mut TemplateContext) -> Result<Self::Output> {
+        self.as_ref().map(|dep| dep.resolve(context)).transpose()
+    }
+
+    fn clone_deps(&self) -> Self {
+        self.as_ref().map(Deps::clone_deps)
+    }
+}
+
+impl<D: Deps> Deps for Vec<D> {
+    type Output = Vec<D::Output>;
+
+    fn resolve(&self, context: &mut TemplateContext) -> Result<Self::Output> {
+        self.iter().map(|dep| dep.resolve(context)).collect()
+    }
+
+    fn clone_deps(&self) -> Self {
+        self.iter().map(Deps::clone_deps).collect()
+    }
+}
 
 /// BSN template that attaches one effect to the current entity.
 pub struct Effect<D, F> {

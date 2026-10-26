@@ -425,7 +425,7 @@ fn despawned_source_delivers_removal_before_its_subscription_goes() {
     app.world_mut()
         .spawn_scene(bsn! {
             Label(0)
-            bevy_radioactive::on_removed(source, |_: bevy_radioactive::Removal<Meter>, mut removals: ResMut<Removals>| {
+            bevy_radioactive::watch_removed(source, |_: bevy_radioactive::Removal<Meter>, mut removals: ResMut<Removals>| {
                 removals.0 += 1;
             })
         })

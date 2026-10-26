@@ -31,7 +31,7 @@ use crate::subscription::{
 /// BSN template returned by [`watch`].
 pub type Watch<T, S, I, M> = Subscribe<ValueChanged<T>, S, I, M>;
 
-/// BSN template returned by [`on_removed`].
+/// BSN template returned by [`watch_removed`].
 pub type WatchRemoval<T, S, I, M> = Subscribe<ValueRemoved<T>, S, I, M>;
 
 /// Scheduling set containing the reactive runtime.
@@ -318,7 +318,7 @@ impl<T: Component> EntityEvent for ValueRemoved<T> {
 /// owns `T`.
 pub type Reaction<'w, 't, T> = Subscription<'w, 't, ValueChanged<T>>;
 
-/// Observer input used by [`on_removed`].
+/// Observer input used by [`watch_removed`].
 pub type Removal<'w, 't, T> = Subscription<'w, 't, ValueRemoved<T>>;
 
 /// App construction helpers for registering reactive value publishers.
@@ -332,7 +332,7 @@ pub trait ReactiveAppExt {
     /// `set_if_neq` to suppress no-op notifications. Registration is
     /// idempotent and adds [`RadioactivePlugin`] if needed.
     ///
-    /// Optional for scenes: [`watch`], [`bind`] and [`on_removed`] track their
+    /// Optional for scenes: [`watch`], [`bind`] and [`watch_removed`] track their
     /// type on first use. Call it for types only observed globally, or to
     /// register everything up front.
     fn track<T: Component + Clone>(&mut self) -> &mut Self;
@@ -550,13 +550,32 @@ fn missing_value<T: Component>(world: &World, source: Entity) -> Option<ValueRem
 }
 
 /// Observes removal of tracked `T` from `source`, including despawn.
-pub fn on_removed<T, S, I, M>(source: S, observer: I) -> WatchRemoval<T, S, I, M>
+///
+/// ```ignore
+/// watch_removed(#Enemy, |removal: Removal<Health>, mut q: Query<&mut Text>| {
+///     if let Ok(mut text) = q.get_mut(removal.target()) {
+///         **text = "Enemy defeated".into();
+///     }
+/// })
+/// ```
+pub fn watch_removed<T, S, I, M>(source: S, observer: I) -> WatchRemoval<T, S, I, M>
 where
     T: Component + Clone,
     S: Source<ValueRemoved<T>>,
     I: IntoObserverSystem<SubscriptionEvent<ValueRemoved<T>>, M>,
 {
     Subscribe::new(source, observer).with_check(ensure_tracked::<T>)
+}
+
+/// Old name of [`watch_removed`].
+#[deprecated(since = "0.5.0", note = "renamed to `watch_removed`")]
+pub fn on_removed<T, S, I, M>(source: S, observer: I) -> WatchRemoval<T, S, I, M>
+where
+    T: Component + Clone,
+    S: Source<ValueRemoved<T>>,
+    I: IntoObserverSystem<SubscriptionEvent<ValueRemoved<T>>, M>,
+{
+    watch_removed(source, observer)
 }
 
 /// Writes each published `T` from `source` into component `C` on the current
@@ -607,13 +626,13 @@ where
 ///
 /// ```ignore
 /// Text::default()
-/// bind_or(
+/// bind_or_else(
 ///     #Player,
 ///     |hp: &Health, text: &mut Text| **text = hp.current.to_string(),
 ///     |text: &mut Text| **text = "DEAD".into(),
 /// )
 /// ```
-pub fn bind_or<T, C, S, F, R>(source: S, write: F, or_else: R) -> Bind<T, C, S, F, OrElse<R>>
+pub fn bind_or_else<T, C, S, F, R>(source: S, write: F, or_else: R) -> Bind<T, C, S, F, OrElse<R>>
 where
     T: Component + Clone,
     C: Component<Mutability = Mutable>,
@@ -630,7 +649,20 @@ where
     }
 }
 
-/// BSN template returned by [`bind`] and [`bind_or`].
+/// Old name of [`bind_or_else`].
+#[deprecated(since = "0.5.0", note = "renamed to `bind_or_else`")]
+pub fn bind_or<T, C, S, F, R>(source: S, write: F, or_else: R) -> Bind<T, C, S, F, OrElse<R>>
+where
+    T: Component + Clone,
+    C: Component<Mutability = Mutable>,
+    S: Source<ValueChanged<T>>,
+    F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
+    R: Fn(&mut C) + Clone + Send + Sync + 'static,
+{
+    bind_or_else(source, write, or_else)
+}
+
+/// BSN template returned by [`bind`] and [`bind_or_else`].
 pub struct Bind<T, C, S, F, R> {
     source: S,
     write: F,
@@ -649,12 +681,12 @@ impl<T, C, S, F, R> Bind<T, C, S, F, R> {
     }
 }
 
-/// Removal fallback of a [`bind_or`] binding.
+/// Removal fallback of a [`bind_or_else`] binding.
 #[derive(Clone)]
 pub struct OrElse<R>(R);
 
 /// What a [`Bind`] does when `T` is removed: nothing for [`bind`], or the
-/// fallback of [`bind_or`].
+/// fallback of [`bind_or_else`].
 pub trait BindFallback<T, C>: Clone + Send + Sync + 'static {
     /// Subscribes the entity being built to removals of `T` from `sources`.
     fn subscribe(&self, context: &mut TemplateContext, sources: Vec<Entity>, replay: bool);

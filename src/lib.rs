@@ -24,8 +24,10 @@ pub use computed::{computed, computed_opt};
 pub use reactivity::{
     Bind, BindFallback, OrElse, RadioactivePlugin, Reaction, ReactiveAppExt, ReactiveDiagnostics,
     ReactivePublish, ReactiveSet, ReactiveSettings, Removal, Singleton, ValueChanged, ValueRemoved,
-    Watch, WatchRemoval, bind, bind_deferred, bind_or, on_removed, watch, watch_immediate,
+    Watch, WatchRemoval, bind, bind_deferred, bind_or_else, watch, watch_immediate, watch_removed,
 };
+#[allow(deprecated)]
+pub use reactivity::{bind_or, on_removed};
 pub use runtime::{Cleanup, Effects, IntoCleanup, Reads};
 pub use subscription::{
     Source, Subscribe, SubscribedTo, Subscribers, Subscription, SubscriptionAppExt,

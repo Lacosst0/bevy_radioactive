@@ -70,10 +70,17 @@
 //!
 //! - The first argument may be `cx: &Cx`; it is optional.
 //! - `Entity` props accept `#Name` references from the surrounding scene, or
-//!   an `Entity` value.
+//!   an `Entity` value. Mark other entity-valued props `#[entity]`, such as
+//!   `#[entity] leader: Option<Entity>` or `#[entity] members: Vec<Entity>`
+//!   (any type that implements [`Deps`]).
 //! - Other props must be `Clone + Send + Sync + 'static`; they are cloned
 //!   into each render.
 //! - `-> impl Scene` never borrows from `cx`; the macro adds `use<..>`.
+//! - A component may return `Result<impl Scene>`. An error goes to Bevy's
+//!   fallback error handler, named after the component, and the component
+//!   renders nothing until its next render.
+//! - To render scenes of different types from two branches, use
+//!   [`either`].
 //!
 //! # Rendering model
 //!
@@ -85,9 +92,12 @@
 //!   without a UI `Node` becomes a `GhostNode` (with the `ui` feature), so
 //!   `@counter(5)` can be a list item without affecting layout.
 //! - A render replaces the rendered subtree. Child components keep their
-//!   hook state across parent renders, matched by position or key, like
-//!   React keeps component instances. Plain entities in the subtree are
-//!   recreated.
+//!   hook state across parent renders, like React keeps component
+//!   instances. A child is matched by its key, or else by the source
+//!   location of its `@name(..)` call and how many components that location
+//!   created earlier in the render, so a conditional sibling does not shift
+//!   anyone's state. Key components created in loops. Plain entities in the
+//!   subtree are recreated.
 //! - Hooks must be called in the same order on every render.
 //! - Renders run in [`ReactiveSet::Publish`], before UI layout, so state set
 //!   by an observer or system earlier in the frame is shown the same frame.
@@ -99,6 +109,7 @@ use std::{
     cell::{Cell, RefCell},
     hash::{BuildHasher, Hash},
     ops::Deref,
+    panic::Location,
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
 };
 
@@ -109,7 +120,10 @@ use bevy::{
     },
     platform::{collections::HashMap, hash::FixedState},
     prelude::*,
-    scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
+    scene::{
+        EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene,
+        SceneDependencies,
+    },
 };
 
 use crate::runtime::{PostEffects, RunFn, Unmounted, attach, ensure_runtime, spawn_child, tracked};
@@ -127,9 +141,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // Component instances
 // ---------------------------------------------------------------------------
 
+/// Identity of a child component within its parent's render.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ChildKey {
-    Position(usize),
+    /// Unkeyed: the source location that created the component, and how
+    /// many components that location created earlier in the same render.
+    Site {
+        loc: &'static Location<'static>,
+        nth: u32,
+    },
+    /// Keyed with [`Mount::key`].
     Key(u64),
 }
 
@@ -137,7 +158,7 @@ enum ChildKey {
 struct ChildSlots {
     previous: HashMap<ChildKey, Arc<Instance>>,
     current: HashMap<ChildKey, Arc<Instance>>,
-    position: usize,
+    sites: HashMap<&'static Location<'static>, u32>,
 }
 
 type PendingEffect = Box<dyn FnOnce(&mut Commands) + Send + Sync>;
@@ -174,13 +195,17 @@ impl Instance {
 
     /// Returns the instance for the next child mounted during a render,
     /// reusing the one from the previous render with the same key.
-    fn child(self: &Arc<Self>, key: Option<u64>) -> Arc<Self> {
+    fn child(self: &Arc<Self>, key: Option<u64>, site: &'static Location<'static>) -> Arc<Self> {
         let mut slots = lock(&self.children);
         let key = if let Some(key) = key {
             ChildKey::Key(key)
         } else {
-            slots.position += 1;
-            ChildKey::Position(slots.position - 1)
+            let nth = slots.sites.entry(site).or_default();
+            *nth += 1;
+            ChildKey::Site {
+                loc: site,
+                nth: *nth - 1,
+            }
         };
         let instance = slots
             .previous
@@ -218,12 +243,16 @@ impl Drop for RenderingGuard {
     }
 }
 
-fn instance_for(key: Option<u64>, unmounted: Unmounted) -> Arc<Instance> {
+fn instance_for(
+    key: Option<u64>,
+    site: &'static Location<'static>,
+    unmounted: Unmounted,
+) -> Arc<Instance> {
     RENDERING
         .with(|stack| stack.borrow().last().cloned())
         .map_or_else(
             || Instance::new(None, unmounted),
-            |parent| parent.child(key),
+            |parent| parent.child(key, site),
         )
 }
 
@@ -234,7 +263,8 @@ fn instance_for(key: Option<u64>, unmounted: Unmounted) -> Arc<Instance> {
 /// Render context passed to components. Provides hooks and tracked reads.
 ///
 /// Dereferences to [`Reads`] for tracked ECS access (`get`, `this`,
-/// `resource`, `untracked`).
+/// `resource`, `untracked`), and for [`Reads::entity`], the entity hosting
+/// this component (the rendered scene is its child).
 pub struct Cx<'a, 'w> {
     reads: &'a Reads<'w>,
     instance: &'a Arc<Instance>,
@@ -251,12 +281,6 @@ impl<'w> Deref for Cx<'_, 'w> {
 }
 
 impl Cx<'_, '_> {
-    /// Entity hosting this component; the rendered scene is its child.
-    #[must_use]
-    pub fn entity(&self) -> Entity {
-        self.reads.target()
-    }
-
     fn hook<H, R>(&self, init: impl FnOnce() -> H, use_hook: impl FnOnce(&mut H) -> R) -> R
     where
         H: Any + Send + Sync,
@@ -316,13 +340,15 @@ impl Cx<'_, '_> {
     /// Like React's `useReducer`: state updated by dispatching actions.
     ///
     /// ```ignore
-    /// let (count, dispatch) = cx.use_reducer(|| 0, |count, delta: i32| count + delta);
+    /// let (count, dispatch) = cx.use_reducer(|count, delta: i32| count + delta, || 0);
     /// on(move |_: On<Pointer<Click>>| dispatch(1))
     /// ```
+    ///
+    /// The reducer comes first, as in React's `useReducer(reducer, init)`.
     pub fn use_reducer<T, A>(
         &self,
-        init: impl FnOnce() -> T,
         reducer: impl Fn(&T, A) -> T + Send + Sync + 'static,
+        init: impl FnOnce() -> T,
     ) -> (T, Dispatch<A>)
     where
         T: Clone + Send + Sync + 'static,
@@ -446,6 +472,8 @@ impl Cx<'_, '_> {
     }
 
     /// Clones resource `R`; the component re-renders when it changes.
+    ///
+    /// Shorthand for `cx.resource::<R>().cloned()` (see [`Reads::resource`]).
     #[must_use]
     pub fn use_resource<R: Resource + Clone>(&self) -> Option<R> {
         self.reads.resource::<R>().cloned()
@@ -453,6 +481,8 @@ impl Cx<'_, '_> {
 
     /// Clones component `C` on `entity`; the component re-renders when it
     /// changes.
+    ///
+    /// Shorthand for `cx.get::<C>(entity).cloned()` (see [`Reads::get`]).
     #[must_use]
     pub fn use_component<C: Component + Clone>(&self, entity: Entity) -> Option<C> {
         self.reads.get::<C>(entity).cloned()
@@ -526,14 +556,22 @@ impl<T> Clone for Ref<T> {
 // ---------------------------------------------------------------------------
 
 /// A mounted component: a BSN template that renders a component on the
-/// current entity. Returned by `#[component]` functions and [`component`].
+/// current entity. Returned by `#[component]` functions and [`component`](fn@component).
 ///
 /// The rendered scene is spawned as the entity's child. An entity without a
 /// UI `Node` becomes a `GhostNode` (with the `ui` feature), so components can
 /// be used directly as list items without affecting layout.
+///
+/// An unkeyed component is identified by the source location that created
+/// it (the `@name(..)` call, through `#[track_caller]`) and how many
+/// components that location created before it in the same parent render.
+/// Adding or removing a conditional sibling therefore does not move another
+/// component's state; components created in a loop still match by position
+/// and should be keyed.
 pub struct Mount<D, F> {
     deps: D,
     key: Option<u64>,
+    site: &'static Location<'static>,
     render: F,
 }
 
@@ -566,7 +604,8 @@ where
         let unmounted = context
             .entity
             .world_scope(|world| world.resource::<Unmounted>().clone());
-        let run = render_loop(instance_for(self.key, unmounted), self.render.clone(), deps);
+        let instance = instance_for(self.key, self.site, unmounted);
+        let run = render_loop(instance, self.render.clone(), deps);
         attach(context, run);
         Ok(EmptySceneEffect)
     }
@@ -575,6 +614,7 @@ where
         Self {
             deps: self.deps.clone_deps(),
             key: self.key,
+            site: self.site,
             render: self.render.clone(),
         }
     }
@@ -597,7 +637,7 @@ where
 
 fn render_loop<O, F>(instance: Arc<Instance>, render: F, deps: O) -> RunFn
 where
-    O: Copy + Send + Sync + 'static,
+    O: Clone + Send + Sync + 'static,
     F: Render<O>,
 {
     let mut child: Option<Entity> = None;
@@ -614,7 +654,7 @@ where
                 hook: Cell::new(0),
                 effects: RefCell::default(),
             };
-            let scene = render.render(&cx, deps);
+            let scene = render.render(&cx, deps.clone());
             (scene, cx.effects.into_inner())
         });
 
@@ -624,7 +664,7 @@ where
         {
             let mut slots = lock(&instance.children);
             slots.previous = std::mem::take(&mut slots.current);
-            slots.position = 0;
+            slots.sites.clear();
         }
         RENDERING.with(|stack| stack.borrow_mut().push(Arc::clone(&instance)));
         let guard = RenderingGuard;
@@ -668,6 +708,7 @@ fn make_layout_transparent(_: &mut World, _: Entity) {}
 /// Mounts a closure as a component: `component(|cx| counter(cx, 5))`.
 ///
 /// Prefer `#[component]` functions, which are used as `@counter(5)`.
+#[track_caller]
 pub fn component<F, S>(render: F) -> Mount<(), impl Render<()>>
 where
     F: Fn(&Cx) -> S + Clone + Send + Sync + 'static,
@@ -678,6 +719,7 @@ where
 
 /// Mounts a closure that receives entities resolved from the scene, such as
 /// `#Player` or `[#A, #B]`: `component_with(#Player, |cx, player| ..)`.
+#[track_caller]
 pub fn component_with<D, F, S>(entities: D, render: F) -> Mount<D, F>
 where
     D: Deps,
@@ -687,7 +729,81 @@ where
     Mount {
         deps: entities,
         key: None,
+        site: Location::caller(),
         render,
+    }
+}
+
+/// Reports a failed render of a `-> Result<impl Scene>` component to Bevy's
+/// [`FallbackErrorHandler`](bevy::ecs::error::FallbackErrorHandler) and
+/// renders nothing.
+#[doc(hidden)]
+pub fn __render_result<S: Scene>(
+    cx: &Cx,
+    component: &'static str,
+    result: Result<S, impl Into<BevyError>>,
+) -> Option<S> {
+    use bevy::ecs::error::{ErrorContext, ErrorHandler, FallbackErrorHandler};
+    match result {
+        Ok(scene) => Some(scene),
+        Err(error) => {
+            let handler = cx
+                .untracked()
+                .get_resource::<FallbackErrorHandler>()
+                .map_or(bevy::ecs::error::error as ErrorHandler, |handler| handler.0);
+            let name = format!("webby component `{component}` on {}", cx.entity());
+            handler(error.into(), ErrorContext::Command { name: name.into() });
+            None
+        }
+    }
+}
+
+/// One of two scenes of different types, returned by [`either`].
+///
+/// Lets the branches of an `if` render different `bsn!` scenes without
+/// boxing them.
+pub enum Either<A, B> {
+    /// The scene of the first branch.
+    Left(A),
+    /// The scene of the second branch.
+    Right(B),
+}
+
+impl<A: Scene, B: Scene> Scene for Either<A, B> {
+    fn resolve(
+        self,
+        context: &mut ResolveContext,
+        scene: &mut ResolvedScene,
+    ) -> Result<(), ResolveSceneError> {
+        match self {
+            Self::Left(left) => left.resolve(context, scene),
+            Self::Right(right) => right.resolve(context, scene),
+        }
+    }
+
+    fn register_dependencies(&self, dependencies: &mut SceneDependencies) {
+        match self {
+            Self::Left(left) => left.register_dependencies(dependencies),
+            Self::Right(right) => right.register_dependencies(dependencies),
+        }
+    }
+}
+
+/// Builds `left()` when `condition` holds and `right()` otherwise; the two
+/// scenes may have different types.
+///
+/// ```ignore
+/// either(done, || bsn! { Text("done") }, || bsn! { Button Children [ Text("finish") ] })
+/// ```
+pub fn either<A: Scene, B: Scene>(
+    condition: bool,
+    left: impl FnOnce() -> A,
+    right: impl FnOnce() -> B,
+) -> Either<A, B> {
+    if condition {
+        Either::Left(left())
+    } else {
+        Either::Right(right())
     }
 }
 

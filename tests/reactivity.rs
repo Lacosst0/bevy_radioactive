@@ -5,8 +5,8 @@ use bevy::{
     scene::ScenePlugin,
 };
 use bevy_radioactive::{
-    RadioactivePlugin, Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind, bind_or,
-    on_removed, testing::settle, watch, watch_immediate,
+    RadioactivePlugin, Reaction, ReactiveAppExt, Removal, Singleton, ValueChanged, bind,
+    bind_or_else, testing::settle, watch, watch_immediate, watch_removed,
 };
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,7 +434,7 @@ fn bind_writes_target_and_bind_or_handles_despawn() {
                 --
                 Listener
                 Label(0)
-                bind_or(
+                bind_or_else(
                     #A,
                     |meter: &Meter, label: &mut Label| label.0 = meter.0,
                     |label: &mut Label| label.0 = 999,
@@ -468,7 +468,7 @@ fn bind_writes_target_and_bind_or_handles_despawn() {
 }
 
 #[test]
-fn on_removed_fires_for_component_removal_and_resource_removal() {
+fn watch_removed_fires_for_component_removal_and_resource_removal() {
     let mut app = test_app();
     app.insert_resource(Counter(1))
         .track::<Counter>()
@@ -479,8 +479,8 @@ fn on_removed_fires_for_component_removal_and_resource_removal() {
                 #A SourceA Meter(1)
                 --
                 Listener
-                on_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| log.local.push((r.target(), r.source(), 0)))
-                on_removed(Singleton, |r: Removal<Counter>, mut log: ResMut<Log>| log.global.push((r.source(), 0)))
+                watch_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| log.local.push((r.target(), r.source(), 0)))
+                watch_removed(Singleton, |r: Removal<Counter>, mut log: ResMut<Log>| log.global.push((r.source(), 0)))
             ]
         })
         .unwrap();
@@ -578,7 +578,7 @@ fn bind_or_replays_a_missing_source_and_watch_can_replay() {
                 --
                 Listener
                 Label(0)
-                bind_or(#A, |meter: &Meter, label: &mut Label| label.0 = meter.0, |label: &mut Label| label.0 = 999)
+                bind_or_else(#A, |meter: &Meter, label: &mut Label| label.0 = meter.0, |label: &mut Label| label.0 = 999)
                 watch_immediate(#B, |event: Reaction<Meter>, mut log: ResMut<Log>| {
                     log.local.push((event.target(), event.source(), event.0));
                 })

@@ -891,11 +891,63 @@ fn last_segment_is(ty: &syn::Type, name: &str) -> bool {
     }
 }
 
+/// Whether a prop is marked `#[entity]`, removing the attribute.
+fn take_entity_attr(attrs: &mut Vec<syn::Attribute>) -> syn::Result<bool> {
+    let mut found = false;
+    let mut result = Ok(());
+    attrs.retain(|attr| {
+        if !attr.path().is_ident("entity") {
+            return true;
+        }
+        if !matches!(attr.meta, syn::Meta::Path(_)) {
+            result = Err(syn::Error::new_spanned(
+                attr,
+                "`#[entity]` takes no arguments",
+            ));
+        }
+        found = true;
+        false
+    });
+    result.map(|()| found)
+}
+
+/// Adds `use<..>` to every `impl Trait` in a return type that lacks one, so
+/// the render function never captures the `cx` lifetime.
+fn add_precise_capture(ty: &mut syn::Type, generics: &syn::Generics) {
+    match ty {
+        syn::Type::ImplTrait(impl_trait) => {
+            if !impl_trait
+                .bounds
+                .iter()
+                .any(|bound| matches!(bound, syn::TypeParamBound::PreciseCapture(_)))
+            {
+                let params = generics.type_params().map(|param| &param.ident);
+                let bound: syn::TypeParamBound = syn::parse_quote!(use<#(#params),*>);
+                impl_trait.bounds.push(bound);
+            }
+        }
+        syn::Type::Path(path) => {
+            for segment in &mut path.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &mut segment.arguments {
+                    for arg in &mut args.args {
+                        if let syn::GenericArgument::Type(ty) = arg {
+                            add_precise_capture(ty, generics);
+                        }
+                    }
+                }
+            }
+        }
+        syn::Type::Paren(paren) => add_precise_capture(&mut paren.elem, generics),
+        syn::Type::Group(group) => add_precise_capture(&mut group.elem, generics),
+        _ => {}
+    }
+}
+
 fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
     let syn::ItemFn {
         attrs,
         vis,
-        sig,
+        mut sig,
         block,
     } = function;
     if let Some(asyncness) = &sig.asyncness {
@@ -905,14 +957,13 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
         ));
     }
     let webby = quote!(::bevy_radioactive::webby);
-    let entity = quote!(::bevy::prelude::Entity);
 
-    let mut uses_cx = false;
     let mut outer_inputs = Vec::new();
     let mut captured = Vec::new();
     let mut entities = Vec::new();
+    let mut entity_types = Vec::new();
     let mut call_args = Vec::new();
-    for (index, input) in sig.inputs.iter().enumerate() {
+    for (index, input) in sig.inputs.iter_mut().enumerate() {
         let syn::FnArg::Typed(typed) = input else {
             return Err(syn::Error::new_spanned(
                 input,
@@ -926,14 +977,22 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             ));
         };
         let name = &pat.ident;
+        let marked = take_entity_attr(&mut typed.attrs)?;
         let ty = &typed.ty;
-        if index == 0 && matches!(&**ty, syn::Type::Reference(_)) && last_segment_is(ty, "Cx") {
-            uses_cx = true;
+        let reference = matches!(&**ty, syn::Type::Reference(_));
+        if marked && reference {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "`#[entity]` props are passed by value",
+            ));
+        }
+        if index == 0 && reference && last_segment_is(ty, "Cx") {
             call_args.push(quote!(__cx));
-        } else if last_segment_is(ty, "Entity") && !matches!(&**ty, syn::Type::Reference(_)) {
+        } else if marked || (last_segment_is(ty, "Entity") && !reference) {
             // `#Name` in `bsn!` passes an `EntityTemplate`; resolve it as a dep.
-            outer_inputs.push(quote!(#name: impl #webby::Deps<Output = #entity>));
+            outer_inputs.push(quote!(#name: impl #webby::Deps<Output = #ty>));
             entities.push(name.clone());
+            entity_types.push(quote!(#ty));
             call_args.push(quote!(#name));
         } else {
             outer_inputs.push(quote!(#name: #ty));
@@ -941,21 +1000,14 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             call_args.push(quote!(::core::clone::Clone::clone(#name)));
         }
     }
-    let _ = uses_cx;
 
     // The render function must not borrow from `cx`.
     let mut render_sig = sig.clone();
     render_sig.ident = Ident::new("__render", Span::call_site());
-    if let syn::ReturnType::Type(_, ty) = &mut render_sig.output
-        && let syn::Type::ImplTrait(impl_trait) = &mut **ty
-        && !impl_trait
-            .bounds
-            .iter()
-            .any(|bound| matches!(bound, syn::TypeParamBound::PreciseCapture(_)))
-    {
-        let params = sig.generics.type_params().map(|param| &param.ident);
-        let bound: syn::TypeParamBound = syn::parse_quote!(use<#(#params),*>);
-        impl_trait.bounds.push(bound);
+    let mut fallible = false;
+    if let syn::ReturnType::Type(_, ty) = &mut render_sig.output {
+        fallible = last_segment_is(ty, "Result") && !matches!(&**ty, syn::Type::Reference(_));
+        add_precise_capture(ty, &sig.generics);
     }
 
     let name = &sig.ident;
@@ -970,10 +1022,17 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
     } else {
         quote!(::<#(#turbofish),*>)
     };
-    let entity_types = entities.iter().map(|_| entity.clone()).collect::<Vec<_>>();
+    let render_call = quote!(__render #turbofish (#(#call_args),*));
+    let render_call = if fallible {
+        // Errors go to Bevy's error handler; the component renders nothing.
+        quote!(#webby::__render_result(__cx, ::core::stringify!(#name), #render_call))
+    } else {
+        render_call
+    };
 
     Ok(quote! {
         #(#attrs)*
+        #[track_caller]
         #vis fn #name #impl_generics (#(#outer_inputs),*)
             -> #webby::Mount<
                 impl #webby::Deps<Output = (#(#entity_types,)*)>,
@@ -990,7 +1049,7 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
                 move |__cx: &#webby::Cx, (#(#entities,)*): (#(#entity_types,)*)| {
                     #[allow(unused_variables)]
                     let (#(#captured,)*) = &__props;
-                    __render #turbofish (#(#call_args),*)
+                    #render_call
                 },
             )
         }

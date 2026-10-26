@@ -11,7 +11,7 @@ struct Increment(Option<Dispatch<u32>>);
 
 #[component]
 fn counter(cx: &Cx, label: &'static str) -> impl Scene {
-    let (count, add) = cx.use_reducer(|| 0, |count, delta: u32| count + delta);
+    let (count, add) = cx.use_reducer(|count, delta: u32| count + delta, || 0);
     let doubled = cx.use_memo(count, |count| count * 2);
     cx.use_effect((), move |(), commands| {
         commands.insert_resource(Increment(Some(add.clone())));

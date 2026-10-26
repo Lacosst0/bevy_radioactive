@@ -1,6 +1,6 @@
 [package]
 name = "bevy_radioactive"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
@@ -20,7 +20,7 @@ comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
 members = ["macros"]
 
 [dependencies]
-bevy_radioactive_macros = { path = "macros", version = "0.4.0" }
+bevy_radioactive_macros = { path = "macros", version = "0.5.0" }
 bevy = { version = "0.20", default-features = false, features = [
     "bevy_log",
     "bevy_scene",

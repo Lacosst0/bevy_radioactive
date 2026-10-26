@@ -6,7 +6,7 @@ without a global system querying every possible view.
 
 It has four layers:
 
-- **Watching and binding** (`watch`, `bind`, `bind_or`, `on_removed`): source-routed
+- **Watching and binding** (`watch`, `bind`, `bind_or_else`, `watch_removed`): source-routed
   change notifications for tracked components and resources.
 - **Subscriptions** (`subscribe_to`): routing of any entity event from a source to
   listeners.
@@ -19,6 +19,7 @@ It has four layers:
 
 | `bevy_radioactive` | Bevy | Rust |
 | --- | --- | --- |
+| 0.5 | 0.20 | 1.97.1 or newer |
 | 0.4 | 0.20 | 1.97.1 or newer |
 
 ```toml
@@ -28,12 +29,12 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 ```
 
 The default `ui` feature orders the reactive runtime before Bevy UI layout and makes
-`coat!` regions `GhostNode`s. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.3.
+`coat!` regions `GhostNode`s. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
 
 ## Quick start
 
 Resources are singleton components in Bevy 0.20, so one API covers both. Add
-`RadioactivePlugin`; `watch`, `bind` and `on_removed` start tracking their type the
+`RadioactivePlugin`; `watch`, `bind` and `watch_removed` start tracking their type the
 first time a scene uses them. Call `app.track::<T>()` only for types you observe
 globally or want registered up front.
 
@@ -72,7 +73,7 @@ fn hud() -> impl Scene {
             --
             // component source, with a removal fallback
             Text("")
-            bind_or(
+            bind_or_else(
                 #Player,
                 |hp: &Health, text: &mut Text| **text = format!("HP {}", hp.0),
                 |text: &mut Text| **text = "DEAD".into(),
@@ -104,15 +105,15 @@ same or different sources and types. Use `source()` on the event to tell sources
 | `watch_immediate(source, handler)` | same, plus once on spawn with the current value | same |
 | `bind(source, \|&T, &mut C\|)` | on spawn with the current value, then like `watch` | writes component `C` on this entity |
 | `bind_deferred(source, write)` | like `watch` (no initial write) | same |
-| `bind_or(source, write, \|&mut C\|)` | like `bind`, plus removal/despawn | writes `C` for both cases |
-| `on_removed(source, handler)` | `T` is removed or the source despawns | observer with `Removal<T>` input |
+| `bind_or_else(source, write, \|&mut C\|)` | like `bind`, plus removal/despawn | writes `C` for both cases |
+| `watch_removed(source, handler)` | `T` is removed or the source despawns | observer with `Removal<T>` input |
 | `subscribe_to(source, handler)` | source receives entity event `E` | observer with `Subscription<E>` input |
 | `computed(\|r: &Reads\| C)` | anything it read changed | keeps component `C` on this entity equal to the result |
 | `computed_opt(\|r: &Reads\| Option<C>)` | same | inserts `C`, or removes it on `None` |
 
 `bind` writes the source's current value when the scene spawns (it is delivered at the
 start of the next reactive pass, so a component in the same scene already exists).
-`bind_or` calls the fallback instead when the source lacks `T`.
+`bind_or_else` calls the fallback instead when the source lacks `T`.
 
 `computed` is a derived component: it reads through `Reads` (`r.resource::<R>()`,
 `r.get::<C>(entity)`, `r.this::<C>()`), re-runs when any
@@ -159,7 +160,7 @@ fn duel_log() -> impl Scene {
                     **text = format!("{name} now has {} HP", hit.0);
                 }
             })
-            on_removed(#Enemy, |removal: Removal<Health>, mut q: Query<&mut Text>| {
+            watch_removed(#Enemy, |removal: Removal<Health>, mut q: Query<&mut Text>| {
                 if let Ok(mut text) = q.get_mut(removal.target()) {
                     **text = "Enemy defeated".into();
                 }
@@ -235,7 +236,7 @@ fn app(cx: &Cx) -> impl Scene {
 | `<Row key={id} />` | `row(..).key(id)` or `@keyed(id, row(..))` |
 | inline component | `component(\|cx\| bsn! { .. })` |
 | `useState` | `let (count, set_count) = cx.use_state(|| 0); set_count(count + 1)` |
-| `useReducer` | `let (state, dispatch) = cx.use_reducer(init, reducer); dispatch(action)` |
+| `useReducer` | `let (state, dispatch) = cx.use_reducer(reducer, init); dispatch(action)` |
 | effect cleanup / unmount | return `move \|commands: &mut Commands\| ..` from `use_effect`, or `cx.on_unmount(..)` |
 | signals | `cx.use_signal(init) -> Signal` |
 | `useMemo` / `useEffect` / `useRef` | `cx.use_memo` / `cx.use_effect` / `cx.use_ref` |
@@ -244,8 +245,13 @@ fn app(cx: &Cx) -> impl Scene {
 
 A component's output is a child of its entity; an entity without a UI `Node` becomes a
 `GhostNode`, so `@counter(5)` works as a list item without affecting layout. A render
-replaces the subtree; child components keep their hook state, matched by position or
-key. Props other than `Entity` must be `Clone + Send + Sync + 'static`.
+replaces the subtree; child components keep their hook state, matched by key or else
+by the call site of `@name(..)`, so a conditional sibling doesn't shift another
+component's state (key components created in loops). Props other than `Entity` must be
+`Clone + Send + Sync + 'static`; mark other entity-valued props `#[entity]`, as in
+`#[entity] target: Option<Entity>`. A component may return `Result<impl Scene>`: errors
+go to Bevy's fallback error handler. `either(cond, || bsn! {..}, || bsn! {..})` picks
+between two scenes of different types.
 
 ## `coat!`: reactive templates
 
@@ -321,7 +327,7 @@ the next run and when its entity despawns.
   `ReactiveDiagnostics::exhausted_frames`.
 - When a type is first tracked by a scene, its publisher's first run reports the current
   values once, so the first watcher of a resource also receives its current value.
-- `bind`, `bind_or` and `watch_immediate` replay the source's current value when the
+- `bind`, `bind_or_else` and `watch_immediate` replay the source's current value when the
   listener spawns; `watch` and `bind_deferred` only see later changes.
 - A changed value is published only when something listens to it: a subscription, an
   entity observer on the source, or a global observer.
