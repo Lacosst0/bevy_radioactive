@@ -4,7 +4,7 @@
 //! the runtime's settings and system sets, selections, monitors, and the
 //! constructors of the `coat` and `webby` layers. The `#[component]` attribute is not included,
 //! because it would make Bevy's `#[component(..)]` derive helper ambiguous;
-//! import it from [`webby`](crate::webby) where components are defined.
+//! import it from [`webby`] where components are defined.
 //!
 //! ```
 //! use bevy::prelude::*;
