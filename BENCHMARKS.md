@@ -51,3 +51,53 @@ for each), and checked every dependency of every effect.
 
 Idle cost grows linearly with hosts times dependencies, and the depth sort makes deep
 trees cost O(hosts x depth) per frame even when nothing changes.
+
+## Push invalidation
+
+Writes queue only the hosts that read what they wrote (see the performance model in
+the README). Signals and memos mark their readers on `set`, `Insert`/`Remove` observers
+mark presence and immutable-component readers, and the change ticks of the mutable
+(entity, component) pairs and resources that some effect read are scanned once per
+pass, since `Mut<T>` writes have no hook.
+
+| scenario                                 | before (us) | after (us) | speedup |
+|------------------------------------------|------------:|-----------:|--------:|
+| empty app                                |         0.6 |        0.6 |      1x |
+| idle, 1000 hosts x 4 signals             |        39.0 |        0.6 |     65x |
+| idle, 10000 hosts x 1 signals            |       349.5 |        0.6 |    580x |
+| idle, 1000 hosts x 4 components          |        52.4 |       17.1 |      3x |
+| idle, 1000 hosts x 4 presence            |        42.9 |        0.8 |     54x |
+| idle, memo diamond -> 1000 hosts         |        89.7 |        0.6 |    150x |
+| idle, 10 chains x depth 100              |       509.1 |        0.6 |    850x |
+| one signal changes, 1000 hosts           |        65.5 |        1.3 |     50x |
+| one signal changes, 10000 hosts          |       773.1 |        1.4 |    550x |
+| one component changes, 1000 hosts        |        82.9 |       13.7 |      6x |
+| one component changes, 10000 hosts       |       874.9 |      134.2 |    6.5x |
+| fan-out, 1 signal -> 1000 hosts          |       181.7 |      190.0 |   0.95x |
+
+Medians; the full run:
+
+| scenario                                 |  median us |     min us |     max us | effects |
+|------------------------------------------|------------|------------|------------|---------|
+| empty app                                |        0.6 |        0.6 |        5.0 |       0 |
+| idle, 1000 hosts x 4 signals             |        0.6 |        0.5 |        1.2 |       0 |
+| idle, 10000 hosts x 1 signals            |        0.6 |        0.5 |        1.9 |       0 |
+| idle, 1000 hosts x 4 components          |       17.1 |       15.8 |       52.6 |       0 |
+| idle, 1000 hosts x 4 presence            |        0.8 |        0.6 |        1.6 |       0 |
+| idle, memo diamond -> 1000 hosts         |        0.6 |        0.6 |        1.6 |       0 |
+| idle, 10 chains x depth 100              |        0.6 |        0.5 |        1.3 |       0 |
+| one signal changes, 1000 hosts           |        1.3 |        1.2 |       10.5 |       1 |
+| one signal changes, 10000 hosts          |        1.4 |        1.2 |        4.0 |       1 |
+| one component changes, 1000 hosts        |       13.7 |       12.2 |      174.0 |       1 |
+| one component changes, 10000 hosts       |      134.2 |      113.3 |      473.4 |       1 |
+| fan-out, 1 signal -> 1000 hosts          |      190.0 |      172.2 |      359.0 |    1000 |
+
+Idle frames with signal, memo and presence dependencies now cost the same as an empty
+app at any host count or depth. Mutable-component dependencies remain O(distinct
+(entity, component) pairs read) per pass, about 4 ns per pair, because Bevy has no hook
+for `Mut<T>` writes; Bevy 0.20's `summary_tick` would let a scan skip unchanged
+columns, but it is opt-in per component type, so user components rarely have it, and
+the scan looks pairs up per entity anyway. Make a component `#[component(immutable)]`
+(changed by re-inserting it) to move its readers onto observers and out of the scan.
+When every host runs (fan-out), the cost is the effects themselves; a run that reads
+the same sources as its previous run keeps its subscriptions instead of re-subscribing.

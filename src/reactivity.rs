@@ -194,6 +194,11 @@ pub struct ReactiveDiagnostics {
     pub passes: usize,
     /// Effects, component renders and region updates run in the last frame.
     pub effects_run: usize,
+    /// Effect hosts whose dependencies were checked in the last frame.
+    ///
+    /// Writes queue only the hosts that read what they wrote, so this is
+    /// zero on a frame where nothing any effect read changed.
+    pub hosts_checked: usize,
     /// [`ValueChanged`] events published in the last frame.
     pub publications: usize,
     /// Frames that stopped at [`ReactiveSettings::max_passes`] with work left.
@@ -214,11 +219,12 @@ fn run_reactive(world: &mut World) {
         let _ = world.try_run_schedule(ReactivePublish);
         world.flush();
         let published = world.resource::<PublishCounter>().0.load(Ordering::Relaxed);
-        let ran = crate::runtime::run_effects(world, Phase::Main);
+        let outcome = crate::runtime::run_effects(world, Phase::Main);
         frame.passes += 1;
         frame.publications += published;
-        frame.effects_run += ran;
-        if published == 0 && ran == 0 && replayed == 0 {
+        frame.effects_run += outcome.ran;
+        frame.hosts_checked += outcome.checked;
+        if published == 0 && outcome.ran == 0 && replayed == 0 {
             settled = true;
             break;
         }
@@ -239,12 +245,14 @@ fn run_reactive(world: &mut World) {
 fn run_post_layout(world: &mut World) {
     let max_passes = world.resource::<ReactiveSettings>().max_passes.max(1);
     for _ in 0..max_passes {
-        let ran = crate::runtime::run_effects(world, Phase::PostLayout);
+        let outcome = crate::runtime::run_effects(world, Phase::PostLayout);
         world.flush();
-        if ran == 0 {
+        let mut diagnostics = world.resource_mut::<ReactiveDiagnostics>();
+        diagnostics.hosts_checked += outcome.checked;
+        if outcome.ran == 0 {
             break;
         }
-        world.resource_mut::<ReactiveDiagnostics>().effects_run += ran;
+        diagnostics.effects_run += outcome.ran;
     }
 }
 

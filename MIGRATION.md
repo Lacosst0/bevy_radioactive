@@ -76,6 +76,16 @@ Behavior changes:
 - `ReactiveSet` has a new `PostLayout` variant (runs `layout_effect`s after UI layout and
   transform propagation); exhaustive `match`es on `ReactiveSet` need an extra arm.
   `ReactiveDiagnostics::effects_run` also counts post-layout effects.
+- Effects are invalidated by push instead of polling every host each pass: a signal
+  `set`, a component insert or removal, or a changed tick on a read value queues only
+  the hosts that read it, so idle frames check no hosts. What runs is unchanged, with
+  one difference in timing: an effect that reads what another effect wrote earlier in
+  the same pass now runs in that pass rather than the next, so chains of `computed`s
+  settle in fewer passes. `ReactiveDiagnostics` has a new `hosts_checked` field
+  (struct literals need it, or `..Default::default()`).
+- Memos use Reactively-style colouring: a change marks downstream memos possibly
+  stale, and a read recomputes each at most once, so a diamond computes once per
+  change.
 
 # Migrating from 0.3 to 0.4
 

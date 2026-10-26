@@ -1,5 +1,7 @@
 //! Shared effect runtime used by `webby` and `coat`.
 
+mod invalidation;
+
 use std::{
     any::TypeId,
     cell::RefCell,
@@ -10,7 +12,6 @@ use bevy::{
     ecs::{
         change_detection::Tick,
         component::ComponentId,
-        entity::EntityHashSet,
         entity_disabling::Disabled,
         lifecycle::HookContext,
         template::{EntityTemplate, Template, TemplateContext},
@@ -23,6 +24,7 @@ use bevy::{
 };
 
 use crate::reactivity::ReactiveSettings;
+use invalidation::{Invalidation, Link, Pass, Shared};
 
 /// Tracked read access to the world.
 ///
@@ -184,6 +186,18 @@ pub(crate) struct Dep {
 }
 
 impl Dep {
+    /// Whether both read the same thing, whatever they saw.
+    fn same_key(&self, other: &Self) -> bool {
+        match (&self.key, &other.key) {
+            (DepKey::Component(a, x), DepKey::Component(b, y))
+            | (DepKey::Presence(a, x), DepKey::Presence(b, y)) => a == b && x == y,
+            (DepKey::Resource(x), DepKey::Resource(y)) => x == y,
+            (DepKey::Unregistered(x), DepKey::Unregistered(y)) => x == y,
+            (DepKey::Signal(x), DepKey::Signal(y)) => x.same_source(y),
+            _ => false,
+        }
+    }
+
     fn is_dirty(&self, world: &World, last_run: Tick, this_run: Tick) -> bool {
         let ticks = match &self.key {
             &DepKey::Component(entity, id) => world
@@ -196,11 +210,7 @@ impl Dep {
                     .is_ok_and(|entity| entity.contains_id(id));
                 return present != self.present;
             }
-            &DepKey::Resource(id) => world
-                .resource_entities()
-                .get(id)
-                .and_then(|entity| world.get_entity(entity).ok())
-                .and_then(|entity| entity.get_change_ticks_by_id(id)),
+            &DepKey::Resource(id) => invalidation::resource_ticks(world, id),
             DepKey::Signal(signal) => return signal.is_dirty(),
             &DepKey::Unregistered(type_id) => {
                 return world.components().get_id(type_id).is_some();
@@ -282,12 +292,14 @@ struct Slot {
     deps: Vec<Dep>,
     last_run: Option<Tick>,
     cleanup: Option<Cleanup>,
+    /// Subscription of the latest run to what it read.
+    link: Option<Arc<Link>>,
 }
 
 /// Effects owned by an entity, inserted by `effect`, `computed`, `coat!`
 /// regions and `webby` components.
 #[derive(Component, Default)]
-#[component(on_add = register_host, on_remove = unregister_host)]
+#[component(on_remove = unregister_host)]
 pub struct Effects(Vec<Slot>);
 
 /// Runs `cleanups` with commands applied to `world` right away.
@@ -353,27 +365,7 @@ fn poll_tasks(world: &World) -> usize {
     finished
 }
 
-/// Every effect host, plus the hosts added since the current pass started.
-#[derive(Resource, Default)]
-struct EffectHosts {
-    all: EntityHashSet,
-    fresh: Vec<Entity>,
-    /// Hosts with at least one [`Phase::PostLayout`] effect.
-    post_layout: EntityHashSet,
-}
-
-fn register_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
-        hosts.all.insert(context.entity);
-        hosts.fresh.push(context.entity);
-    }
-}
-
 fn unregister_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
-        hosts.all.remove(&context.entity);
-        hosts.post_layout.remove(&context.entity);
-    }
     let cleanups: Vec<Cleanup> = world
         .get_mut::<Effects>(context.entity)
         .map(|mut effects| {
@@ -401,60 +393,83 @@ fn depth(world: &World, mut entity: Entity) -> usize {
     depth
 }
 
-/// Runs every dirty effect of `phase` once. Returns the number of effects
-/// that ran.
+/// What one call of [`run_effects`] did.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Outcome {
+    /// Effects, cleanups and `webby` effects that ran.
+    pub(crate) ran: usize,
+    /// Hosts whose dependencies were checked.
+    pub(crate) checked: usize,
+}
+
+/// Runs every dirty effect of `phase` once.
 ///
-/// Hosts run parent-first, so a parent that re-renders despawns stale
-/// children before they run. Hosts spawned during a main pass (child
-/// components and nested regions) run in the same pass, so a pass settles a
-/// whole tree rather than one level of it. Hosts spawned during a
-/// post-layout pass wait for the next main pass.
-pub(crate) fn run_effects(world: &mut World, phase: Phase) -> usize {
+/// Only hosts queued by a write since they last ran are checked (see
+/// [`invalidation`]). Hosts run parent-first, so a parent that re-renders
+/// despawns stale children before they run. In a main pass, hosts queued
+/// while the pass runs, such as hosts spawned by it (child components and
+/// nested regions) or hosts reading what an earlier effect wrote, run in
+/// the same pass, so a pass settles a whole tree rather than one level of
+/// it; a host already checked in the pass waits for the next. Hosts queued
+/// during a post-layout pass wait for the next pass.
+pub(crate) fn run_effects(world: &mut World, phase: Phase) -> Outcome {
     if phase == Phase::Main {
         // Finished tasks notify their hosts, which then run below.
         poll_tasks(world);
     }
-    let mut queue: Vec<Entity> = {
-        let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() else {
-            return 0;
-        };
-        match phase {
-            Phase::Main => {
-                hosts.fresh.clear();
-                hosts.all.iter().copied().collect()
-            }
-            Phase::PostLayout => hosts.post_layout.iter().copied().collect(),
-        }
+    let Some(shared) = world
+        .get_resource::<Invalidation>()
+        .map(|invalidation| Arc::clone(&invalidation.0))
+    else {
+        return Outcome::default();
     };
-    queue.sort_by_cached_key(|&host| depth(world, host));
-    let mut ran = run_unmounted(world);
-    let mut next = 0;
-    while next < queue.len() {
-        let host = queue[next];
-        next += 1;
-        ran += run_host(world, host, phase);
-        if phase == Phase::Main {
-            let fresh = std::mem::take(&mut world.resource_mut::<EffectHosts>().fresh);
-            queue.extend(fresh);
-        }
+    invalidation::unpark(world, &shared);
+    if phase == Phase::Main || shared.has_post_links() {
+        invalidation::scan(world, &shared);
     }
-    ran += run_unmounted(world);
+    let mut outcome = Outcome {
+        ran: run_unmounted(world),
+        checked: 0,
+    };
+    let mut pass = Pass::new(phase);
+    pass.collect(world, &shared);
+    loop {
+        let mut ran = 0;
+        while let Some(host) = pass.pop() {
+            outcome.checked += 1;
+            ran += run_host(world, &shared, host, phase);
+            if phase == Phase::Main {
+                pass.collect(world, &shared);
+            }
+        }
+        outcome.ran += ran;
+        if phase == Phase::PostLayout || ran == 0 {
+            break;
+        }
+        // Effects may have written component values that hosts not yet
+        // checked in this pass read.
+        invalidation::scan(world, &shared);
+        pass.collect(world, &shared);
+    }
+    pass.finish(&shared);
+    outcome.ran += run_unmounted(world);
     let post = world
         .get_resource_mut::<PostEffects>()
         .map(|mut post| std::mem::take(&mut post.0))
         .unwrap_or_default();
     for effect in post.into_iter().rev() {
         effect(world);
-        ran += 1;
+        outcome.ran += 1;
     }
-    ran
+    outcome
 }
 
-fn run_host(world: &mut World, host: Entity, phase: Phase) -> usize {
+fn run_host(world: &mut World, shared: &Arc<Shared>, host: Entity, phase: Phase) -> usize {
     let Ok(mut entity) = world.get_entity_mut(host) else {
         return 0;
     };
     if entity.contains::<Disabled>() {
+        shared.park(host, phase);
         return 0;
     }
     let Some(mut effects) = entity.get_mut::<Effects>() else {
@@ -484,9 +499,29 @@ fn run_host(world: &mut World, host: Entity, phase: Phase) -> usize {
         world.increment_change_tick();
         let tick = world.read_change_tick();
         let result = (slot.run)(world, host);
+        // A run that read the same things as the previous one keeps its
+        // subscriptions; otherwise replacing the link unsubscribes it.
+        let same = slot.link.is_some()
+            && result.deps.len() == slot.deps.len()
+            && result
+                .deps
+                .iter()
+                .zip(&slot.deps)
+                .all(|(new, old)| new.same_key(old));
         slot.deps = result.deps;
         slot.cleanup = result.cleanup;
         slot.last_run = Some(tick);
+        if !same {
+            let link = Link::new(host, phase, shared);
+            invalidation::subscribe(world, shared, &link, &slot.deps);
+            slot.link = Some(link);
+        }
+        // A dependency that changed after it was read but before the
+        // subscription did not mark the host; check it in the next pass.
+        let now = world.read_change_tick();
+        if slot.deps.iter().any(|dep| dep.is_dirty(world, tick, now)) {
+            shared.mark(host, phase);
+        }
         ran += 1;
         if world.get_entity(host).is_err() {
             break;
@@ -506,7 +541,7 @@ fn run_host(world: &mut World, host: Entity, phase: Phase) -> usize {
 }
 
 pub(crate) fn init(world: &mut World) {
-    world.init_resource::<EffectHosts>();
+    world.init_resource::<Invalidation>();
     world.init_resource::<PostEffects>();
     world.init_resource::<Unmounted>();
     world.init_resource::<PendingTasks>();
@@ -769,20 +804,21 @@ pub(crate) fn attach_in(context: &mut TemplateContext, run: RunFn, phase: Phase)
         deps: Vec::new(),
         last_run: None,
         cleanup: None,
+        link: None,
     };
     if let Some(mut effects) = context.entity.get_mut::<Effects>() {
         effects.0.push(slot);
     } else {
         context.entity.insert(Effects(vec![slot]));
     }
-    if phase == Phase::PostLayout {
-        let host = context.entity.id();
-        context.entity.world_scope(|world| {
-            if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
-                hosts.post_layout.insert(host);
-            }
-        });
-    }
+    // New effects run in the next pass of their phase, or in the current
+    // main pass if one is running.
+    let host = context.entity.id();
+    context.entity.world_scope(|world| {
+        if let Some(invalidation) = world.get_resource::<Invalidation>() {
+            invalidation.0.mark(host, phase);
+        }
+    });
 }
 
 /// `GhostNode` requires `Transform`, but UI nodes never have a

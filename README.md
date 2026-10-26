@@ -530,10 +530,26 @@ snapshot per changed source, and shares it through `Arc` with every listener of 
 source. Each `watch`/`bind` creates one small subscription entity per source, owned
 by (and despawned with) its listener, and despawned when its source is despawned.
 
-`webby` components and `coat!` regions check the change ticks and signal versions of
-their recorded dependencies each pass, and do no work when nothing changed. A component
-re-render respawns its subtree, so keep components small; prefer `coat!` regions or
-`bind` for hot paths and normal systems for thousands of entities changing every frame.
+Effects, `computed`, `webby` components and `coat!` regions are invalidated by push:
+each run subscribes to what it read, and a write queues only the hosts that read it.
+A frame where nothing they read changed checks no hosts
+(`ReactiveDiagnostics::hosts_checked` is zero), however many exist.
+
+- `Signal::set` (and `update`, `notify`) queues the signal's readers right away, from any
+  thread. Memos are marked possibly stale without recomputing (Reactively-style
+  colouring); a read recomputes each stale memo at most once, so a diamond of memos
+  computes once per change and an equal result stops propagation.
+- Presence reads (`has`), inherited reads, and values of immutable components are
+  queued by `Insert`/`Remove` observers, one pair per component type read.
+- Values of mutable components and resources can change through `Mut<T>`/`ResMut<T>`,
+  which Bevy offers no hook for. The runtime scans the change ticks of exactly the
+  (entity, component) pairs and resources some effect read, once per pass, which costs
+  a few nanoseconds per pair and does not depend on how many hosts read each one.
+  Writes made by systems are seen like any other.
+
+A component re-render respawns its subtree, so keep components small; prefer `coat!`
+regions or `bind` for hot paths and normal systems for thousands of entities changing
+every frame. `BENCHMARKS.md` has measured frame costs.
 
 ## Official Bevy references
 

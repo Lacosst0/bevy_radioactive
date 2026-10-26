@@ -119,8 +119,8 @@ use std::{
     hash::Hash,
     ops::{Add, Sub},
     sync::{
-        Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError, RwLock, Weak,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -142,8 +142,44 @@ use crate::runtime::{
 // Dependency tracking
 // ---------------------------------------------------------------------------
 
+/// Told when a signal or memo it read may have changed: a memo, or one run
+/// of a runtime effect.
+pub(crate) trait Subscriber: Send + Sync {
+    /// `changed` is `true` when a signal it read changed, and `false` when a
+    /// memo it read may have changed.
+    fn mark(&self, changed: bool);
+}
+
+/// Subscribers of a signal or memo, held weakly: a dropped memo, or an
+/// effect run superseded by a newer run, is pruned as the list grows.
+#[derive(Default)]
+struct SubscriberList(Mutex<Vec<Weak<dyn Subscriber>>>);
+
+impl SubscriberList {
+    fn add(&self, subscriber: Weak<dyn Subscriber>, unique: bool) {
+        let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if unique && list.iter().any(|other| Weak::ptr_eq(other, &subscriber)) {
+            return;
+        }
+        if list.len() == list.capacity() {
+            list.retain(|other| other.strong_count() > 0);
+        }
+        list.push(subscriber);
+    }
+
+    /// Marks every live subscriber. Marks flow only from sources to their
+    /// subscribers, so holding the lock while marking cannot deadlock.
+    fn notify(&self, changed: bool) {
+        let list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for subscriber in list.iter().filter_map(Weak::upgrade) {
+            subscriber.mark(changed);
+        }
+    }
+}
+
 trait Versioned: Send + Sync {
     fn version(&self) -> u64;
+    fn subscribers(&self) -> &SubscriberList;
 }
 
 /// A signal or memo read by a tracking scope, with the version it had.
@@ -156,6 +192,15 @@ pub(crate) struct SignalDep {
 impl SignalDep {
     pub(crate) fn is_dirty(&self) -> bool {
         self.source.version() != self.version
+    }
+
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.source), Arc::as_ptr(&other.source))
+    }
+
+    /// Marks `subscriber` whenever the source changes from now on.
+    pub(crate) fn subscribe(&self, subscriber: Weak<dyn Subscriber>) {
+        self.source.subscribers().add(subscriber, false);
     }
 }
 
@@ -247,11 +292,16 @@ const MEMO_REENTERED: &str = "a `Memo` was read while it is being computed or re
 struct SignalInner<T> {
     value: RwLock<T>,
     version: AtomicU64,
+    subscribers: SubscriberList,
 }
 
 impl<T: Send + Sync> Versioned for SignalInner<T> {
     fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    fn subscribers(&self) -> &SubscriberList {
+        &self.subscribers
     }
 }
 
@@ -277,6 +327,7 @@ impl<T: Send + Sync + 'static> Signal<T> {
         Self(Arc::new(SignalInner {
             value: RwLock::new(value),
             version: AtomicU64::new(0),
+            subscribers: SubscriberList::default(),
         }))
     }
 
@@ -363,8 +414,12 @@ impl<T: Send + Sync + 'static> Signal<T> {
     }
 
     /// Marks the signal changed without modifying it.
+    ///
+    /// Readers are pushed onto the runtime's dirty queue right away, so the
+    /// next reactive pass runs only them.
     pub fn notify(&self) {
         self.0.version.fetch_add(1, Ordering::AcqRel);
+        self.0.subscribers.notify(true);
     }
 
     /// Returns `true` if both handles refer to the same signal.
@@ -434,37 +489,107 @@ struct MemoState<T> {
     version: u64,
 }
 
+// Reactively-style colours of a memo. A changed signal marks the memos that
+// read it `DIRTY` and, through them, every memo further down `CHECK`; reading
+// a memo then recomputes it only if it is `DIRTY`, or `CHECK` with a source
+// whose version moved. Each memo computes at most once per change, in source
+// order, so a diamond never sees a half-updated graph.
+const CLEAN: u8 = 0;
+const CHECK: u8 = 1;
+const DIRTY: u8 = 2;
+
 struct MemoInner<T> {
     compute: Box<dyn Fn() -> T + Send + Sync>,
     state: Mutex<MemoState<T>>,
+    color: AtomicU8,
+    subscribers: SubscriberList,
+    this: Weak<Self>,
 }
 
-impl<T: PartialEq + Send + Sync> MemoInner<T> {
+impl<T: PartialEq + Send + Sync + 'static> MemoInner<T> {
     fn cell(&self) -> usize {
         std::ptr::from_ref(self).addr()
     }
 
+    fn cached(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .value
+            .is_some()
+    }
+
     fn refresh(&self) {
-        let needs_refresh = {
-            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.value.is_none() || state.deps.iter().any(SignalDep::is_dirty)
-        };
-        if !needs_refresh {
-            return;
+        loop {
+            match self.color.load(Ordering::Acquire) {
+                CLEAN if self.cached() => return,
+                CHECK if self.cached() => {
+                    // Memo sources refresh here, in the order they were read.
+                    let changed = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .deps
+                        .iter()
+                        .any(SignalDep::is_dirty);
+                    if changed {
+                        break;
+                    }
+                    let cleared = self.color.compare_exchange(
+                        CHECK,
+                        CLEAN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    if cleared.is_ok() {
+                        return;
+                    }
+                    // Marked again while checking: look again.
+                }
+                _ => break,
+            }
         }
+        self.recompute();
+    }
+
+    fn recompute(&self) {
+        // Cleared before computing, so a source changing meanwhile marks the
+        // memo again instead of being lost.
+        self.color.store(CLEAN, Ordering::Release);
         let held = hold(self.cell(), true, MEMO_REENTERED);
         let (value, deps) = scope(|| (self.compute)());
         drop(held);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.value.as_ref() != Some(&value) {
-            state.value = Some(value);
-            state.version += 1;
+        let this: Weak<dyn Subscriber> = self.this.clone();
+        for dep in &deps {
+            dep.source.subscribers().add(this.clone(), true);
         }
-        state.deps = deps;
+        // A source that changed between being read and the subscription
+        // above did not mark this memo.
+        let outdated = deps.iter().any(SignalDep::is_dirty);
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.value.as_ref() != Some(&value) {
+                state.value = Some(value);
+                state.version += 1;
+            }
+            state.deps = deps;
+        }
+        if outdated {
+            self.mark(true);
+        }
     }
 }
 
-impl<T: PartialEq + Send + Sync> Versioned for MemoInner<T> {
+impl<T: PartialEq + Send + Sync + 'static> Subscriber for MemoInner<T> {
+    fn mark(&self, changed: bool) {
+        let color = if changed { DIRTY } else { CHECK };
+        if self.color.fetch_max(color, Ordering::AcqRel) == CLEAN {
+            self.subscribers.notify(false);
+        }
+    }
+}
+
+impl<T: PartialEq + Send + Sync + 'static> Versioned for MemoInner<T> {
     fn version(&self) -> u64 {
         self.refresh();
         self.state
@@ -472,10 +597,19 @@ impl<T: PartialEq + Send + Sync> Versioned for MemoInner<T> {
             .unwrap_or_else(PoisonError::into_inner)
             .version
     }
+
+    fn subscribers(&self) -> &SubscriberList {
+        &self.subscribers
+    }
 }
 
 /// A cached value derived from signals, recomputed lazily when a signal it
 /// read changes. Readers are notified only when the result differs.
+///
+/// A change marks the memos downstream of it as possibly stale (Reactively's
+/// colouring) without computing anything; the next read recomputes each
+/// stale memo at most once, so derived values never see a half-updated
+/// graph and a diamond of memos computes its bottom once per change.
 pub struct Memo<T>(Arc<MemoInner<T>>);
 
 /// Creates a [`Memo`]. Like Topcoat's `#[memoize]`, scoped to signals.
@@ -484,13 +618,16 @@ where
     T: PartialEq + Send + Sync + 'static,
     F: Fn() -> T + Send + Sync + 'static,
 {
-    Memo(Arc::new(MemoInner {
+    Memo(Arc::new_cyclic(|this| MemoInner {
         compute: Box::new(compute),
         state: Mutex::new(MemoState {
             value: None,
             deps: Vec::new(),
             version: 0,
         }),
+        color: AtomicU8::new(DIRTY),
+        subscribers: SubscriberList::default(),
+        this: this.clone(),
     }))
 }
 
