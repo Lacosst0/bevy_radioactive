@@ -144,7 +144,7 @@ fn medal() -> impl Scene {
 
 ### Presence, inherited context and layout effects
 
-`Reads` has two more tracked reads:
+`Reads` has more tracked reads beyond `get`, `this` and `resource`:
 
 - `r.has::<C>(entity)` / `r.this_has::<C>()` return whether the component is there and
   depend only on that: inserting or removing `C` re-runs the reader, changing its value
@@ -154,6 +154,12 @@ fn medal() -> impl Scene {
   value by holding the component, and the nearest one wins, so a subtree can override
   it. Changing the provider's value, adding an override in between, or reparenting
   re-runs the reader. `webby` components get it as `cx.inherited::<C>()`.
+- `r.count::<M>()` returns how many entities have `M`, counted like `Query<(), With<M>>`
+  (disabled entities are left out), and re-runs the reader only when that number changes:
+  adding or removing `M`, despawning, disabling or enabling an entity with it. Changing
+  the value of an existing `M` doesn't. `r.any::<M>()` re-runs only when "is there any"
+  flips. With a [query monitor](#query-monitors) marker, `r.count::<Alive>()` counts the
+  entities matching a filter.
 
 `layout_effect(|r: &Reads, commands| ..)` is an `effect` that runs after UI layout and
 transform propagation, in `ReactiveSet::PostLayout`, so it can read this frame's
@@ -228,7 +234,7 @@ exactly the entities that match the filter, after flecs monitors. Observers on e
 term's `Add`/`Remove` re-check only the entity that changed, and entities that already
 match when the monitor is added get the marker too. `On<Add<M>>` and `On<Remove<M>>`
 observers are the "entered" and "left" callbacks, and `r.this_has::<M>()` makes the
-membership a reactive input.
+membership a reactive input; `r.count::<M>()` makes the number of matches one.
 
 ```rust
 use bevy::prelude::*;

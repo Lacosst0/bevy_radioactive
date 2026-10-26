@@ -12,7 +12,7 @@ use bevy::{
     ecs::{
         change_detection::Tick,
         component::ComponentId,
-        entity_disabling::Disabled,
+        entity_disabling::{DefaultQueryFilters, Disabled},
         lifecycle::HookContext,
         template::{EntityTemplate, Template, TemplateContext},
         world::{CommandQueue, DeferredWorld},
@@ -158,6 +158,46 @@ impl<'w> Reads<'w> {
         value
     }
 
+    /// Number of entities with component `M`, counted like
+    /// `Query<(), With<M>>` counts them (disabled entities are left out),
+    /// re-running the effect only when that number changes.
+    ///
+    /// Adding `M` to an entity, removing it, despawning an entity that has
+    /// it, or disabling or enabling such an entity re-runs the effect if the
+    /// count moved. Changing the value of an existing `M` does not. Pair it
+    /// with a marker kept by a [`Monitor`](crate::monitor::Monitor) to count
+    /// the entities matching a filter.
+    ///
+    /// ```ignore
+    /// computed(|r: &Reads| Text(format!("{} alive", r.count::<Alive>())))
+    /// ```
+    pub fn count<M: Component>(&self) -> usize {
+        let Some(id) = self.world.component_id::<M>() else {
+            self.track(DepKey::Unregistered(TypeId::of::<M>()), false);
+            return 0;
+        };
+        let count = count_with(self.world, id);
+        self.track(DepKey::Count(id, count), true);
+        count
+    }
+
+    /// Whether any entity has component `M` (disabled entities are left
+    /// out), re-running the effect only when that flips. See
+    /// [`count`](Self::count).
+    ///
+    /// ```ignore
+    /// computed(|r: &Reads| Visibility::from(r.any::<GameOver>()))
+    /// ```
+    pub fn any<M: Component>(&self) -> bool {
+        let Some(id) = self.world.component_id::<M>() else {
+            self.track(DepKey::Unregistered(TypeId::of::<M>()), false);
+            return false;
+        };
+        let any = count_with(self.world, id) > 0;
+        self.track(DepKey::Any(id, any), true);
+        any
+    }
+
     /// Untracked world access. Reads made through it do not re-run the effect.
     #[must_use]
     pub fn untracked(&self) -> &'w World {
@@ -177,6 +217,28 @@ enum DepKey {
     Resource(ComponentId),
     Unregistered(TypeId),
     Signal(crate::coat::SignalDep),
+    /// How many entities had the component.
+    Count(ComponentId, usize),
+    /// Whether any entity had the component.
+    Any(ComponentId, bool),
+}
+
+/// Entities with component `id` that default queries see.
+fn count_with(world: &World, id: ComponentId) -> usize {
+    let filters = world.get_resource::<DefaultQueryFilters>();
+    world
+        .archetypes()
+        .iter()
+        .filter(|archetype| {
+            archetype.contains(id)
+                && !filters.is_some_and(|filters| {
+                    filters
+                        .disabling_ids()
+                        .any(|disabling| disabling != id && archetype.contains(disabling))
+                })
+        })
+        .map(|archetype| archetype.len() as usize)
+        .sum()
 }
 
 #[derive(Clone)]
@@ -194,6 +256,9 @@ impl Dep {
             (DepKey::Resource(x), DepKey::Resource(y)) => x == y,
             (DepKey::Unregistered(x), DepKey::Unregistered(y)) => x == y,
             (DepKey::Signal(x), DepKey::Signal(y)) => x.same_source(y),
+            (DepKey::Count(x, _), DepKey::Count(y, _)) | (DepKey::Any(x, _), DepKey::Any(y, _)) => {
+                x == y
+            }
             _ => false,
         }
     }
@@ -212,6 +277,8 @@ impl Dep {
             }
             &DepKey::Resource(id) => invalidation::resource_ticks(world, id),
             DepKey::Signal(signal) => return signal.is_dirty(),
+            &DepKey::Count(id, count) => return count_with(world, id) != count,
+            &DepKey::Any(id, any) => return (count_with(world, id) > 0) != any,
             &DepKey::Unregistered(type_id) => {
                 return world.components().get_id(type_id).is_some();
             }

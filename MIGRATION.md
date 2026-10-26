@@ -23,7 +23,7 @@ signal reads in `coat!`, `ReactiveDiagnostics`, `ReactiveSet::Settled`, and the
 (`Reads::has`/`this_has`), hierarchy-inherited components (`Reads::inherited`),
 `layout_effect` with `ReactiveSet::PostLayout`, `Selection`/`Selected` with
 `SelectCommandsExt`/`SelectEntityCommandsExt`, and query monitors
-(`Monitor`, `MonitorAppExt::add_monitor`), and with the new `widgets` feature, two-way
+(`Monitor`, `MonitorAppExt::add_monitor`), entity-count reads (`Reads::count`, `Reads::any`), and with the new `widgets` feature, two-way
 widget binding (`bind_slider`, `bind_checkbox`, `bind_tabs`, `bind_radio`,
 `bind_widget`, `bind_widget_with`). `coat!` loops can bind an item signal
 (`#[key(..)] for $item in ..` / `for $item in ..`) so rows patch in place, `coat::Value<T>`

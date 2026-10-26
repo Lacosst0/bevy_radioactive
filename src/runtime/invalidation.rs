@@ -7,7 +7,7 @@
 //!
 //! - Signals and memos hold the links weakly and mark them on `set`
 //!   ([`Subscriber`]). Memos propagate marks with Reactively colouring.
-//! - Presence and component reads are marked by `Insert` and
+//! - Presence, `count`/`any` and component reads are marked by `Insert` and
 //!   `Remove` observers, installed once per component type read.
 //! - Values of mutable components and resources can change through `Mut<T>`
 //!   or `ResMut<T>`, which have no hook. They are found by scanning the
@@ -33,7 +33,7 @@ use bevy::{
         change_detection::Tick,
         component::{ComponentId, ComponentInfo},
         entity::EntityHashMap,
-        entity_disabling::Disabled,
+        entity_disabling::{DefaultQueryFilters, Disabled},
         lifecycle::{InsertEvent, RemoveEvent},
     },
     platform::collections::{HashMap, HashSet, hash_map::Entry},
@@ -181,8 +181,12 @@ struct Index {
     scanned: Vec<(Entity, ComponentId)>,
     resources: HashMap<ComponentId, ResourceWatch>,
     unregistered: Vec<(TypeId, Weak<Link>)>,
+    /// Runs that read how many entities have a component.
+    counts: HashMap<ComponentId, Vec<Weak<Link>>>,
     /// Component types with change observers.
     observed: HashSet<ComponentId>,
+    /// Observed disabling components, which change what `count` sees.
+    disabling: Vec<ComponentId>,
     last_scan: Tick,
     sweep_at: usize,
 }
@@ -192,6 +196,14 @@ impl Index {
         if let Some(watchers) = self.components.get(&(entity, id)) {
             mark_all(&watchers.value);
             mark_all(&watchers.presence);
+        }
+        if let Some(links) = self.counts.get(&id) {
+            mark_all(links);
+        }
+        if self.disabling.contains(&id) {
+            for links in self.counts.values() {
+                mark_all(links);
+            }
         }
     }
 
@@ -211,6 +223,10 @@ impl Index {
             components
                 .get(pair)
                 .is_some_and(|watchers| watchers.scanned)
+        });
+        self.counts.retain(|_, links| {
+            links.retain(alive);
+            !links.is_empty()
         });
         self.sweep_at = (self.components.len() * 2).max(1024);
     }
@@ -267,6 +283,23 @@ pub(crate) fn subscribe(world: &mut World, shared: &Arc<Shared>, link: &Arc<Link
                 }
                 &DepKey::Unregistered(type_id) => index.unregistered.push((type_id, weak.clone())),
                 DepKey::Signal(signal) => signal.subscribe(weak.clone()),
+                &DepKey::Count(id, _) | &DepKey::Any(id, _) => {
+                    push(index.counts.entry(id).or_default(), weak.clone());
+                    if index.observed.insert(id) {
+                        observe.push(id);
+                    }
+                    // Disabling or enabling an entity changes what it counts.
+                    if let Some(filters) = world.get_resource::<DefaultQueryFilters>() {
+                        for disabling in filters.disabling_ids() {
+                            if index.observed.insert(disabling) {
+                                observe.push(disabling);
+                            }
+                            if !index.disabling.contains(&disabling) {
+                                index.disabling.push(disabling);
+                            }
+                        }
+                    }
+                }
             }
         }
         index.sweep();
