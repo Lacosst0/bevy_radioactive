@@ -1065,13 +1065,29 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
             #[allow(clippy::needless_pass_by_value)]
             #render_sig #block
 
-            let __props = (#(#captured,)*);
+            let __props = ::std::sync::Arc::new((#(#captured,)*));
+            let __memo = ::std::sync::Arc::clone(&__props);
             #webby::component_with(
                 (#(#entities,)*),
                 move |__cx: &#webby::Cx, (#(#entities,)*): (#(#entity_types,)*)| {
                     #[allow(unused_variables)]
-                    let (#(#captured,)*) = &__props;
+                    let (#(#captured,)*) = &*__props;
                     #render_call
+                },
+            )
+            // A parent re-render skips this component when its props are
+            // unchanged, if they are all `PartialEq`.
+            .__memo(
+                __memo,
+                |__old, __new| {
+                    #[allow(unused_imports)]
+                    use #webby::{__ProbeEq as _, __ProbeOpaque as _};
+                    (&#webby::__Probe(__old, __new)).__props_eq()
+                },
+                |__old, __new| {
+                    #[allow(unused_imports)]
+                    use #webby::{__ProbeEq as _, __ProbeOpaque as _};
+                    (&#webby::__Probe(__old, __new)).__props_eq()
                 },
             )
         }

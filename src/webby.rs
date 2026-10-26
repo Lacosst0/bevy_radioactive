@@ -75,7 +75,8 @@
 //!   `#[entity] leader: Option<Entity>` or `#[entity] members: Vec<Entity>`
 //!   (any type that implements [`Deps`]).
 //! - Other props must be `Clone + Send + Sync + 'static`; they are cloned
-//!   into each render.
+//!   into each render. When every prop is also `PartialEq`, a parent
+//!   re-render with equal props does not re-render the component.
 //! - `-> impl Scene` never borrows from `cx`; the macro adds `use<..>`.
 //! - A component may return `Result<impl Scene>`. An error goes to Bevy's
 //!   fallback error handler, named after the component, and the component
@@ -92,13 +93,28 @@
 //! - The rendered scene is a child of the component's entity. An entity
 //!   without a UI `Node` becomes a `GhostNode` (with the `ui` feature), so
 //!   `@counter(5)` can be a list item without affecting layout.
-//! - A render replaces the rendered subtree. Child components keep their
-//!   hook state across parent renders, like React keeps component
-//!   instances. A child is matched by its key, or else by the source
-//!   location of its `@name(..)` call and how many components that location
-//!   created earlier in the render, so a conditional sibling does not shift
-//!   anyone's state. Key components created in loops. Plain entities in the
-//!   subtree are recreated.
+//! - A render reconciles child components with the previous render, like
+//!   React keeps component instances. A child is matched by its key, or
+//!   else by the source location of its `@name(..)` call and how many
+//!   components that location created earlier in the render, so a
+//!   conditional sibling does not shift anyone's state. Key components
+//!   created in loops.
+//! - A matched child keeps its host entity, its hook state and its rendered
+//!   subtree: the host is moved into the parent's new scene in place of the
+//!   entity spawned for it. It renders again only if its props changed
+//!   (`React.memo`): a `#[component]` whose props are all `PartialEq`
+//!   (including `Entity` props, and [`Signal`]s, which compare by identity)
+//!   is skipped when they are equal; one with a prop that is not
+//!   `PartialEq`, and closures mounted with [`component`](fn@component),
+//!   render again with every parent render. Children that the new render no
+//!   longer includes are despawned and unmount.
+//! - Plain entities in the parent's subtree are recreated. Components,
+//!   effects, observers and children declared beside a kept child (as in
+//!   `@row(id) Node { .. }`) are moved onto its host from the new scene,
+//!   replacing those of the previous render; a component type the new scene
+//!   no longer declares there stays on the host. A child that skips its
+//!   render does not see a changed non-signal context value; provide a
+//!   [`Signal`] for context that changes.
 //! - Hooks must be called in the same order on every render.
 //! - Renders run in [`ReactiveSet::Publish`], before UI layout, so state set
 //!   by an observer or system earlier in the frame is shown the same frame.
@@ -129,9 +145,11 @@ use bevy::{
 
 use bevy::tasks::{AsyncComputeTaskPool, Task, TaskPool, futures::check_ready};
 
+use bevy::ecs::observer::ObservedBy;
+
 use crate::runtime::{
-    PendingTasks, PollTask, PostEffects, RunFn, Unmounted, attach, ensure_runtime, spawn_child,
-    tracked,
+    PendingTasks, PollTask, PostEffects, RunFn, Unmounted, adopt_effects, attach_component,
+    ensure_runtime, spawn_child, tracked,
 };
 pub use crate::{
     coat::{Signal, cloned},
@@ -185,6 +203,65 @@ struct Instance {
     /// Effect cleanups and `on_unmount` callbacks, run when dropped.
     cleanups: Mutex<Vec<CleanupCell>>,
     unmounted: Unmounted,
+    /// The entity hosting the component, once its render loop first ran.
+    host: Mutex<Option<Entity>>,
+    /// The root entity of the latest render's scene.
+    rendered: Mutex<Option<Entity>>,
+    /// Observers the parent's scene declared on the host, replaced when a
+    /// parent re-render keeps the host.
+    observers: Mutex<Vec<Entity>>,
+    /// The latest [`Props`], type-erased.
+    props: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
+    /// Notified when a parent render replaces `props`; read by every render.
+    props_changed: Signal<()>,
+    /// Child instances kept by the render in progress, with the entity the
+    /// new scene spawned for each; their hosts take those entities' places.
+    adopt: Mutex<Vec<(Entity, Arc<Instance>)>>,
+}
+
+/// What a mounted component renders from: its render function, its
+/// resolved entity props, and the props compared to skip a re-render.
+struct Props<F, O> {
+    render: F,
+    deps: O,
+    memo: Option<PropsMemo>,
+}
+
+type DynEq = Arc<dyn Fn(&dyn Any, &dyn Any) -> bool + Send + Sync>;
+
+/// Captured props of a `#[component]` call, compared by `PartialEq` when a
+/// parent re-render keeps the component.
+#[derive(Clone)]
+struct PropsMemo {
+    props: Arc<dyn Any + Send + Sync>,
+    props_eq: DynEq,
+    deps_eq: DynEq,
+}
+
+impl PropsMemo {
+    /// Whether `self` and `deps` render the same as `old` and `old_deps`.
+    fn same(&self, old: &Self, deps: &dyn Any, old_deps: &dyn Any) -> bool {
+        (self.props_eq)(&*old.props, &*self.props) && (self.deps_eq)(old_deps, deps)
+    }
+}
+
+/// Erases `eq`; `None` (props that are not `PartialEq`) counts as changed.
+fn erase_eq<T: 'static>(eq: fn(&T, &T) -> Option<bool>) -> DynEq {
+    Arc::new(
+        move |old, new| match (old.downcast_ref::<T>(), new.downcast_ref::<T>()) {
+            (Some(old), Some(new)) => eq(old, new) == Some(true),
+            _ => false,
+        },
+    )
+}
+
+/// The child instance a `Mount` resolved to.
+struct Mounted {
+    instance: Arc<Instance>,
+    /// The component rendering it, if any.
+    parent: Option<Arc<Instance>>,
+    /// Whether the parent's previous render created it.
+    reused: bool,
 }
 
 impl Instance {
@@ -196,12 +273,36 @@ impl Instance {
             contexts: Mutex::default(),
             cleanups: Mutex::default(),
             unmounted,
+            host: Mutex::default(),
+            rendered: Mutex::default(),
+            observers: Mutex::default(),
+            props: Mutex::default(),
+            props_changed: Signal::new(()),
+            adopt: Mutex::default(),
         })
     }
 
+    fn host(&self) -> Option<Entity> {
+        *lock(&self.host)
+    }
+
+    /// The latest props, if they are of type `Props<F, O>`.
+    fn props<F, O>(&self) -> Option<Arc<Props<F, O>>>
+    where
+        F: Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        lock(&self.props).clone()?.downcast().ok()
+    }
+
     /// Returns the instance for the next child mounted during a render,
-    /// reusing the one from the previous render with the same key.
-    fn child(self: &Arc<Self>, key: Option<u64>, site: &'static Location<'static>) -> Arc<Self> {
+    /// reusing the one from the previous render with the same key, and
+    /// whether it was reused.
+    fn child(
+        self: &Arc<Self>,
+        key: Option<u64>,
+        site: &'static Location<'static>,
+    ) -> (Arc<Self>, bool) {
         let mut slots = lock(&self.children);
         let key = if let Some(key) = key {
             ChildKey::Key(key)
@@ -213,12 +314,12 @@ impl Instance {
                 nth: *nth - 1,
             }
         };
-        let instance = slots
-            .previous
-            .remove(&key)
+        let previous = slots.previous.remove(&key);
+        let reused = previous.is_some();
+        let instance = previous
             .unwrap_or_else(|| Self::new(Some(Arc::downgrade(self)), self.unmounted.clone()));
         slots.current.insert(key, Arc::clone(&instance));
-        instance
+        (instance, reused)
     }
 }
 
@@ -253,13 +354,23 @@ fn instance_for(
     key: Option<u64>,
     site: &'static Location<'static>,
     unmounted: Unmounted,
-) -> Arc<Instance> {
-    RENDERING
-        .with(|stack| stack.borrow().last().cloned())
-        .map_or_else(
-            || Instance::new(None, unmounted),
-            |parent| parent.child(key, site),
-        )
+) -> Mounted {
+    let parent = RENDERING.with(|stack| stack.borrow().last().cloned());
+    match parent {
+        Some(parent) => {
+            let (instance, reused) = parent.child(key, site);
+            Mounted {
+                instance,
+                parent: Some(parent),
+                reused,
+            }
+        }
+        None => Mounted {
+            instance: Instance::new(None, unmounted),
+            parent: None,
+            reused: false,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,11 +790,16 @@ impl<T> Clone for Ref<T> {
 /// Adding or removing a conditional sibling therefore does not move another
 /// component's state; components created in a loop still match by position
 /// and should be keyed.
+///
+/// When a parent re-renders, a matched component keeps its host entity and
+/// renders again only if its props changed; see the
+/// [module docs](self#rendering-model).
 pub struct Mount<D, F> {
     deps: D,
     key: Option<u64>,
     site: &'static Location<'static>,
     render: F,
+    memo: Option<PropsMemo>,
 }
 
 impl<D, F> Mount<D, F> {
@@ -692,6 +808,27 @@ impl<D, F> Mount<D, F> {
     #[must_use]
     pub fn key(mut self, key: impl Hash) -> Self {
         self.key = Some(FixedState::default().hash_one(key));
+        self
+    }
+}
+
+impl<D: Deps, F> Mount<D, F> {
+    /// Lets a parent re-render skip re-rendering this component when
+    /// `props_eq` and `deps_eq` find its props unchanged. Generated by
+    /// `#[component]`; `None` from either means "changed".
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __memo<P: Send + Sync + 'static>(
+        mut self,
+        props: Arc<P>,
+        props_eq: fn(&P, &P) -> Option<bool>,
+        deps_eq: fn(&D::Output, &D::Output) -> Option<bool>,
+    ) -> Self {
+        self.memo = Some(PropsMemo {
+            props,
+            props_eq: erase_eq(props_eq),
+            deps_eq: erase_eq(deps_eq),
+        });
         self
     }
 }
@@ -715,9 +852,42 @@ where
         let unmounted = context
             .entity
             .world_scope(|world| world.resource::<Unmounted>().clone());
-        let instance = instance_for(self.key, self.site, unmounted);
-        let run = render_loop(instance, self.render.clone(), deps);
-        attach(context, run);
+        let Mounted {
+            instance,
+            parent,
+            reused,
+        } = instance_for(self.key, self.site, unmounted);
+        let props = Arc::new(Props {
+            render: self.render.clone(),
+            deps,
+            memo: self.memo.clone(),
+        });
+        // A component the parent's previous render created keeps its host:
+        // the parent moves the host into this entity's place once its scene
+        // has spawned, and the host re-renders only if its props changed.
+        if let Some(parent) = parent
+            && reused
+            && let Some(host) = instance.host()
+            && context.entity.world_scope(|world| {
+                world
+                    .get_entity(host)
+                    .is_ok_and(|host| host.contains::<Effects>())
+            })
+            && let Some(old) = instance.props::<F, D::Output>()
+        {
+            let same = match (&props.memo, &old.memo) {
+                (Some(new), Some(old_memo)) => new.same(old_memo, &props.deps, &old.deps),
+                _ => false,
+            };
+            if !same {
+                *lock(&instance.props) = Some(props);
+                instance.props_changed.notify();
+            }
+            lock(&parent.adopt).push((context.entity.id(), instance));
+            return Ok(EmptySceneEffect);
+        }
+        *lock(&instance.props) = Some(props);
+        attach_component(context, render_loop::<D::Output, F>(instance));
         Ok(EmptySceneEffect)
     }
 
@@ -727,6 +897,7 @@ where
             key: self.key,
             site: self.site,
             render: self.render.clone(),
+            memo: self.memo.clone(),
         }
     }
 }
@@ -746,18 +917,26 @@ where
     }
 }
 
-fn render_loop<O, F>(instance: Arc<Instance>, render: F, deps: O) -> RunFn
+fn render_loop<O, F>(instance: Arc<Instance>) -> RunFn
 where
     O: Clone + Send + Sync + 'static,
     F: Render<O>,
 {
-    let mut child: Option<Entity> = None;
     let mut mounted = false;
     Box::new(move |world: &mut World, target| {
         if !mounted {
             mounted = true;
+            *lock(&instance.host) = Some(target);
+            // Effects have not run yet, so these were declared by the scene.
+            *lock(&instance.observers) = world
+                .get::<ObservedBy>(target)
+                .map(|observers| observers.get().to_vec())
+                .unwrap_or_default();
             make_layout_transparent(world, target);
         }
+        let Some(props) = instance.props::<F, O>() else {
+            return Vec::new().into();
+        };
         let ((scene, effects), read_deps) = tracked(world, target, |reads| {
             let cx = Cx {
                 reads,
@@ -765,13 +944,11 @@ where
                 hook: Cell::new(0),
                 effects: RefCell::default(),
             };
-            let scene = render.render(&cx, deps.clone());
+            instance.props_changed.with(|()| {});
+            let scene = props.render.render(&cx, props.deps.clone());
             (scene, cx.effects.into_inner())
         });
 
-        if let Some(old) = child.take() {
-            world.despawn(old);
-        }
         {
             let mut slots = lock(&instance.children);
             slots.previous = std::mem::take(&mut slots.current);
@@ -779,8 +956,29 @@ where
         }
         RENDERING.with(|stack| stack.borrow_mut().push(Arc::clone(&instance)));
         let guard = RenderingGuard;
-        child = spawn_child(world, target, scene);
+        let mut child = spawn_child(world, target, scene);
         drop(guard);
+
+        // Kept children move into the new scene. Nested ones were mounted
+        // after their ancestors, so they move first and travel with them.
+        let adopted = std::mem::take(&mut *lock(&instance.adopt));
+        let mut kept = Vec::with_capacity(adopted.len());
+        for (spawned, kid) in adopted.into_iter().rev() {
+            if let Some(host) = adopt(world, spawned, &kid) {
+                if child == Some(spawned) {
+                    child = Some(host);
+                }
+                kept.push(host);
+            }
+        }
+        let old = std::mem::replace(&mut *lock(&instance.rendered), child);
+        if let Some(old) = old
+            && Some(old) != child
+            && !kept.contains(&old)
+            && world.get_entity(old).is_ok()
+        {
+            world.despawn(old);
+        }
         // Children that were not rendered again unmount with their state.
         lock(&instance.children).previous.clear();
 
@@ -799,6 +997,85 @@ where
         }
         read_deps.into()
     })
+}
+
+/// Moves the host of the kept child instance `kid` into the place of
+/// `spawned`, the entity the parent's new scene spawned for it, and
+/// despawns `spawned`. Returns the host.
+///
+/// The host keeps its entity, rendered subtree and hook state. What the
+/// parent's new scene declared beside the component replaces what its
+/// previous scene declared: components are moved over (overwriting those
+/// of the same type), and effects, observers and children are swapped.
+/// Components the previous scene declared and the new one does not are
+/// left in place.
+fn adopt(world: &mut World, spawned: Entity, kid: &Instance) -> Option<Entity> {
+    let host = kid.host()?;
+    if world.get_entity(spawned).is_err() || world.get_entity(host).is_err() {
+        return None;
+    }
+    let rendered = *lock(&kid.rendered);
+    adopt_effects(world, spawned, host);
+
+    // Children declared beside the component.
+    let stale: Vec<Entity> = world
+        .get::<Children>(host)
+        .map(|children| {
+            children
+                .iter()
+                .filter(|&child| Some(child) != rendered)
+                .collect()
+        })
+        .unwrap_or_default();
+    for child in stale {
+        world.despawn(child);
+    }
+    let declared: Vec<Entity> = world
+        .get::<Children>(spawned)
+        .map(|children| children.iter().collect())
+        .unwrap_or_default();
+    if !declared.is_empty() {
+        world.entity_mut(host).insert_children(0, &declared);
+    }
+
+    // Observers declared beside the component.
+    let observers = world
+        .get::<ObservedBy>(spawned)
+        .map(|observers| observers.get().to_vec())
+        .unwrap_or_default();
+    let add_observers = !observers.is_empty();
+    for observer in std::mem::replace(&mut *lock(&kid.observers), observers) {
+        if world.get_entity(observer).is_ok() {
+            world.despawn(observer);
+        }
+    }
+
+    world
+        .entity_mut(spawned)
+        .clone_with_opt_out(host, move |builder| {
+            builder
+                .deny::<(ChildOf, Children, Effects)>()
+                .move_components(true)
+                .add_observers(add_observers);
+        });
+
+    match world.get::<ChildOf>(spawned).map(ChildOf::parent) {
+        Some(parent) => {
+            let index = world
+                .get::<Children>(parent)
+                .and_then(|children| children.iter().position(|child| child == spawned));
+            let mut parent = world.entity_mut(parent);
+            match index {
+                Some(index) => parent.insert_children(index, &[host]),
+                None => parent.add_child(host),
+            };
+        }
+        None => {
+            world.entity_mut(host).remove::<ChildOf>();
+        }
+    }
+    world.despawn(spawned);
+    Some(host)
 }
 
 #[cfg(feature = "ui")]
@@ -842,6 +1119,35 @@ where
         key: None,
         site: Location::caller(),
         render,
+        memo: None,
+    }
+}
+
+/// Compares two props values with `PartialEq` when their type has it, through
+/// autoref specialisation: `(&__Probe(a, b)).__props_eq()` is `Some(a == b)`
+/// for `PartialEq` types and `None` otherwise. Used by `#[component]`.
+#[doc(hidden)]
+pub struct __Probe<'a, T>(pub &'a T, pub &'a T);
+
+#[doc(hidden)]
+pub trait __ProbeEq {
+    fn __props_eq(&self) -> Option<bool>;
+}
+
+impl<T: PartialEq> __ProbeEq for __Probe<'_, T> {
+    fn __props_eq(&self) -> Option<bool> {
+        Some(self.0 == self.1)
+    }
+}
+
+#[doc(hidden)]
+pub trait __ProbeOpaque {
+    fn __props_eq(&self) -> Option<bool>;
+}
+
+impl<T> __ProbeOpaque for &__Probe<'_, T> {
+    fn __props_eq(&self) -> Option<bool> {
+        None
     }
 }
 

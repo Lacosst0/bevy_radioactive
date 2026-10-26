@@ -465,6 +465,18 @@ impl<T> Clone for Signal<T> {
     }
 }
 
+/// Handles are equal when they refer to the same signal (see
+/// [`ptr_eq`](Signal::ptr_eq)), whatever its value. This lets a `webby`
+/// component that takes a signal prop skip re-rendering when its parent
+/// re-renders with the same signal.
+impl<T> PartialEq for Signal<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for Signal<T> {}
+
 impl<T: Default + Send + Sync + 'static> Default for Signal<T> {
     fn default() -> Self {
         Self::new(T::default())
@@ -675,6 +687,15 @@ impl<T> Clone for Memo<T> {
     }
 }
 
+/// Handles are equal when they refer to the same memo, like [`Signal`].
+impl<T> PartialEq for Memo<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for Memo<T> {}
+
 // ---------------------------------------------------------------------------
 // Value
 // ---------------------------------------------------------------------------
@@ -763,6 +784,18 @@ impl<T: Clone> Clone for Value<T> {
             Self::Const(value) => Self::Const(value.clone()),
             Self::Signal(signal) => Self::Signal(signal.clone()),
             Self::Memo(memo) => Self::Memo(memo.clone()),
+        }
+    }
+}
+
+/// Constants compare by value; signals and memos by identity.
+impl<T: PartialEq> PartialEq for Value<T> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Const(a), Self::Const(b)) => a == b,
+            (Self::Signal(a), Self::Signal(b)) => a == b,
+            (Self::Memo(a), Self::Memo(b)) => a == b,
+            _ => false,
         }
     }
 }

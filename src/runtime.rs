@@ -361,6 +361,8 @@ struct Slot {
     cleanup: Option<Cleanup>,
     /// Subscription of the latest run to what it read.
     link: Option<Arc<Link>>,
+    /// The render loop of the `webby` component hosted by the entity.
+    component: bool,
 }
 
 /// Effects owned by an entity, inserted by `effect`, `computed`, `coat!`
@@ -859,12 +861,22 @@ pub(crate) fn ensure_runtime(context: &mut TemplateContext) -> Result {
 }
 
 /// Adds an effect to the entity being built.
+#[cfg(feature = "widgets")]
 pub(crate) fn attach(context: &mut TemplateContext, run: RunFn) {
-    attach_in(context, run, Phase::Main);
+    attach_slot(context, run, Phase::Main, false);
+}
+
+/// Adds the render loop of a `webby` component to the entity being built.
+pub(crate) fn attach_component(context: &mut TemplateContext, run: RunFn) {
+    attach_slot(context, run, Phase::Main, true);
 }
 
 /// Adds an effect that runs in `phase` to the entity being built.
 pub(crate) fn attach_in(context: &mut TemplateContext, run: RunFn, phase: Phase) {
+    attach_slot(context, run, phase, false);
+}
+
+fn attach_slot(context: &mut TemplateContext, run: RunFn, phase: Phase, component: bool) {
     let slot = Slot {
         run,
         phase,
@@ -872,6 +884,7 @@ pub(crate) fn attach_in(context: &mut TemplateContext, run: RunFn, phase: Phase)
         last_run: None,
         cleanup: None,
         link: None,
+        component,
     };
     if let Some(mut effects) = context.entity.get_mut::<Effects>() {
         effects.0.push(slot);
@@ -886,6 +899,41 @@ pub(crate) fn attach_in(context: &mut TemplateContext, run: RunFn, phase: Phase)
             invalidation.0.mark(host, phase);
         }
     });
+}
+
+/// Gives `host` the effects of `from` in place of its own, keeping only the
+/// render loop of the component it hosts.
+///
+/// Used when a parent re-render keeps a child component's host: effects
+/// declared beside the component in the parent's new scene were attached
+/// to the newly spawned entity `from`, and replace the ones the previous
+/// scene declared.
+pub(crate) fn adopt_effects(world: &mut World, from: Entity, host: Entity) {
+    let adopted = world
+        .get_entity_mut(from)
+        .ok()
+        .and_then(|mut entity| entity.take::<Effects>())
+        .map(|effects| effects.0)
+        .unwrap_or_default();
+    let Some(mut effects) = world.get_mut::<Effects>(host) else {
+        return;
+    };
+    let slots = &mut effects.bypass_change_detection().0;
+    let mut cleanups = Vec::new();
+    slots.retain_mut(|slot| {
+        if !slot.component {
+            cleanups.extend(slot.cleanup.take());
+        }
+        slot.component
+    });
+    let phases: Vec<Phase> = adopted.iter().map(|slot| slot.phase).collect();
+    slots.extend(adopted);
+    run_cleanups(world, cleanups);
+    if let Some(invalidation) = world.get_resource::<Invalidation>() {
+        for phase in phases {
+            invalidation.0.mark(host, phase);
+        }
+    }
 }
 
 /// `GhostNode` requires `Transform`, but UI nodes never have a

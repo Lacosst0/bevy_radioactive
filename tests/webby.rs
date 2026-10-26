@@ -493,3 +493,268 @@ fn result_renders_report_errors_and_either_switches_scene_types() {
     assert_eq!(texts(&mut app), vec![(3, "left".into())]);
     assert_eq!(RENDER_ERRORS.load(Ordering::Relaxed), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Child retention: a parent re-render keeps child component hosts and skips
+// children whose props did not change.
+// ---------------------------------------------------------------------------
+
+#[derive(Resource, Clone, Default)]
+struct Step(u32);
+
+#[derive(Resource, Clone, Default)]
+struct RenderLog(Arc<std::sync::Mutex<Vec<u32>>>);
+
+impl RenderLog {
+    fn take(app: &App) -> Vec<u32> {
+        let mut log = std::mem::take(&mut *app.world().resource::<Self>().0.lock().unwrap());
+        log.sort_unstable();
+        log
+    }
+}
+
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+struct Host(u32);
+
+#[derive(EntityEvent)]
+struct Ping {
+    entity: Entity,
+}
+
+fn retention_app() -> App {
+    let mut app = app();
+    app.init_resource::<Step>()
+        .init_resource::<RenderLog>()
+        .init_resource::<Cells>();
+    app
+}
+
+/// Logs each render and exposes its state signal through `Cells`.
+#[component]
+fn row(cx: &Cx, id: u32, label: String) -> impl Scene {
+    cx.untracked()
+        .resource::<RenderLog>()
+        .0
+        .lock()
+        .unwrap()
+        .push(id);
+    let clicks = cx.use_signal(|| 0);
+    let shared = clicks.clone();
+    cx.use_effect((), move |(), commands| {
+        let shared = shared.clone();
+        commands.queue(move |world: &mut World| {
+            world.resource_mut::<Cells>().0.push((id, shared));
+        });
+    });
+    bsn! { Label({id}) Text({format!("{label} {}", clicks.get())}) }
+}
+
+#[component]
+fn rows_parent(cx: &Cx) -> impl Scene {
+    let step = cx.use_resource::<Step>().unwrap_or_default().0;
+    let rows = cx
+        .use_resource::<Order>()
+        .unwrap_or_default()
+        .0
+        .into_iter()
+        .map(|id| {
+            // Row 2's label follows the parent's state; the others are fixed.
+            let label = if id == 2 {
+                format!("step{step}")
+            } else {
+                "row".into()
+            };
+            row(id, label).key(id)
+        })
+        .collect::<Vec<_>>();
+    bsn! {
+        Node Children [
+            Label(100) Text({format!("parent {step}")})
+            --
+            Node Children [ {rows} ]
+        ]
+    }
+}
+
+/// `(id, rendered entity, host entity)` of every rendered row.
+fn rows(app: &mut App) -> Vec<(u32, Entity, Entity)> {
+    let mut rows: Vec<_> = app
+        .world_mut()
+        .query_filtered::<(Entity, &Label, &ChildOf), With<Text>>()
+        .iter(app.world())
+        .filter(|(_, label, _)| label.0 < 100)
+        .map(|(entity, label, parent)| (label.0, entity, parent.parent()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn cell_signal(app: &App, id: u32) -> Signal<i32> {
+    app.world()
+        .resource::<Cells>()
+        .0
+        .iter()
+        .find(|(cell, _)| *cell == id)
+        .map(|(_, signal)| signal.clone())
+        .unwrap()
+}
+
+#[test]
+fn a_parent_re_render_keeps_children_and_skips_unchanged_ones() {
+    let mut app = retention_app();
+    app.world_mut().resource_mut::<Order>().0 = vec![1, 2, 3];
+    app.world_mut()
+        .spawn_scene(bsn! { @rows_parent() })
+        .unwrap();
+    app.update();
+    assert_eq!(RenderLog::take(&app), vec![1, 2, 3]);
+    cell_signal(&app, 1).set(5);
+    cell_signal(&app, 2).set(7);
+    app.update();
+    assert_eq!(RenderLog::take(&app), vec![1, 2]);
+    let before = rows(&mut app);
+
+    app.world_mut().resource_mut::<Step>().0 = 1;
+    app.update();
+    // Only row 2, whose `label` prop changed, rendered again.
+    assert_eq!(RenderLog::take(&app), vec![2]);
+    assert_eq!(
+        texts(&mut app),
+        vec![
+            (1, "row 5".into()),
+            (2, "step1 7".into()),
+            (3, "row 0".into()),
+            (100, "parent 1".into()),
+        ]
+    );
+    let after = rows(&mut app);
+    // Every host is the same entity; unchanged rows kept their rendered
+    // subtree, and row 2 kept its hook state.
+    for ((id, old_rendered, old_host), (_, new_rendered, new_host)) in before.iter().zip(&after) {
+        assert_eq!(old_host, new_host, "row {id} host");
+        assert_eq!(
+            *id == 2,
+            old_rendered != new_rendered,
+            "row {id} rendered entity"
+        );
+    }
+
+    // The kept hosts were moved into the parent's new scene, in order.
+    let list = app.world().get::<ChildOf>(after[0].2).unwrap().parent();
+    let hosts: Vec<Entity> = after.iter().map(|row| row.2).collect();
+    assert_eq!(app.world().get::<Children>(list).unwrap().to_vec(), hosts);
+    let labels = app.world_mut().query::<&Label>().iter(app.world()).count();
+    assert_eq!(labels, 4);
+}
+
+#[test]
+fn children_that_went_away_are_despawned_and_others_keep_their_order() {
+    let mut app = retention_app();
+    app.world_mut().resource_mut::<Order>().0 = vec![1, 2, 3];
+    app.world_mut()
+        .spawn_scene(bsn! { @rows_parent() })
+        .unwrap();
+    app.update();
+    RenderLog::take(&app);
+    let before = rows(&mut app);
+    let host = |id: u32| before.iter().find(|row| row.0 == id).unwrap().2;
+
+    app.world_mut().resource_mut::<Order>().0 = vec![3, 1];
+    app.update();
+    assert_eq!(RenderLog::take(&app), Vec::<u32>::new());
+    assert!(app.world().get_entity(host(2)).is_err());
+    let after = rows(&mut app);
+    assert_eq!(after, vec![before[0], before[2]]);
+    let list = app.world().get::<ChildOf>(host(3)).unwrap().parent();
+    assert_eq!(
+        app.world().get::<Children>(list).unwrap().to_vec(),
+        vec![host(3), host(1)]
+    );
+    // Nothing from the previous render is left behind.
+    let labels = app.world_mut().query::<&Label>().iter(app.world()).count();
+    assert_eq!(labels, 3);
+}
+
+/// A prop type without `PartialEq`.
+#[derive(Clone)]
+struct Opaque(u32);
+
+#[component]
+fn opaque_row(cx: &Cx, value: Opaque) -> impl Scene {
+    cx.untracked()
+        .resource::<RenderLog>()
+        .0
+        .lock()
+        .unwrap()
+        .push(value.0);
+    let (count, _) = cx.use_state(|| value.0 * 10);
+    bsn! { Label(1) Text({count.to_string()}) }
+}
+
+#[component]
+fn opaque_parent(cx: &Cx) -> impl Scene {
+    let step = cx.use_resource::<Step>().unwrap_or_default().0;
+    bsn! { Node Children [ Label(100) Text({step.to_string()}) -- @opaque_row(Opaque(4)) ] }
+}
+
+#[test]
+fn props_without_partial_eq_re_render_but_keep_the_host() {
+    let mut app = retention_app();
+    app.world_mut()
+        .spawn_scene(bsn! { @opaque_parent() })
+        .unwrap();
+    app.update();
+    let before = rows(&mut app);
+    app.world_mut().resource_mut::<Step>().0 = 1;
+    app.update();
+    assert_eq!(RenderLog::take(&app), vec![4, 4]);
+    let after = rows(&mut app);
+    assert_eq!(before[0].2, after[0].2);
+    assert_eq!(texts(&mut app)[0], (1, "40".into()));
+}
+
+#[derive(Resource, Clone, Default)]
+struct Hits(Arc<AtomicUsize>);
+
+#[component]
+fn decorated_parent(cx: &Cx) -> impl Scene {
+    let step = cx.use_resource::<Step>().unwrap_or_default().0;
+    let hits = cx.untracked().resource::<Hits>().0.clone();
+    // The kept row is the root of this scene, with a component and an
+    // observer declared beside it.
+    bsn! {
+        @row(1, String::from("row"))
+        Host({step})
+        on(move |_: On<Ping>| {
+            hits.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+}
+
+#[test]
+fn what_the_parent_declares_beside_a_kept_child_is_replaced() {
+    let mut app = retention_app();
+    app.init_resource::<Hits>();
+    let root = app
+        .world_mut()
+        .spawn_scene(bsn! { @decorated_parent() })
+        .unwrap()
+        .id();
+    app.update();
+    let host = rows(&mut app)[0].2;
+    assert_eq!(app.world().get::<Host>(host), Some(&Host(0)));
+
+    for step in 1..=2 {
+        app.world_mut().resource_mut::<Step>().0 = step;
+        app.update();
+    }
+    assert_eq!(RenderLog::take(&app), vec![1]);
+    assert_eq!(rows(&mut app)[0].2, host);
+    assert_eq!(app.world().get::<Host>(host), Some(&Host(2)));
+    assert_eq!(app.world().get::<ChildOf>(host).unwrap().parent(), root);
+
+    // One observer, not one per parent render.
+    app.world_mut().trigger(Ping { entity: host });
+    app.world_mut().flush();
+    assert_eq!(app.world().resource::<Hits>().0.load(Ordering::Relaxed), 1);
+}

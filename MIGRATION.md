@@ -54,6 +54,16 @@ Behavior changes:
   occurrence count, not by position among all siblings. Inserting a conditional
   sibling no longer moves another component's state. Components created in a loop
   from one call site still match by position; key them.
+- A parent re-render no longer respawns child components. A matched child keeps its
+  host entity, hook state and rendered subtree, and renders again only if its props
+  changed: a `#[component]` whose props are all `PartialEq` is skipped when they are
+  equal (closures from `component(..)` and components with a non-`PartialEq` prop
+  still render with every parent render). A child that relied on re-rendering with
+  its parent to pick up a changed non-signal context value or untracked read must
+  track it instead (provide a `Signal` as context). Components declared beside a kept
+  child in the parent's scene are moved onto its host; a type the new scene stops
+  declaring there is left on the host. `Signal`, `Memo` and `Value` now implement
+  `PartialEq` (handles by identity, `Value::Const` by value).
 - A component whose hooks change type at the same index (for example after a
   conditional hook) logs a warning and resets that hook instead of panicking.
 - A tracked value is published only when something listens for it: a subscription, an

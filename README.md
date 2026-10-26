@@ -397,10 +397,18 @@ fn app(cx: &Cx) -> impl Scene {
 | store/selector hooks | `cx.use_resource::<R>()`, `cx.use_component::<C>(entity)` |
 
 A component's output is a child of its entity; an entity without a UI `Node` becomes a
-`GhostNode`, so `@counter(5)` works as a list item without affecting layout. A render
-replaces the subtree; child components keep their hook state, matched by key or else
-by the call site of `@name(..)`, so a conditional sibling doesn't shift another
-component's state (key components created in loops). Props other than `Entity` must be
+`GhostNode`, so `@counter(5)` works as a list item without affecting layout.
+
+A render reconciles child components with the previous one. A child is matched by key
+or else by the call site of `@name(..)`, so a conditional sibling doesn't shift another
+component's state (key components created in loops). A matched child keeps its host
+entity, hook state and rendered subtree, and renders again only if its props changed,
+like `React.memo`: props that are all `PartialEq` (`Entity` and `Signal` props
+included; signals compare by identity) are compared, and a child with an equal set is
+skipped. Children no longer rendered are despawned and unmount. Plain entities in the
+parent's own scene are still recreated, and what the parent declares beside a kept
+child (`@row(id) Node { .. }`, `on(..)`) is moved onto its host from the new scene.
+Props other than `Entity` must be
 `Clone + Send + Sync + 'static`; mark other entity-valued props `#[entity]`, as in
 `#[entity] target: Option<Entity>`. A component may return `Result<impl Scene>`: errors
 go to Bevy's fallback error handler. `either(cond, || bsn! {..}, || bsn! {..})` picks
@@ -553,9 +561,10 @@ A frame where nothing they read changed checks no hosts
   a few nanoseconds per pair and does not depend on how many hosts read each one.
   Writes made by systems are seen like any other.
 
-A component re-render respawns its subtree, so keep components small; prefer `coat!`
-regions or `bind` for hot paths and normal systems for thousands of entities changing
-every frame. `BENCHMARKS.md` has measured frame costs.
+A component re-render respawns the plain entities of its own scene but keeps child
+components whose props are unchanged, so split large components into children; prefer
+`coat!` regions or `bind` for hot paths and normal systems for thousands of entities
+changing every frame. `BENCHMARKS.md` has measured frame costs.
 
 ## Official Bevy references
 
