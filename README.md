@@ -253,6 +253,7 @@ fn todo_list() -> impl Scene {
 | `if c { .. } else if c { .. } else { .. }` | conditional entities |
 | `#[key(expr)] for pat in iter { .. }` | entities per item; unchanged rows keep their entities |
 | `for pat in iter { .. }` | entities per item, identified by position |
+| `for $item in iter { .. }` (keyed or not) | each row gets its item as a signal and is patched in place instead of rebuilt |
 | `match value { pat => .., }` | entities for the matching arm |
 | `let pat = expr;` | binding for the following items |
 
@@ -260,7 +261,27 @@ Without `$`, control flow is evaluated once. Signals have `get`, `set`, `update`
 `set_if_neq` and `with`; `memo(|| ..)` derives a cached value from signals, and
 `effect(|commands| ..)` re-runs a side effect when a signal it read changes. Signals
 are `Send + Sync`, so they can also live in components or resources and be set from
-systems.
+systems. Writing a signal from inside its own `with`/`update` closure panics instead of
+deadlocking.
+
+`CopySignal<T>` is a signal behind a `Copy` handle, so closures capture it without
+`clone`s. Its value lives on its own entity, linked to an owner and despawned with it:
+create one with `commands.spawn_signal(owner, value)`, or with `copy_signal(|| value)`
+plus `owns(signal)` on an entity of the scene. After the owner despawns, `try_get`
+returns `None` and `get` panics.
+
+`#[derive(Store)]` on a struct generates `{Name}Store` with one signal per field, so a
+reader of one field doesn't update when another changes; `set` and `update` write the
+whole value and notify only the fields that changed.
+
+```rust,ignore
+#[derive(Clone, PartialEq, Store)]
+struct Player { name: String, health: u32 }
+
+let player = PlayerStore::new(Player { name: "Ada".into(), health: 10 });
+let health = player.health.clone();
+view! { Text($(format!("HP {}", $health))) }   // not patched when `name` changes
+```
 
 Examples: `view_todos`, `view_tabs`.
 

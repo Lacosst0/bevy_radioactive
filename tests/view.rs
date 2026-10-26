@@ -295,3 +295,103 @@ fn views_require_the_plugin() {
     };
     assert!(error.to_string().contains("ViewPlugin"));
 }
+
+#[test]
+fn duplicate_keys_do_not_leak_rows() {
+    let rows = signal(|| vec![Row { id: 1, name: "a" }, Row { id: 1, name: "b" }]);
+    let mut app = app();
+    let scene = {
+        let rows = rows.clone();
+        view! {
+            Root
+            Children [
+                #[key(row.id)]
+                for row in $rows {
+                    Label({row.id}) Text({row.name})
+                }
+            ]
+        }
+    };
+    app.world_mut().spawn_scene(scene).unwrap();
+    app.update();
+    // The later item wins.
+    assert_eq!(texts(&mut app), vec![(1, "b".into())]);
+
+    rows.set(vec![Row { id: 2, name: "c" }]);
+    app.update();
+    assert_eq!(texts(&mut app), vec![(2, "c".into())]);
+}
+
+#[test]
+fn keyed_item_signals_patch_rows_in_place() {
+    let rows = signal(|| vec![Row { id: 1, name: "a" }, Row { id: 2, name: "b" }]);
+    let mut app = app();
+    let scene = {
+        let rows = rows.clone();
+        view! {
+            Root
+            Children [
+                #[key(row.id)]
+                for $row in $rows {
+                    Label(row.get_untracked().id)
+                    Text($($row.name.to_string()))
+                }
+            ]
+        }
+    };
+    app.world_mut().spawn_scene(scene).unwrap();
+    app.update();
+    let before = labels(&mut app);
+
+    rows.set(vec![Row { id: 1, name: "A" }, Row { id: 2, name: "b" }]);
+    app.update();
+    // Same entities, new text.
+    assert_eq!(labels(&mut app), before);
+    assert_eq!(texts(&mut app), vec![(1, "A".into()), (2, "b".into())]);
+}
+
+#[test]
+fn indexed_item_signals_keep_positions() {
+    let numbers = signal(|| vec![1_u32, 2]);
+    let mut app = app();
+    let scene = {
+        let numbers = numbers.clone();
+        view! {
+            Root
+            Children [
+                for $n in $numbers {
+                    Label(0) Text($(format!("{}", $n)))
+                }
+            ]
+        }
+    };
+    app.world_mut().spawn_scene(scene).unwrap();
+    app.update();
+    let before = labels(&mut app);
+
+    numbers.set(vec![5, 2, 7]);
+    app.update();
+    let after = labels(&mut app);
+    assert_eq!(after.len(), 3);
+    assert!(before.iter().all(|label| after.contains(label)));
+    let mut shown: Vec<String> = texts(&mut app).into_iter().map(|(_, text)| text).collect();
+    shown.sort();
+    assert_eq!(shown, ["2", "5", "7"]);
+}
+
+#[test]
+#[should_panic(expected = "a `Signal` was set or read while this thread is updating or")]
+fn setting_a_signal_inside_its_own_read_panics_instead_of_deadlocking() {
+    let count = signal(|| 1);
+    count.with(|_| count.set(2));
+}
+
+#[test]
+#[should_panic(expected = "a `Memo` read itself while computing its value")]
+fn a_memo_reading_itself_panics() {
+    let slot: std::sync::Arc<std::sync::Mutex<Option<Memo<u32>>>> = std::sync::Arc::default();
+    let inner = slot.clone();
+    let looped = memo(move || inner.lock().unwrap().clone().map_or(0, |m| m.get()));
+    *slot.lock().unwrap() = Some(looped.clone());
+    let _ = looped.get();
+}

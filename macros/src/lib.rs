@@ -591,13 +591,30 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
     let Some(in_index) = item.iter().position(|t| is_ident(Some(t), "in")) else {
         return error(item[0].span(), "expected `for pattern in items { ... }`");
     };
-    let pattern_tokens = &item[1..in_index];
+    let mut pattern_tokens = &item[1..in_index];
+    // `for $item in ..`: each row receives its item as a signal.
+    let item_signal = is_punct(pattern_tokens.first(), '$');
+    if item_signal {
+        if !matches!(pattern_tokens, [_, TokenTree::Ident(_)]) {
+            return error(
+                pattern_tokens[0].span(),
+                "expected `for $name in ..`: an item signal binds a single name",
+            );
+        }
+        pattern_tokens = &pattern_tokens[1..];
+    }
     let pattern = stream(pattern_tokens);
     let Some((iter, body, next)) = until_block(item, in_index + 1) else {
         return error(item[0].span(), "expected `for pattern in items { ... }`");
     };
     if next < item.len() {
         return error(item[next].span(), "unexpected tokens after `for`");
+    }
+    if item_signal && !contains_dollar(&iter) {
+        return error(
+            item[1].span(),
+            "`for $name in ..` needs a reactive iterator that reads a signal with `$`",
+        );
     }
 
     if !contains_dollar(&iter) {
@@ -625,13 +642,18 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
             #body
         } }
     };
+    let (keyed, indexed) = if item_signal {
+        (quote!(__view_for_signal), quote!(__view_for_indexed_signal))
+    } else {
+        (quote!(__view_for), quote!(__view_for_indexed))
+    };
     match key {
         Some(key) => {
             let key_site = scope.site(key, &bound);
             let key = reads(key);
             quote! {
                 __ViewRegion
-                __view_for(
+                #keyed(
                     #items,
                     { #key_site move |__item: &_| {
                         #[allow(unused_variables)]
@@ -644,7 +666,7 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
         }
         None => quote! {
             __ViewRegion
-            __view_for_indexed(#items, #render)
+            #indexed(#items, #render)
         },
     }
 }
@@ -914,5 +936,142 @@ fn mentions_signal(tokens: &[TokenTree]) -> bool {
         TokenTree::Ident(name) => is_signal(name),
         TokenTree::Group(g) => mentions_signal(&tokens_of(g)),
         _ => false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// #[derive(Store)]
+// ---------------------------------------------------------------------------
+
+/// Derives `bevy_radioactive::view::Store` for a struct with named fields,
+/// generating `{Name}Store`: one `Signal` per field, so a reader of one
+/// field does not re-run when another changes.
+///
+/// See `bevy_radioactive::view::Store` for details.
+#[proc_macro_derive(Store)]
+pub fn derive_store(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match syn::parse::<syn::DeriveInput>(input) {
+        Ok(input) => store(&input)
+            .unwrap_or_else(syn::Error::into_compile_error)
+            .into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
+fn store(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
+    let syn::Data::Struct(syn::DataStruct {
+        fields: syn::Fields::Named(fields),
+        ..
+    }) = &input.data
+    else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "`#[derive(Store)]` needs a struct with named fields",
+        ));
+    };
+    let view = quote!(::bevy_radioactive::view);
+    let vis = &input.vis;
+    let name = &input.ident;
+    let store = format_ident!("{}Store", name);
+    let types: Vec<&syn::Type> = fields.named.iter().map(|field| &field.ty).collect();
+    // Generic field types need the bounds `Signal` and `Store` rely on; a
+    // concrete type that lacks them fails at the generated code instead.
+    let mut generics = input.generics.clone();
+    if generics.type_params().next().is_some() {
+        let predicates = &mut generics.make_where_clause().predicates;
+        for ty in &types {
+            predicates.push(syn::parse_quote!(
+                #ty: ::core::clone::Clone
+                    + ::core::cmp::PartialEq
+                    + ::core::marker::Send
+                    + ::core::marker::Sync
+                    + 'static
+            ));
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let names: Vec<&Ident> = fields
+        .named
+        .iter()
+        .map(|field| field.ident.as_ref().expect("named field"))
+        .collect();
+    let visibilities: Vec<&syn::Visibility> = fields.named.iter().map(|field| &field.vis).collect();
+    let docs: Vec<String> = names
+        .iter()
+        .map(|field| format!("The signal of [`{name}::{field}`]."))
+        .collect();
+    let store_doc = format!(
+        "Per-field signals of a [`{name}`], generated by `#[derive(Store)]`.\n\n\
+         Reading one field (`store.field.get()`) tracks only that field, and \
+         [`set`](Self::set) notifies only the fields whose value changed."
+    );
+
+    Ok(quote! {
+        #[doc = #store_doc]
+        #vis struct #store #impl_generics #where_clause {
+            #(
+                #[doc = #docs]
+                #visibilities #names: #view::Signal<#types>,
+            )*
+        }
+
+        impl #impl_generics ::core::clone::Clone for #store #ty_generics #where_clause {
+            fn clone(&self) -> Self {
+                Self { #(#names: ::core::clone::Clone::clone(&self.#names),)* }
+            }
+        }
+
+        impl #impl_generics #view::Store for #name #ty_generics #where_clause {
+            type Fields = #store #ty_generics;
+
+            fn into_store(self) -> Self::Fields {
+                #store { #(#names: #view::Signal::new(self.#names),)* }
+            }
+        }
+
+        impl #impl_generics ::core::convert::From<#name #ty_generics>
+            for #store #ty_generics #where_clause
+        {
+            fn from(value: #name #ty_generics) -> Self {
+                #view::Store::into_store(value)
+            }
+        }
+
+        #[allow(dead_code)]
+        impl #impl_generics #store #ty_generics #where_clause {
+            /// Creates the per-field signals of `value`.
+            #[must_use]
+            pub fn new(value: #name #ty_generics) -> Self {
+                #view::Store::into_store(value)
+            }
+
+            /// Clones the whole value, tracking every field.
+            #[must_use]
+            pub fn get(&self) -> #name #ty_generics {
+                #name { #(#names: self.#names.get(),)* }
+            }
+
+            /// Clones the whole value without tracking.
+            #[must_use]
+            pub fn get_untracked(&self) -> #name #ty_generics {
+                #name { #(#names: self.#names.get_untracked(),)* }
+            }
+
+            /// Writes every field, notifying only the readers of fields
+            /// whose value changed. Returns whether any did.
+            pub fn set(&self, value: #name #ty_generics) -> bool {
+                let mut changed = false;
+                #(changed |= self.#names.set_if_neq(value.#names);)*
+                changed
+            }
+
+            /// Mutates a copy of the whole value and writes it back with
+            /// [`set`](Self::set). Returns whether any field changed.
+            pub fn update(&self, f: impl ::core::ops::FnOnce(&mut #name #ty_generics)) -> bool {
+                let mut value = self.get_untracked();
+                f(&mut value);
+                self.set(value)
+            }
+        }
     })
 }

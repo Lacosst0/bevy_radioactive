@@ -42,6 +42,7 @@
 //! | `if c { .. } else if c { .. } else { .. }` | conditional entities |
 //! | `#[key(expr)] for pat in iter { .. }` | entities per item; unchanged rows keep their entities |
 //! | `for pat in iter { .. }` | entities per item, identified by position |
+//! | `#[key(expr)] for $item in iter { .. }` | like the above, but each row gets its item as a signal and is patched instead of rebuilt |
 //! | `match value { pat => .., }` | entities for the matching arm |
 //! | `let pat = expr;` | binding for the following items |
 //!
@@ -59,7 +60,15 @@
 //! a patched component, an [`effect`] or a [`memo`] subscribes that code to
 //! later writes. Signals are `Send + Sync`, so they can be stored in
 //! components or resources and set from systems. Updates run in
-//! [`ViewSystems`] in `PostUpdate`, before UI layout.
+//! [`ViewSystems`] in `PostUpdate`, before UI layout. Reading or writing a
+//! signal from inside its own `with`/`update` closure panics instead of
+//! deadlocking.
+//!
+//! A [`CopySignal`] is the same signal behind a `Copy` handle, owned by an
+//! entity, so closures capture it without `clone`s and it is freed when its
+//! owner despawns. `#[derive(Store)]` splits a struct into one signal per
+//! field (see [`Store`]), so a reader of one field doesn't update when
+//! another changes.
 
 use std::{
     cell::RefCell,
@@ -85,7 +94,15 @@ use bevy::{
     scene::{EmptySceneEffect, SceneList, WorldSceneExt},
 };
 
-pub use crate::macros::{view, view_list};
+mod copy_signal;
+mod store;
+
+pub use copy_signal::{
+    CopySignal, OwnedSignals, Owns, SignalCell, SignalCommandsExt, SignalOf, copy_signal, owns,
+};
+pub use store::{Store, store};
+
+pub use crate::macros::{Store, view, view_list};
 
 /// Rounds of updates per frame, so a signal set by an effect settles in
 /// one frame.
@@ -168,6 +185,53 @@ fn untracked<R>(f: impl FnOnce() -> R) -> R {
 }
 
 // ---------------------------------------------------------------------------
+// Re-entrancy checks
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Signals and memos this thread is accessing, and whether exclusively.
+    static HELD: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Marks a signal or memo as accessed by this thread until dropped.
+struct Held(usize);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|&(cell, _)| cell == self.0) {
+                held.remove(index);
+            }
+        });
+    }
+}
+
+/// Records an access to the cell at address `cell`, panicking when it
+/// conflicts with one this thread already holds: locking again would
+/// deadlock (or, for a memo, recurse forever).
+fn hold(cell: usize, exclusive: bool, conflict: &str) -> Held {
+    let conflicts = HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        let conflicts = held
+            .iter()
+            .any(|&(other, other_exclusive)| other == cell && (exclusive || other_exclusive));
+        if !conflicts {
+            held.push((cell, exclusive));
+        }
+        conflicts
+    });
+    assert!(!conflicts, "{conflict}");
+    Held(cell)
+}
+
+const SIGNAL_REENTERED: &str = "a `Signal` was set or read while this thread is updating or \
+    reading it, for example `s.set(..)` inside `s.with(..)` or `s.get()` inside \
+    `s.update(..)`; read the value first, or use the closure's argument";
+
+const MEMO_REENTERED: &str = "a `Memo` read itself while computing its value";
+
+// ---------------------------------------------------------------------------
 // Signal
 // ---------------------------------------------------------------------------
 
@@ -214,7 +278,12 @@ impl<T: Send + Sync + 'static> Signal<T> {
     }
 
     /// Reads the value through `f` without tracking.
+    ///
+    /// # Panics
+    ///
+    /// If `f` sets this signal, which would otherwise deadlock.
     pub fn with_untracked<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let _held = hold(self.cell(), false, SIGNAL_REENTERED);
         f(&self.0.value.read().unwrap_or_else(PoisonError::into_inner))
     }
 
@@ -244,10 +313,15 @@ impl<T: Send + Sync + 'static> Signal<T> {
     /// Replaces the value, notifying readers only if it changed.
     ///
     /// Returns whether the value changed.
+    ///
+    /// # Panics
+    ///
+    /// If called while this thread is reading or updating the signal.
     pub fn set_if_neq(&self, value: T) -> bool
     where
         T: PartialEq,
     {
+        let _held = hold(self.cell(), true, SIGNAL_REENTERED);
         let mut current = self.0.value.write().unwrap_or_else(PoisonError::into_inner);
         if *current == value {
             return false;
@@ -259,10 +333,21 @@ impl<T: Send + Sync + 'static> Signal<T> {
     }
 
     /// Mutates the value in place and notifies readers.
+    ///
+    /// # Panics
+    ///
+    /// If `f` reads or sets this signal, or this thread is already reading
+    /// it, which would otherwise deadlock.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let held = hold(self.cell(), true, SIGNAL_REENTERED);
         let result = f(&mut self.0.value.write().unwrap_or_else(PoisonError::into_inner));
+        drop(held);
         self.notify();
         result
+    }
+
+    fn cell(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
     }
 
     fn notify(&self) {
@@ -313,7 +398,9 @@ impl<T: PartialEq + Send + Sync> MemoInner<T> {
         if !needs_refresh {
             return;
         }
+        let held = hold(std::ptr::from_ref(self).addr(), true, MEMO_REENTERED);
         let (value, deps) = scope(|| (self.compute)());
+        drop(held);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.value.as_ref() != Some(&value) {
             state.value = Some(value);
@@ -434,6 +521,10 @@ fn update_all(world: &mut World) {
             return;
         }
     }
+    warn!(
+        "view: signals still changing after {MAX_ROUNDS} rounds; the rest update next frame. \
+         An effect may be setting a signal it reads."
+    );
 }
 
 /// Runs every update whose signals changed. Returns how many ran.
@@ -648,28 +739,99 @@ where
     KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
     R: Fn(&V) -> BoxedList + Clone + Send + Sync + 'static,
 {
+    keyed_rows(
+        items,
+        key,
+        |item| item,
+        |row: &V, item| (*row != item).then_some(item),
+        render,
+    )
+}
+
+/// Like [`for_keyed`], but each row gets its item as a signal: a changed
+/// item is written to the row's signal instead of rebuilding the row.
+#[doc(hidden)]
+pub fn for_keyed_signal<V, K, IF, KF, R>(
+    items: IF,
+    key: KF,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: PartialEq + Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
+    R: Fn(&Signal<V>) -> BoxedList + Clone + Send + Sync + 'static,
+{
+    keyed_rows(
+        items,
+        key,
+        Signal::new,
+        |row: &Signal<V>, item| {
+            row.set_if_neq(item);
+            None
+        },
+        render,
+    )
+}
+
+/// One set of children per key. `reuse` updates a kept row from its new
+/// item, or hands the item back to rebuild the row with `make`.
+fn keyed_rows<V, S, K, IF, KF, R>(
+    items: IF,
+    key: KF,
+    make: fn(V) -> S,
+    reuse: fn(&S, V) -> Option<V>,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: Send + Sync + 'static,
+    S: Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    KF: Fn(&V) -> K + Clone + Send + Sync + 'static,
+    R: Fn(&S) -> BoxedList + Clone + Send + Sync + 'static,
+{
     effect_template(move || -> RunFn {
         let (items, key, render) = (items.clone(), key.clone(), render.clone());
-        let mut rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
+        let mut rows: HashMap<K, (S, Vec<Entity>)> = HashMap::default();
         let mut order: Vec<Entity> = Vec::new();
         Box::new(move |world: &mut World, target| {
             let (next, deps) = scope(&items);
-            let mut next_rows = HashMap::default();
+            let mut next_rows: HashMap<K, (S, Vec<Entity>)> = HashMap::default();
             let mut next_order = Vec::new();
+            let mut duplicates = 0;
             for item in next {
                 let item_key = untracked(|| key(&item));
-                let children = match rows.remove(&item_key) {
-                    Some((old, children)) if old == item => children,
-                    previous => {
-                        if let Some((_, children)) = previous {
+                let rebuild = match rows.remove(&item_key) {
+                    Some((row, children)) => match reuse(&row, item) {
+                        None => Ok((row, children)),
+                        Some(item) => {
                             despawn_all(world, &children);
+                            Err(item)
                         }
-                        let list = untracked(|| render(&item));
-                        spawn_list(world, target, list)
-                    }
+                    },
+                    None => Err(item),
                 };
+                let (row, children) = rebuild.unwrap_or_else(|item| {
+                    let row = make(item);
+                    let children = spawn_list(world, target, untracked(|| render(&row)));
+                    (row, children)
+                });
                 next_order.extend(children.iter().copied());
-                next_rows.insert(item_key, (item, children));
+                if let Some((_, displaced)) = next_rows.insert(item_key, (row, children)) {
+                    // A duplicate key: the later item wins and the earlier
+                    // row is despawned rather than left untracked.
+                    duplicates += 1;
+                    next_order.retain(|entity| !displaced.contains(entity));
+                    despawn_all(world, &displaced);
+                }
+            }
+            if duplicates > 0 {
+                warn!(
+                    "view: {duplicates} duplicate key(s) in a keyed `for`; only the last item \
+                     with each key is shown"
+                );
             }
             for (_, (_, children)) in rows.drain() {
                 despawn_all(world, &children);
@@ -700,11 +862,47 @@ where
     )
 }
 
+/// Like [`for_indexed`], but each position keeps its row and gets its item
+/// as a signal.
+#[doc(hidden)]
+pub fn for_indexed_signal<V, IF, R>(
+    items: IF,
+    render: R,
+) -> impl Template<Output = EmptySceneEffect>
+where
+    V: PartialEq + Send + Sync + 'static,
+    IF: Fn() -> Vec<V> + Clone + Send + Sync + 'static,
+    R: Fn(&Signal<V>) -> BoxedList + Clone + Send + Sync + 'static,
+{
+    effect_template(move || -> RunFn {
+        let (items, render) = (items.clone(), render.clone());
+        let mut rows: Vec<(Signal<V>, Vec<Entity>)> = Vec::new();
+        Box::new(move |world: &mut World, target| {
+            let (next, deps) = scope(&items);
+            let len = next.len();
+            for (index, item) in next.into_iter().enumerate() {
+                if let Some((signal, _)) = rows.get(index) {
+                    signal.set_if_neq(item);
+                } else {
+                    let signal = Signal::new(item);
+                    let children = spawn_list(world, target, untracked(|| render(&signal)));
+                    rows.push((signal, children));
+                }
+            }
+            for (_, children) in rows.drain(len.min(rows.len())..) {
+                despawn_all(world, &children);
+            }
+            deps
+        })
+    })
+}
+
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        Region as __ViewRegion, for_indexed as __view_for_indexed, for_keyed as __view_for,
-        patch as __view_patch, region as __view_region,
+        Region as __ViewRegion, for_indexed as __view_for_indexed,
+        for_indexed_signal as __view_for_indexed_signal, for_keyed as __view_for,
+        for_keyed_signal as __view_for_signal, patch as __view_patch, region as __view_region,
     };
     pub use bevy::scene::{bsn, bsn_list};
 }
