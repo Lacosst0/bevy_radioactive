@@ -28,9 +28,11 @@ widget binding (`bind_slider`, `bind_checkbox`, `bind_tabs`, `bind_radio`,
 `bind_widget`, `bind_widget_with`). `coat!` loops can bind an item signal
 (`#[key(..)] for $item in ..` / `for $item in ..`) so rows patch in place, `coat::Value<T>`
 props accept a constant, a signal or a memo, and `Cx::use_task` returns a `TaskState`
-for an async task that is cancelled when its deps change or the component unmounts. The prelude now also exports `ReactiveSet`,
+for an async task that is cancelled when its deps change or the component unmounts.
+`CopySignal` (with `copy_signal`, `owns`, `SignalCommandsExt::spawn_signal` and
+`Cx::use_copy_signal`) is a `Copy` signal handle owned by an entity. The prelude now also exports `ReactiveSet`,
 `ReactiveSettings`, `ReactiveDiagnostics`, `Reads`, `Signal`, `signal`, `memo`,
-`effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed` and the new helpers. It
+`effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed`, `CopySignal` and the new helpers. It
 does not export `#[component]`, which would clash with Bevy's `#[component(..)]` derive
 helper; import it from `bevy_radioactive::webby`.
 

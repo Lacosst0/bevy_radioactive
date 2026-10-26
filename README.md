@@ -489,6 +489,35 @@ for $todo in $todos {
 }
 ```
 
+### `CopySignal<T>`: `Copy` handles owned by entities
+
+A `CopySignal<T>` is a `Signal<T>` behind a `Copy` handle, so any number of closures
+capture it without `clone`s. Its value lives in a `SignalCell<T>` component on its own
+entity, linked to an owner by the `SignalOf` relationship and despawned with it (like
+`ChildOf`), so it is visible to inspectors and freed with the entity that created it.
+Reads and writes are tracked and pushed exactly like `Signal`'s.
+
+```rust,ignore
+let count = commands.spawn_signal(owner, 0);   // or world.spawn_signal(owner, 0)
+let count = cx.use_copy_signal(|| 0);          // webby: owned by the component's host
+
+fn counter() -> impl Scene {
+    let count = copy_signal(|| 0);             // unowned until `owns` places it
+    bsn! {
+        Button
+        owns(count)
+        on(move |_: On<Pointer<Click>>| count.increment())
+        computed(move |_: &Reads| Text(count.get().to_string()))
+    }
+}
+```
+
+After the owner despawns the handle is dead: `try_get`, `try_with`, `try_set` and
+`try_update` return `None`/`false`, and `get`, `set` and the other methods panic with a
+message naming the type. A signal created with `copy_signal` and never placed with
+`owns` lives until `dispose()`. A read costs about 20 ns more than a `Signal` read
+(`BENCHMARKS.md`), and each owned signal is one extra entity.
+
 ### `Value<T>` props
 
 `Value<T>` is a constant, a `Signal<T>` or a `Memo<T>`, converted with `.into()`. A

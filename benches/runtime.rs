@@ -13,7 +13,7 @@ use std::{
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::{
     RadioactivePlugin, Reads,
-    coat::{Signal, effect, memo},
+    coat::{CopySignal, Signal, SignalCommandsExt, effect, memo},
     testing::settle_n,
 };
 
@@ -279,6 +279,72 @@ fn memo_diamond(frames: usize, hosts: usize) {
     );
 }
 
+/// One host reading `reads` signals, every one of which is set each frame:
+/// the host runs once per frame, so this measures read and write cost.
+fn many_reads(frames: usize, reads: usize) {
+    let mut app = app();
+    let signals: Vec<Signal<u32>> = (0..reads).map(|_| Signal::new(0)).collect();
+    let captured = signals.clone();
+    host(&mut app, None, move |_| {
+        for signal in &captured {
+            black_box(signal.get());
+        }
+    });
+    let stats = measure(&mut app, frames, |_| {
+        for signal in &signals {
+            signal.update(|value| *value += 1);
+        }
+    });
+    report(
+        &format!("1 host x {reads} Signal reads, all set"),
+        &stats,
+        effects_run(&app),
+    );
+}
+
+/// [`many_reads`] with [`CopySignal`]s owned by an entity.
+fn many_copy_reads(frames: usize, reads: usize) {
+    let mut app = app();
+    let owner = app.world_mut().spawn_empty().id();
+    let signals: Vec<CopySignal<u32>> = (0..reads)
+        .map(|_| app.world_mut().spawn_signal(owner, 0))
+        .collect();
+    let captured = signals.clone();
+    host(&mut app, None, move |_| {
+        for signal in &captured {
+            black_box(signal.get());
+        }
+    });
+    let stats = measure(&mut app, frames, |_| {
+        for signal in &signals {
+            signal.update(|value| *value += 1);
+        }
+    });
+    report(
+        &format!("1 host x {reads} CopySignal reads, all set"),
+        &stats,
+        effects_run(&app),
+    );
+}
+
+/// [`fan_out`] with a [`CopySignal`].
+fn fan_out_copy(frames: usize, hosts: usize) {
+    let mut app = app();
+    let owner = app.world_mut().spawn_empty().id();
+    let signal = app.world_mut().spawn_signal(owner, 0_u32);
+    for _ in 0..hosts {
+        host(&mut app, None, move |_| {
+            black_box(signal.get());
+        });
+    }
+    let stats = measure(&mut app, frames, |_| signal.update(|value| *value += 1));
+    report(
+        &format!("fan-out, 1 CopySignal -> {hosts} hosts"),
+        &stats,
+        effects_run(&app),
+    );
+}
+
 fn main() {
     let quick = std::env::args().any(|arg| arg == "--quick");
     let frames = if quick { 30 } else { 200 };
@@ -302,4 +368,7 @@ fn main() {
     single_component_change(frames, 1_000);
     single_component_change(frames, 10_000);
     fan_out(frames, 1_000);
+    fan_out_copy(frames, 1_000);
+    many_reads(frames, 1_000);
+    many_copy_reads(frames, 1_000);
 }

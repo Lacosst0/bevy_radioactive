@@ -36,7 +36,10 @@ pub use crate::{
 #[allow(deprecated)]
 pub use crate::{bind_or, on_removed};
 
-pub use crate::coat::{Signal, Value, coat, coat_list, effect, layout_effect, memo, signal};
+pub use crate::coat::{
+    CopySignal, Signal, SignalCommandsExt, Value, coat, coat_list, copy_signal, effect,
+    layout_effect, memo, owns, signal,
+};
 pub use crate::monitor::{Monitor, MonitorAppExt};
 pub use crate::select::{SelectCommandsExt, SelectEntityCommandsExt, Selected, Selection};
 pub use crate::webby::{Cx, Either, TaskState, either};

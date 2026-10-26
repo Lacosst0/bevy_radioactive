@@ -25,6 +25,10 @@ Scenarios:
 - **one component changes**: every host reads a component on its own entity; one
   component is mutated through `Mut<T>` per frame, outside the runtime.
 - **fan-out**: one signal read by 1000 hosts and set every frame, so every host runs.
+- **fan-out, 1 CopySignal**: the same with an entity-owned `CopySignal`.
+- **1 host x 1000 Signal / CopySignal reads, all set**: one host reads 1000 signals,
+  all set (untimed) before each frame, so the host runs once and the frame is
+  dominated by 1000 tracked reads.
 
 Numbers are microseconds per frame on an Intel Core i7-13650HX, Windows 11, Rust
 1.99.0, release profile. They vary by a few percent between runs.
@@ -101,3 +105,23 @@ the scan looks pairs up per entity anyway. Make a component `#[component(immutab
 (changed by re-inserting it) to move its readers onto observers and out of the scan.
 When every host runs (fan-out), the cost is the effects themselves; a run that reads
 the same sources as its previous run keeps its subscriptions instead of re-subscribing.
+
+## `CopySignal` versus `Signal`
+
+A `CopySignal` handle is two integers; a read looks the handle up in a process-wide
+arena (a read lock and an index), clones the `Arc` of the `Signal` behind it, and then
+reads and tracks it like a `Signal`. Writes are timed outside the frame, so these rows
+measure the read and tracking side.
+
+| scenario                                 |  median us |     min us |     max us | effects |
+|------------------------------------------|------------|------------|------------|---------|
+| fan-out, 1 signal -> 1000 hosts          |      183.1 |      172.3 |      381.7 |    1000 |
+| fan-out, 1 CopySignal -> 1000 hosts      |      204.2 |      192.3 |      421.0 |    1000 |
+| 1 host x 1000 Signal reads, all set      |       41.6 |       41.0 |       93.9 |       1 |
+| 1 host x 1000 CopySignal reads, all set  |       61.8 |       58.8 |      146.8 |       1 |
+
+A `CopySignal` read costs about 20 ns more than a `Signal` read (about 60 ns against
+40 ns per tracked read, including subscription bookkeeping). Idle frames are unaffected:
+both push invalidations through the same subscriber lists. Each owned `CopySignal` adds
+one entity (its `SignalCell`), so prefer `Signal` for signals created per row in large
+lists, and `CopySignal` where saving clones in handlers matters more.

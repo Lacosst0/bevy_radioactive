@@ -110,6 +110,10 @@
 //! stored in components or resources and set from systems. Everything runs
 //! in [`ReactiveSet::Publish`], before UI layout.
 //!
+//! A [`CopySignal`] is the same signal behind a `Copy` handle whose value is
+//! owned by an entity, so closures capture it without `clone`s and it is
+//! freed when its owner despawns.
+//!
 //! [`ReactiveSet::Publish`]: crate::reactivity::ReactiveSet::Publish
 
 use std::{
@@ -129,6 +133,12 @@ use bevy::{
     platform::collections::HashMap,
     prelude::*,
     scene::{EmptySceneEffect, Scene, SceneList, WorldSceneExt},
+};
+
+mod copy_signal;
+
+pub use copy_signal::{
+    CopySignal, OwnedSignals, Owns, SignalCell, SignalCommandsExt, SignalOf, copy_signal, owns,
 };
 
 pub use crate::macros::{coat, coat_list};

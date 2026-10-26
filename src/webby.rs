@@ -152,7 +152,7 @@ use crate::runtime::{
     ensure_runtime, spawn_child, tracked,
 };
 pub use crate::{
-    coat::{Signal, cloned},
+    coat::{CopySignal, Signal, cloned},
     macros::component,
     runtime::{Cleanup, Deps, Effects, IntoCleanup, Reads},
 };
@@ -487,6 +487,46 @@ impl Cx<'_, '_> {
         self.hook(
             || Signal::new(init()),
             |signal: &mut Signal<T>| signal.clone(),
+        )
+    }
+
+    /// A [`CopySignal`] that persists across renders, owned by the
+    /// component's host: it is disposed when the host despawns.
+    ///
+    /// Like [`use_signal`](Self::use_signal), but the handle is `Copy`, so
+    /// event handlers and child props take it without `clone`s:
+    ///
+    /// ```ignore
+    /// let count = cx.use_copy_signal(|| 0);
+    /// bsn! {
+    ///     Button on(move |_: On<Pointer<Click>>| count.increment())
+    ///     Children [ Text({count.get().to_string()}) ]
+    /// }
+    /// ```
+    pub fn use_copy_signal<T>(&self, init: impl FnOnce() -> T) -> CopySignal<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        let host = self.reads.entity();
+        self.hook(
+            || {
+                let signal = CopySignal::new(init());
+                // The cell entity spawns after the render; the handle works
+                // right away.
+                self.effects
+                    .borrow_mut()
+                    .push(Box::new(move |commands: &mut Commands| {
+                        commands.queue(move |world: &mut World| {
+                            if world.get_entity(host).is_ok() {
+                                signal.own(world, host);
+                            } else {
+                                signal.dispose();
+                            }
+                        });
+                    }));
+                signal
+            },
+            |signal: &mut CopySignal<T>| *signal,
         )
     }
 
