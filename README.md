@@ -29,7 +29,8 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 ```
 
 The default `ui` feature orders the reactive runtime before Bevy UI layout and makes
-`coat!` regions `GhostNode`s. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
+`coat!` regions `GhostNode`s. The optional `widgets` feature adds two-way binding for
+`bevy_ui_widgets` controls. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
 
 ## Quick start
 
@@ -243,6 +244,40 @@ struct Alive;
 fn plugin(app: &mut App) {
     app.add_monitor::<Alive>(Monitor::new().with::<Health>().without::<Dead>())
         .add_observer(|died: On<Remove<Alive>>| info!("{} is out", died.entity));
+}
+```
+
+### Two-way widget binding (`widgets` feature)
+
+`bevy_ui_widgets` widgets are controlled: a slider emits `ValueChange<f32>` and waits
+for the app to write `SliderValue`. `bind_slider(model)`, `bind_checkbox(model)`,
+`bind_tabs(model)` and `bind_radio(model)` do both halves on the widget's entity. The
+widget's state follows the model (starting with its current value), and each
+`ValueChange` writes the model. The model is a `Signal`, or any ECS state through
+`bind_widget_with::<W, _, _>(read, write)`. `.commit_on_final()` writes the model only
+when the interaction ends and lets the widget move by itself meanwhile. Implement
+`ControlledWidget` to bind other widgets with `bind_widget::<W, _>(model)`. Don't also
+add the widget's `*_self_update` observer.
+
+```rust,ignore
+use bevy::ui_widgets::{Checkbox, Slider};
+use bevy_radioactive::prelude::*;
+
+#[derive(Resource)]
+struct Volume(f32);
+
+fn settings(muted: Signal<bool>) -> impl Scene {
+    bsn! {
+        Node Children [
+            Checkbox bind_checkbox(muted.clone())
+            --
+            Slider
+            bind_widget_with::<Slider, _, _>(
+                |r: &Reads| r.resource::<Volume>().map(|v| v.0),
+                |world: &mut World, v| world.resource_mut::<Volume>().0 = v,
+            ).commit_on_final()
+        ]
+    }
 }
 ```
 

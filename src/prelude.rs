@@ -40,3 +40,8 @@ pub use crate::coat::{Signal, coat, coat_list, effect, layout_effect, memo, sign
 pub use crate::monitor::{Monitor, MonitorAppExt};
 pub use crate::select::{SelectCommandsExt, SelectEntityCommandsExt, Selected, Selection};
 pub use crate::webby::{Cx, Either, either};
+#[cfg(feature = "widgets")]
+pub use crate::widgets::{
+    ControlledWidget, bind_checkbox, bind_radio, bind_slider, bind_tabs, bind_widget,
+    bind_widget_with,
+};

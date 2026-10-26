@@ -21,6 +21,8 @@ pub mod select;
 pub mod subscription;
 pub mod testing;
 pub mod webby;
+#[cfg(feature = "widgets")]
+pub mod widgets;
 
 pub use computed::{computed, computed_opt};
 pub use reactivity::{

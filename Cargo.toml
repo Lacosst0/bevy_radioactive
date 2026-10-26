@@ -13,8 +13,10 @@ categories = ["game-development", "gui"]
 default = ["ui"]
 ## Orders the runtime before UI layout and enables `webby::text` and `webby::show`.
 ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]
+## Two-way binding for `bevy_ui_widgets` controlled widgets (`widgets` module).
+widgets = ["ui", "bevy/bevy_ui_widgets"]
 ## Full Bevy with Feathers, for the `comparison_*` examples.
-comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
+comparison = ["ui", "widgets", "bevy/ui", "bevy/bevy_feathers"]
 
 [workspace]
 members = ["macros"]
@@ -56,3 +58,7 @@ required-features = ["comparison"]
 name = "comparison_coat"
 path = "examples/comparison/coat.rs"
 required-features = ["comparison"]
+
+[[test]]
+name = "widgets"
+required-features = ["widgets"]

@@ -23,7 +23,9 @@ signal reads in `coat!`, `ReactiveDiagnostics`, `ReactiveSet::Settled`, and the
 (`Reads::has`/`this_has`), hierarchy-inherited components (`Reads::inherited`),
 `layout_effect` with `ReactiveSet::PostLayout`, `Selection`/`Selected` with
 `SelectCommandsExt`/`SelectEntityCommandsExt`, and query monitors
-(`Monitor`, `MonitorAppExt::add_monitor`). The prelude now also exports `ReactiveSet`,
+(`Monitor`, `MonitorAppExt::add_monitor`), and with the new `widgets` feature, two-way
+widget binding (`bind_slider`, `bind_checkbox`, `bind_tabs`, `bind_radio`,
+`bind_widget`, `bind_widget_with`). The prelude now also exports `ReactiveSet`,
 `ReactiveSettings`, `ReactiveDiagnostics`, `Reads`, `Signal`, `signal`, `memo`,
 `effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed` and the new helpers. It
 does not export `#[component]`, which would clash with Bevy's `#[component(..)]` derive
