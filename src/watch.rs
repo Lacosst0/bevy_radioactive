@@ -51,6 +51,7 @@ use bevy::{
         component::Mutable,
         entity_disabling::Disabled,
         event::{EntityEvent, EntityTrigger, Event},
+        lifecycle::HookContext,
         query::Allow,
         schedule::ScheduleLabel,
         system::{FromInput, IntoObserverSystem, SystemInput},
@@ -254,7 +255,8 @@ where
 
 /// Source for resource `T`: `bind(Singleton, |score: &Score, ..| ..)`.
 ///
-/// The resource must exist when the scene spawns.
+/// If the resource doesn't exist yet when the scene spawns, the watch waits
+/// for it: its first insertion is delivered as a change.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Singleton;
 
@@ -295,25 +297,73 @@ impl<T> ValueSource<T> for Entity {
 
 impl<T: Resource> ValueSource<T> for Singleton {
     fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        let exists = context
-            .entity
-            .world_scope(|world| world.contains_resource::<T>());
-        let entity = context
-            .resource_entity::<T>()
-            .filter(|_| exists)
-            .ok_or_else(|| {
-                format!(
-                    "resource `{}` must exist before a scene binds to it with `Singleton`",
-                    type_name::<T>(),
-                )
-            })?;
-        out.push(entity);
+        out.push(context.entity.world_scope(|world| {
+            world
+                .resource_entity::<T>()
+                .filter(|_| world.contains_resource::<T>())
+                .unwrap_or_else(|| pending_resource::<T>(world))
+        }));
         Ok(())
     }
 
     fn clone_source(&self) -> Self {
         Self
     }
+}
+
+/// Stands in for the entity of resource `T` until the resource is added;
+/// its watchers then move to the resource's entity.
+#[derive(Component)]
+struct PendingResource<T: Resource> {
+    observer: Entity,
+    marker: PhantomData<fn() -> T>,
+}
+
+/// The placeholder entity of missing resource `T`, shared by its watchers.
+fn pending_resource<T: Resource>(world: &mut World) -> Entity {
+    let mut pending = world.query_filtered::<Entity, With<PendingResource<T>>>();
+    if let Some(entity) = pending.iter(world).next() {
+        return entity;
+    }
+    let observer = world.add_observer(adopt_pending::<T>).id();
+    world
+        .spawn(PendingResource::<T> {
+            observer,
+            marker: PhantomData,
+        })
+        .id()
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Bevy observer systems receive SystemInput parameters by value"
+)]
+fn adopt_pending<T: Resource>(event: On<Add<T>>, mut commands: Commands) {
+    let resource = event.entity;
+    commands.queue(move |world: &mut World| {
+        if world.resource_entity::<T>() != Some(resource) {
+            return;
+        }
+        let mut pending = world.query::<(Entity, &PendingResource<T>, Option<&Watchers<T>>)>();
+        let placeholders: Vec<(Entity, Entity, Vec<Entity>)> = pending
+            .iter(world)
+            .map(|(entity, pending, watchers)| {
+                let deliveries = watchers.map(|w| w.0.clone()).unwrap_or_default();
+                (entity, pending.observer, deliveries)
+            })
+            .collect();
+        for (placeholder, observer, deliveries) in placeholders {
+            // Replacing the relationship is not a removal, so the delivery
+            // entities survive.
+            for delivery in deliveries {
+                world
+                    .entity_mut(delivery)
+                    .insert(Watches::<T>::new(resource));
+            }
+            world.despawn(placeholder);
+            world.despawn(observer);
+        }
+    });
 }
 
 impl<T, S: ValueSource<T>, const N: usize> ValueSource<T> for [S; N] {
@@ -563,7 +613,9 @@ where
 }
 
 /// One delivery entity per (watcher, source) pair, pointing at the source.
+/// It is despawned after its source despawns.
 #[derive(Component)]
+#[component(on_remove = despawn_delivery)]
 #[relationship(relationship_target = Watchers<T>)]
 struct Watches<T: Component> {
     #[relationship]
@@ -583,6 +635,17 @@ impl<T: Component> Watches<T> {
 #[derive(Component)]
 #[relationship_target(relationship = Watches<T>)]
 struct Watchers<T: Component>(#[relationship] Vec<Entity>, PhantomData<fn() -> T>);
+
+/// Marks a delivery entity whose source is gone. A despawning source still
+/// routes its removal to it afterwards, so it is despawned by the next
+/// [`publish_all`] rather than right away.
+fn despawn_delivery(mut world: DeferredWorld, context: HookContext) {
+    world.commands().entity(context.entity).try_insert(Orphaned);
+}
+
+/// A delivery entity whose source is gone.
+#[derive(Component)]
+struct Orphaned;
 
 /// Owns delivery entities, so they despawn with the watcher.
 #[derive(Component)]
@@ -652,6 +715,11 @@ fn track<T: Component + Clone>(world: &mut World) {
 }
 
 fn publish_all(world: &mut World) {
+    let mut orphans = world.query_filtered::<Entity, (With<Orphaned>, Allow<Disabled>)>();
+    let orphans: Vec<Entity> = orphans.iter(world).collect();
+    for orphan in orphans {
+        world.despawn(orphan);
+    }
     for _ in 0..MAX_ROUNDS {
         let pending = std::mem::take(&mut world.resource_mut::<Watched>().pending);
         if !pending.is_empty() {
@@ -668,6 +736,10 @@ fn publish_all(world: &mut World) {
             return;
         }
     }
+    warn!(
+        "watch: values still changing after {MAX_ROUNDS} rounds; the rest is published next \
+         frame. A reaction may be writing a value it watches."
+    );
 }
 
 #[expect(

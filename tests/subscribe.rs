@@ -314,3 +314,33 @@ fn custom_disabled_sources_still_forward() {
         vec![(listener, source, source, 29, false)]
     );
 }
+
+#[test]
+fn delivery_entities_despawn_with_their_source() {
+    let mut app = subscription_app();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children[
+                #Source Source
+                --
+                Subscriber
+                subscribe_to(#Source, |event: Subscription<Ping>, mut log: ResMut<Log>| {
+                    log.0.push((event.target(), event.source(), event.source(), event.value, true));
+                })
+            ]
+        })
+        .unwrap();
+    settle(&mut app);
+    let source = single_entity::<Source>(app.world_mut());
+    let count = |app: &mut App| app.world_mut().query::<Entity>().iter(app.world()).count();
+    let before = count(&mut app);
+
+    // An event fired right before the despawn is still delivered.
+    app.world_mut().trigger(Ping { source, value: 3 });
+    app.world_mut().despawn(source);
+    app.world_mut().flush();
+    assert_eq!(app.world().resource::<Log>().0.len(), 1);
+    // Without cleanup only the source would go; its delivery entity (and the
+    // delivery's observer) go with it.
+    assert!(before - count(&mut app) > 1);
+}

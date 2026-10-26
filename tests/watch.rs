@@ -361,19 +361,75 @@ fn watch_without_runtime_reports_the_plugin() {
 }
 
 #[test]
-fn watch_resource_requires_a_current_resource_value() {
-    let mut app = test_app();
-    app.insert_resource(Counter(1)).track::<Counter>();
-    app.world_mut().remove_resource::<Counter>();
+fn watch_resource_waits_for_a_missing_resource() {
+    let mut app = test_app_with_plugin();
+    let listener = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Listener
+            watch(Singleton, record_counter)
+        })
+        .unwrap()
+        .id();
+    settle(&mut app);
+    assert!(app.world().resource::<Log>().local.is_empty());
 
-    let Err(error) = app.world_mut().spawn_scene(bsn! {
-        Listener
-        watch(Singleton, record_counter)
-    }) else {
-        panic!("watch unexpectedly resolved without its resource");
-    };
+    // The first insertion is delivered, from the resource's own entity.
+    app.insert_resource(Counter(4));
+    settle(&mut app);
+    let resource = app.world().resource_entity::<Counter>().unwrap();
+    assert_eq!(
+        app.world().resource::<Log>().local,
+        [(listener, resource, 4)]
+    );
 
-    assert!(error.to_string().contains("must exist"));
+    app.world_mut().resource_mut::<Counter>().0 = 5;
+    settle(&mut app);
+    assert_eq!(
+        app.world().resource::<Log>().local.last(),
+        Some(&(listener, resource, 5))
+    );
+}
+
+fn entity_count(app: &mut App) -> usize {
+    app.world_mut()
+        .query_filtered::<Entity, bevy::ecs::query::Allow<Disabled>>()
+        .iter(app.world())
+        .count()
+}
+
+#[test]
+fn delivery_entities_despawn_with_their_source() {
+    let mut app = test_app_with_plugin();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            Children [
+                #A SourceA Meter(1)
+                --
+                Listener
+                watch_removed(#A, |r: Removal<Meter>, mut log: ResMut<Log>| {
+                    log.local.push((r.target(), r.source(), 0));
+                })
+            ]
+        })
+        .unwrap();
+    settle(&mut app);
+    let source = app
+        .world_mut()
+        .query_filtered::<Entity, With<SourceA>>()
+        .single(app.world())
+        .unwrap();
+    let before = entity_count(&mut app);
+
+    app.world_mut().despawn(source);
+    app.world_mut().flush();
+    // The removal still reaches the watcher; the delivery entity goes in the
+    // next update.
+    assert_eq!(app.world().resource::<Log>().local.len(), 1);
+    settle(&mut app);
+    // Without cleanup only the source would go; its delivery entity (and the
+    // delivery's observer) go with it.
+    assert!(before - entity_count(&mut app) > 1);
 }
 
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]

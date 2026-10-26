@@ -33,6 +33,7 @@ use bevy::{
         component::Mutable,
         entity_disabling::Disabled,
         event::EntityEvent,
+        lifecycle::HookContext,
         query::Allow,
         system::{FromInput, IntoObserverSystem, SystemInput},
         template::{EntityTemplate, Template, TemplateContext},
@@ -246,7 +247,9 @@ where
 }
 
 /// One delivery entity per (listener, source) pair, pointing at the source.
+/// It despawns with its source.
 #[derive(Component)]
+#[component(on_remove = despawn_delivery)]
 #[relationship(relationship_target = Subscribers<E>)]
 struct SubscribedTo<E: EntityEvent + Clone> {
     #[relationship]
@@ -266,6 +269,12 @@ impl<E: EntityEvent + Clone> SubscribedTo<E> {
 #[derive(Component)]
 #[relationship_target(relationship = SubscribedTo<E>)]
 struct Subscribers<E: EntityEvent + Clone>(#[relationship] Vec<Entity>, PhantomData<fn() -> E>);
+
+/// Despawns a delivery entity whose source is gone. Events already routed
+/// to it are queued first, so they still run.
+fn despawn_delivery(mut world: DeferredWorld, context: HookContext) {
+    world.commands().entity(context.entity).try_despawn();
+}
 
 /// Owns delivery entities, so they despawn with the listener.
 #[derive(Component)]

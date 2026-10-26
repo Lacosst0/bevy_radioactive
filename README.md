@@ -98,7 +98,8 @@ declare any number of binds and watches.
   writes. Several writes in one frame are delivered once, with the latest value.
 - The current value isn't replayed when a scene spawns. Values inserted by the same
   scene are delivered as changes, so they render on spawn; initialize a node from an
-  existing resource yourself.
+  existing resource yourself. A `Singleton` whose resource doesn't exist yet waits for
+  it, and its first insertion is delivered as a change.
 - A reaction that writes another watched value is delivered in the same frame.
 - For global observers, call `app.track::<T>()` and observe `ValueChanged<T>` or
   `ValueRemoved<T>`.
@@ -386,7 +387,8 @@ view! {
 Each plugin runs in its own system set in `PostUpdate` — `WatchSystems`,
 `HooksSystems` and `ViewSystems` — before UI layout with the `ui` feature. Order
 systems that write watched values `.before(...)` the set to show them the same frame.
-Each runtime repeats until nothing changes, up to 8 rounds per frame.
+Each runtime repeats until nothing changes, up to 8 rounds per frame; if changes are
+still pending after that, it logs a warning and continues next frame.
 
 - `watch` adds one publisher per watched type using Bevy's `Changed<T>` filter. Each
   changed value is cloned once and shared with every watcher of that source.
