@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [bevy-0.20]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Bevy debug info dominates disk use and link time; tests do not need it.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Each style is independent, so each must build and pass on its own.
+  test:
+    name: test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - default
+          - watch
+          - subscribe
+          - hooks
+          - view
+          - watch,ui
+          - hooks,ui
+          - view,ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Select features
+        run: |
+          if [ "${{ matrix.features }}" = default ]; then
+            echo "FEATURES=" >> "$GITHUB_ENV"
+          else
+            echo "FEATURES=--no-default-features --features ${{ matrix.features }}" >> "$GITHUB_ENV"
+          fi
+      - run: cargo clippy $FEATURES --all-targets -- -D warnings
+      - run: cargo test $FEATURES
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+
+  # The comparison examples pull in full Bevy, which needs windowing and
+  # audio system libraries.
+  comparison:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features comparison --examples -- -D warnings

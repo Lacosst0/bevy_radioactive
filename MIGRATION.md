@@ -34,7 +34,10 @@ glob: `use bevy_radioactive::view::*;`.
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
 New: `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
-an event fires on a source.
+an event fires on a source. `hooks` has `cx.use_task(deps, start)` for async work
+(returns `TaskState`). `view` has `for $item in ..` rows that receive their item as a
+signal, `CopySignal` (`copy_signal`, `owns`, `SignalCommandsExt::spawn_signal`) and
+`#[derive(Store)]`.
 
 Behavior changes:
 
@@ -47,6 +50,18 @@ Behavior changes:
   them from a parent that re-renders.
 - `use_context` values are plain values; a provider re-render reaches consumers
   because its subtree renders again.
+- Unkeyed `hooks` child components are matched by the `@name(..)` call that created
+  them rather than by position, so a conditional sibling no longer shifts their state.
+  A hook that changes type resets with a warning instead of panicking.
+- A `Singleton` source whose resource doesn't exist yet waits for it instead of failing
+  the scene.
+- Delivery entities of `watch` and `subscribe` despawn when their source does, not only
+  with the declaring entity.
+- A duplicate key in a keyed `view!` `for` shows the last item with that key and logs a
+  warning; reading or writing a signal inside its own `with`/`update` panics instead of
+  deadlocking.
+- Each runtime logs a warning when it runs out of its 8 rounds in a frame. The crate
+  enables Bevy's `bevy_log` feature for this.
 
 # Migrating from 0.3 to 0.4
 
