@@ -199,9 +199,11 @@ fn hud() -> impl Scene {
 | `useMemo` / `useEffect` / `useRef` | `cx.use_memo` / `cx.use_effect` / `cx.use_ref` |
 | `createContext` / `useContext` | `cx.provide_context(value)` / `cx.use_context::<T>()` |
 | store/selector hooks | `cx.use_resource::<R>()` / `cx.use_component::<C>(entity)` |
+| `use(promise)` with Suspense | `cx.use_task(deps, \|d\| async { .. })` returns `TaskState` |
 
 The rendered scene is a child of the component's entity. A render replaces that
-subtree; child components keep their state, matched by position or key. Call hooks
+subtree; child components keep their state, matched by key, or else by the `@name(..)`
+call that created them, so a conditional sibling doesn't shift their state. Call hooks
 in the same order on every render. Props other than `Entity` must be
 `Clone + Send + Sync + 'static`. Keep components small: a render respawns the
 subtree.

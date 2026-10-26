@@ -56,6 +56,7 @@
 //! | `useMemo` / `useEffect` / `useRef` | [`Cx::use_memo`] / [`Cx::use_effect`] / [`Cx::use_ref`] |
 //! | `createContext` / `useContext` | [`Cx::provide_context`] / [`Cx::use_context`] |
 //! | store/selector hooks | [`Cx::use_resource`] / [`Cx::use_component`] |
+//! | `use(promise)` with Suspense | [`Cx::use_task`] |
 //!
 //! # Rendering
 //!
@@ -63,7 +64,7 @@
 //!   without a UI `Node` becomes a `GhostNode` (with the `ui` feature), so a
 //!   component can be a list item without affecting layout.
 //! - A render replaces the rendered subtree. Child components keep their
-//!   state, matched by position or key.
+//!   state, matched by key, or else by the `@name(..)` call that created them.
 //! - Call hooks in the same order on every render.
 //! - Props other than `Entity` must be `Clone + Send + Sync + 'static`.
 //! - Renders run in [`HooksSystems`] in `PostUpdate`, before UI layout.
@@ -72,8 +73,9 @@ use std::{
     any::{Any, TypeId, type_name},
     cell::{Cell, RefCell},
     hash::{BuildHasher, Hash},
+    panic::Location,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -93,6 +95,7 @@ use bevy::{
     scene::{
         EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene, WorldSceneExt,
     },
+    tasks::{AsyncComputeTaskPool, Task, TaskPool, futures::check_ready},
 };
 
 pub use crate::macros::component;
@@ -130,9 +133,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // Component instances
 // ---------------------------------------------------------------------------
 
+/// Identity of a child component within its parent's render.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ChildKey {
-    Position(usize),
+    /// Unkeyed: the source location of the `@name(..)` call, and how many
+    /// components that location created earlier in the same render.
+    Site {
+        site: &'static Location<'static>,
+        nth: u32,
+    },
+    /// Keyed with [`Element::key`].
     Key(u64),
 }
 
@@ -140,14 +150,17 @@ enum ChildKey {
 struct ChildSlots {
     previous: HashMap<ChildKey, Arc<Instance>>,
     current: HashMap<ChildKey, Arc<Instance>>,
-    position: usize,
+    sites: HashMap<&'static Location<'static>, u32>,
 }
 
 type PendingEffect = Box<dyn FnOnce(&mut Commands) + Send + Sync>;
 
 /// One mounted component: hook state, child instances and contexts.
+///
+/// A parent owns its child instances; the link back is weak, so despawning
+/// a host frees its whole instance tree.
 struct Instance {
-    parent: Option<Arc<Instance>>,
+    parent: Option<Weak<Instance>>,
     /// Bumped by state setters; a change re-renders the component.
     version: AtomicU64,
     hooks: Mutex<Vec<Box<dyn Any + Send + Sync>>>,
@@ -156,7 +169,7 @@ struct Instance {
 }
 
 impl Instance {
-    fn new(parent: Option<Arc<Instance>>) -> Arc<Self> {
+    fn new(parent: Option<Weak<Instance>>) -> Arc<Self> {
         Arc::new(Self {
             parent,
             version: AtomicU64::new(0),
@@ -167,19 +180,24 @@ impl Instance {
     }
 
     /// The instance for the next child mounted during a render, reusing the
-    /// one from the previous render with the same key or position.
-    fn child(self: &Arc<Self>, key: Option<u64>) -> Arc<Self> {
+    /// one from the previous render with the same key, or the same call site
+    /// and occurrence.
+    fn child(self: &Arc<Self>, key: Option<u64>, site: &'static Location<'static>) -> Arc<Self> {
         let mut slots = lock(&self.children);
         let key = if let Some(key) = key {
             ChildKey::Key(key)
         } else {
-            slots.position += 1;
-            ChildKey::Position(slots.position - 1)
+            let nth = slots.sites.entry(site).or_default();
+            *nth += 1;
+            ChildKey::Site {
+                site,
+                nth: *nth - 1,
+            }
         };
         let instance = slots
             .previous
             .remove(&key)
-            .unwrap_or_else(|| Self::new(Some(Arc::clone(self))));
+            .unwrap_or_else(|| Self::new(Some(Arc::downgrade(self))));
         slots.current.insert(key, Arc::clone(&instance));
         instance
     }
@@ -206,10 +224,10 @@ impl Drop for RenderingGuard {
     }
 }
 
-fn instance_for(key: Option<u64>) -> Arc<Instance> {
+fn instance_for(key: Option<u64>, site: &'static Location<'static>) -> Arc<Instance> {
     RENDERING
         .with(|stack| stack.borrow().last().cloned())
-        .map_or_else(|| Instance::new(None), |parent| parent.child(key))
+        .map_or_else(|| Instance::new(None), |parent| parent.child(key, site))
 }
 
 // ---------------------------------------------------------------------------
@@ -248,16 +266,24 @@ impl Cx<'_> {
         let mut slot = {
             let mut hooks = lock(&self.instance.hooks);
             if index == hooks.len() {
-                hooks.push(Box::new(init()));
+                hooks.push(Box::new(()));
             }
             std::mem::replace(&mut hooks[index], Box::new(()))
         };
-        let hook = slot.downcast_mut::<H>().unwrap_or_else(|| {
-            panic!(
-                "hook #{index} changed type to `{}`; call hooks in the same order on every render",
-                type_name::<H>(),
-            )
-        });
+        if !slot.is::<H>() {
+            // A new slot holds `()`. Anything else means hooks were called
+            // in a different order than on the previous render.
+            if !slot.is::<()>() {
+                warn!(
+                    "hooks: hook #{index} changed type to `{}`, so its state was reset; call \
+                     hooks in the same order on every render, or give conditional \
+                     components a `.key(..)`",
+                    type_name::<H>(),
+                );
+            }
+            slot = Box::new(init());
+        }
+        let hook = slot.downcast_mut::<H>().expect("slot was just checked");
         let result = use_hook(hook);
         lock(&self.instance.hooks)[index] = slot;
         result
@@ -411,7 +437,7 @@ impl Cx<'_> {
     /// Like React's `useContext`: the nearest ancestor's provided `T`.
     #[must_use]
     pub fn use_context<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
-        let mut ancestor = self.instance.parent.clone();
+        let mut ancestor = self.instance.parent.as_ref().and_then(Weak::upgrade);
         while let Some(instance) = ancestor {
             if let Some(value) = lock(&instance.contexts)
                 .get(&TypeId::of::<T>())
@@ -419,15 +445,111 @@ impl Cx<'_> {
             {
                 return Some(value.clone());
             }
-            #[expect(
-                clippy::assigning_clones,
-                reason = "`instance` is moved out of `ancestor`"
-            )]
-            {
-                ancestor = instance.parent.clone();
-            }
+            ancestor = instance.parent.as_ref().and_then(Weak::upgrade);
         }
         None
+    }
+
+    /// Runs an async task for `deps` and re-renders when it finishes, like
+    /// React's `use` with Suspense.
+    ///
+    /// The first render with new `deps` starts `start(deps)` on Bevy's
+    /// [`AsyncComputeTaskPool`] and returns [`TaskState::Pending`]. Once the
+    /// future completes, the component re-renders and gets
+    /// [`TaskState::Ready`] with a clone of the output until `deps` change.
+    /// Changing `deps` drops the running task, which cancels it, and so does
+    /// despawning the component.
+    ///
+    /// ```ignore
+    /// let name = match cx.use_task(user_id, |id| async move { load_user(id).await }) {
+    ///     TaskState::Pending => "Loading...".to_string(),
+    ///     TaskState::Ready(user) => user.name,
+    /// };
+    /// ```
+    pub fn use_task<D, T, F, Fut>(&self, deps: D, start: F) -> TaskState<T>
+    where
+        D: PartialEq + Send + Sync + 'static,
+        T: Clone + Send + Sync + 'static,
+        F: FnOnce(&D) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let slot = self.hook(
+            || None::<(D, Arc<TaskSlot<T>>)>,
+            |hook| {
+                if let Some((previous, slot)) = hook
+                    && *previous == deps
+                {
+                    return Arc::clone(slot);
+                }
+                let pool = AsyncComputeTaskPool::get_or_init(TaskPool::default);
+                let slot = Arc::new(TaskSlot {
+                    task: Mutex::new(Some(pool.spawn(start(&deps)))),
+                    output: Mutex::new(None),
+                });
+                // Replacing the previous slot drops its task, cancelling it.
+                *hook = Some((deps, Arc::clone(&slot)));
+                slot
+            },
+        );
+        let output = lock(&slot.output).clone();
+        if output.is_none() {
+            self.reads.borrow_mut().push(Read {
+                key: ReadKey::Task(slot),
+                present: true,
+            });
+        }
+        output.map_or(TaskState::Pending, TaskState::Ready)
+    }
+}
+
+/// Progress of a [`Cx::use_task`] task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskState<T> {
+    /// The task is running.
+    Pending,
+    /// The task finished with this output.
+    Ready(T),
+}
+
+impl<T> TaskState<T> {
+    /// The output, if the task finished.
+    #[must_use]
+    pub fn ready(self) -> Option<T> {
+        match self {
+            Self::Pending => None,
+            Self::Ready(value) => Some(value),
+        }
+    }
+
+    /// Whether the task is still running.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+/// A [`Cx::use_task`] task and, once it finished, its output.
+struct TaskSlot<T> {
+    task: Mutex<Option<Task<T>>>,
+    output: Mutex<Option<T>>,
+}
+
+/// A running task, polled by the render loop like any other read.
+trait PollTask: Send + Sync {
+    /// Moves the output in if the task finished; returns whether it did.
+    fn poll_finished(&self) -> bool;
+}
+
+impl<T: Send + Sync + 'static> PollTask for TaskSlot<T> {
+    fn poll_finished(&self) -> bool {
+        let mut task = lock(&self.task);
+        let Some(output) = task.as_mut().and_then(check_ready) else {
+            return task.is_none();
+        };
+        *task = None;
+        drop(task);
+        *lock(&self.output) = Some(output);
+        true
     }
 }
 
@@ -443,9 +565,16 @@ pub type Dispatch<A> = Arc<dyn Fn(A) + Send + Sync>;
 
 /// A component with its props, ready to be placed in a scene. Returned by
 /// `#[component]` functions and [`component()`].
+///
+/// An unkeyed component is matched across its parent's renders by the call
+/// site that created it (the `@name(..)` call) and how many components that
+/// site created before it, so adding or removing a conditional sibling does
+/// not move another component's state. Components created in a loop share a
+/// call site; key them.
 pub struct Element<P, F> {
     props: P,
     key: Option<u64>,
+    site: &'static Location<'static>,
     render: F,
 }
 
@@ -465,6 +594,7 @@ pub fn keyed<P, F>(key: impl Hash, element: Element<P, F>) -> Element<P, F> {
 }
 
 /// Mounts a closure as a component: `component(|cx| bsn! { .. })`.
+#[track_caller]
 pub fn component<F, S>(render: F) -> Element<(), impl Render<()>>
 where
     F: Fn(&Cx) -> S + Clone + Send + Sync + 'static,
@@ -474,6 +604,7 @@ where
 }
 
 #[doc(hidden)]
+#[track_caller]
 pub fn element<P, F, S>(props: P, render: F) -> Element<P, F>
 where
     P: EntityProps,
@@ -483,6 +614,7 @@ where
     Element {
         props,
         key: None,
+        site: Location::caller(),
         render,
     }
 }
@@ -593,7 +725,11 @@ where
         }
         let props = self.props.resolve(context)?;
         let renderer = Renderer {
-            render: render_loop(instance_for(self.key), self.render.clone(), props),
+            render: render_loop(
+                instance_for(self.key, self.site),
+                self.render.clone(),
+                props,
+            ),
             reads: Vec::new(),
             last_run: None,
         };
@@ -609,6 +745,7 @@ where
         Self {
             props: self.props.clone_props(),
             key: self.key,
+            site: self.site,
             render: self.render.clone(),
         }
     }
@@ -639,6 +776,8 @@ enum ReadKey {
     Resource(ComponentId),
     Unregistered(TypeId),
     State(Arc<Instance>, u64),
+    /// A running [`Cx::use_task`] task; changed once it finished.
+    Task(Arc<dyn PollTask>),
 }
 
 #[derive(Clone)]
@@ -660,6 +799,7 @@ impl Read {
                 .and_then(|entity| world.get_entity(entity).ok())
                 .and_then(|entity| entity.get_change_ticks_by_id(id)),
             ReadKey::State(instance, version) => return instance.version() != *version,
+            ReadKey::Task(task) => return task.poll_finished(),
             &ReadKey::Unregistered(type_id) => {
                 return world.components().get_id(type_id).is_some();
             }
@@ -703,6 +843,10 @@ fn render_all(world: &mut World) {
             return;
         }
     }
+    warn!(
+        "hooks: components still re-rendering after {MAX_ROUNDS} rounds; the rest render next \
+         frame. A render may be setting its own state."
+    );
 }
 
 /// Re-renders every component whose reads changed. Returns how many ran.
@@ -788,7 +932,7 @@ where
         {
             let mut slots = lock(&instance.children);
             slots.previous = std::mem::take(&mut slots.current);
-            slots.position = 0;
+            slots.sites.clear();
         }
         RENDERING.with(|stack| stack.borrow_mut().push(Arc::clone(&instance)));
         let guard = RenderingGuard;

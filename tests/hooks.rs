@@ -282,3 +282,207 @@ fn use_reducer_applies_actions_to_latest_state() {
     app.update();
     assert_eq!(texts(&mut app), vec![(4, "5".into())]);
 }
+
+#[derive(Resource, Clone, Default)]
+struct Show(bool);
+
+#[component]
+fn maybe_first(cx: &Cx) -> impl Scene {
+    let first = cx
+        .use_resource::<Show>()
+        .unwrap_or_default()
+        .0
+        .then(|| bsn_list! { @counter(9) });
+    bsn! { Node Children [ {first} -- @counter(0) ] }
+}
+
+#[test]
+fn conditional_siblings_do_not_move_state() {
+    let mut app = app();
+    app.init_resource::<Show>();
+    app.world_mut()
+        .spawn_scene(bsn! { @maybe_first() })
+        .unwrap();
+    app.update();
+    let setter = app.world().resource::<Setter>().0.clone().unwrap();
+    setter(2);
+    app.update();
+    assert_eq!(texts(&mut app), vec![(0, "count 2".into())]);
+
+    // A sibling appearing before it keeps `counter(0)`'s state in place.
+    app.world_mut().resource_mut::<Show>().0 = true;
+    app.update();
+    assert_eq!(
+        texts(&mut app),
+        vec![(0, "count 2".into()), (9, "count 0".into())]
+    );
+}
+
+#[derive(Resource, Clone, Default)]
+struct Flip(bool);
+
+#[component]
+fn shifty(cx: &Cx) -> impl Scene {
+    let text = if cx.use_resource::<Flip>().unwrap_or_default().0 {
+        cx.use_memo((), |()| "memo".to_string())
+    } else {
+        cx.use_state(|| "state".to_string()).0
+    };
+    bsn! { Label(1) Text({text}) }
+}
+
+#[test]
+fn a_hook_changing_type_resets_instead_of_panicking() {
+    let mut app = app();
+    app.init_resource::<Flip>();
+    app.world_mut().spawn_scene(bsn! { @shifty() }).unwrap();
+    app.update();
+    assert_eq!(texts(&mut app), vec![(1, "state".into())]);
+    app.world_mut().resource_mut::<Flip>().0 = true;
+    app.update();
+    assert_eq!(texts(&mut app), vec![(1, "memo".into())]);
+}
+
+/// Counts drops of the values it is cloned into.
+#[derive(Resource, Clone, Default)]
+struct Drops(Arc<AtomicUsize>);
+
+struct Probe(Arc<AtomicUsize>);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[component]
+fn leaf(cx: &Cx) -> impl Scene {
+    let drops = cx.world().resource::<Drops>().0.clone();
+    let _ = cx.use_ref(|| Probe(drops));
+    bsn! { Node }
+}
+
+#[component]
+fn branch(cx: &Cx) -> impl Scene {
+    let drops = cx.world().resource::<Drops>().0.clone();
+    let _ = cx.use_ref(|| Probe(drops));
+    bsn! { Node Children [ @leaf() ] }
+}
+
+#[test]
+fn despawning_a_component_frees_its_instance_tree() {
+    let mut app = app();
+    app.init_resource::<Drops>();
+    let root = app
+        .world_mut()
+        .spawn_scene(bsn! { @branch() })
+        .unwrap()
+        .id();
+    app.update();
+    let drops = app.world().resource::<Drops>().0.clone();
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    app.world_mut().despawn(root);
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+}
+
+mod tasks {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::Mutex,
+        task::{Context, Poll, Waker},
+    };
+
+    use super::*;
+
+    /// A future that finishes when its gate opens, and counts its drops.
+    #[derive(Clone, Default)]
+    struct Gate {
+        state: Arc<Mutex<(Option<u32>, Option<Waker>)>>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Gate {
+        fn open(&self, value: u32) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = Some(value);
+            if let Some(waker) = state.1.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    struct Waiting(Gate);
+
+    impl Future for Waiting {
+        type Output = u32;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+            let mut state = self.0.state.lock().unwrap();
+            if let Some(value) = state.0 {
+                Poll::Ready(value)
+            } else {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Resource, Clone)]
+    struct Gates(Vec<Gate>);
+
+    #[derive(Resource, Clone, Default)]
+    struct Which(usize);
+
+    #[component]
+    fn loader(cx: &Cx) -> impl Scene {
+        let which = cx.use_resource::<Which>().unwrap_or_default().0;
+        let gate = cx.world().resource::<Gates>().0[which].clone();
+        let state = cx.use_task(which, move |_| Waiting(gate));
+        let text = match state {
+            TaskState::Pending => "pending".to_string(),
+            TaskState::Ready(value) => value.to_string(),
+        };
+        bsn! { Label(7) Text({text}) }
+    }
+
+    /// Updates until the text changes from `from`, since tasks finish on
+    /// another thread.
+    fn wait_for(app: &mut App, from: &str) -> String {
+        for _ in 0..1000 {
+            app.update();
+            let text = texts(app)[0].1.clone();
+            if text != from {
+                return text;
+            }
+            std::thread::yield_now();
+        }
+        panic!("text stayed {from:?}");
+    }
+
+    #[test]
+    fn use_task_renders_its_output_and_cancels_on_new_deps() {
+        let gates = vec![Gate::default(), Gate::default()];
+        let mut app = app();
+        app.insert_resource(Gates(gates.clone()))
+            .init_resource::<Which>();
+        app.world_mut().spawn_scene(bsn! { @loader() }).unwrap();
+        app.update();
+        assert_eq!(texts(&mut app), vec![(7, "pending".into())]);
+
+        // New deps drop the running task.
+        app.world_mut().resource_mut::<Which>().0 = 1;
+        app.update();
+        assert_eq!(gates[0].dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(texts(&mut app), vec![(7, "pending".into())]);
+
+        gates[1].open(5);
+        assert_eq!(wait_for(&mut app, "pending"), "5");
+    }
+}

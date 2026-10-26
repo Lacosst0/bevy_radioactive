@@ -851,6 +851,7 @@ fn component_fn(function: syn::ItemFn) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         #(#attrs)*
+        #[track_caller]
         #vis fn #name #impl_generics (#(#outer_inputs),*)
             -> #hooks::Element<
                 impl #hooks::EntityProps<Output = (#(#entity_types,)*)>,
