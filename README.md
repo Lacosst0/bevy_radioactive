@@ -110,6 +110,7 @@ same or different sources and types. Use `source()` on the event to tell sources
 | `subscribe_to(source, handler)` | source receives entity event `E` | observer with `Subscription<E>` input |
 | `computed(\|r: &Reads\| C)` | anything it read changed | keeps component `C` on this entity equal to the result |
 | `computed_opt(\|r: &Reads\| Option<C>)` | same | inserts `C`, or removes it on `None` |
+| `layout_effect(\|r: &Reads, commands\|)` | after UI layout, when anything it read changed | side effects that read layout output |
 
 `bind` writes the source's current value when the scene spawns (it is delivered at the
 start of the next reactive pass, so a component in the same scene already exists).
@@ -136,6 +137,50 @@ fn medal() -> impl Scene {
             10..100 => 1,
             _ => 2,
         }))
+    }
+}
+```
+
+### Presence, inherited context and layout effects
+
+`Reads` has two more tracked reads:
+
+- `r.has::<C>(entity)` / `r.this_has::<C>()` return whether the component is there and
+  depend only on that: inserting or removing `C` re-runs the reader, changing its value
+  doesn't. Use them for markers such as `Pressed`, `Checked` or a selection marker.
+- `r.inherited::<C>()` returns `C` from the reader's own entity or its nearest
+  `ChildOf` ancestor. It is context provided through the ECS: an ancestor provides a
+  value by holding the component, and the nearest one wins, so a subtree can override
+  it. Changing the provider's value, adding an override in between, or reparenting
+  re-runs the reader. `webby` components get it as `cx.inherited::<C>()`.
+
+`layout_effect(|r: &Reads, commands| ..)` is an `effect` that runs after UI layout and
+transform propagation, in `ReactiveSet::PostLayout`, so it can read this frame's
+`ComputedNode` or `GlobalTransform`. Values it writes are laid out on the next frame.
+
+```rust
+use bevy::{prelude::*, ui::Pressed};
+use bevy_radioactive::prelude::*;
+
+#[derive(Component, Clone, Copy, Default, PartialEq)]
+struct Theme { accent: Color }
+
+fn panel() -> impl Scene {
+    bsn! {
+        Node Theme { accent: Color::WHITE }
+        Children [
+            Node
+            computed(|r: &Reads| BackgroundColor(if r.this_has::<Pressed>() {
+                Color::BLACK
+            } else {
+                r.inherited::<Theme>().map_or(Color::BLACK, |t| t.accent)
+            }))
+            layout_effect(|r: &Reads, _: &mut Commands| {
+                if let Some(node) = r.this::<ComputedNode>() {
+                    debug!("panel is {:?}", node.size());
+                }
+            })
+        ]
     }
 }
 ```

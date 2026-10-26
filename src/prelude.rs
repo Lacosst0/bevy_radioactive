@@ -36,5 +36,5 @@ pub use crate::{
 #[allow(deprecated)]
 pub use crate::{bind_or, on_removed};
 
-pub use crate::coat::{Signal, coat, coat_list, effect, memo, signal};
+pub use crate::coat::{Signal, coat, coat_list, effect, layout_effect, memo, signal};
 pub use crate::webby::{Cx, Either, either};

@@ -19,7 +19,9 @@ New: `watch_immediate`, `bind_deferred` and `Bind::deferred`, `computed` and
 `computed_opt`, `Cleanup`/`IntoCleanup`, `Cx::on_unmount`, `either`/`Either`,
 `#[entity]` component props, `Result<impl Scene>` component renders, `$&name` borrowed
 signal reads in `coat!`, `ReactiveDiagnostics`, `ReactiveSet::Settled`, and the
-`testing` module (`settle`, `settle_n`). The prelude now also exports `ReactiveSet`,
+`testing` module (`settle`, `settle_n`). Also new: presence-only reads
+(`Reads::has`/`this_has`), hierarchy-inherited components (`Reads::inherited`),
+`layout_effect` with `ReactiveSet::PostLayout`. The prelude now also exports `ReactiveSet`,
 `ReactiveSettings`, `ReactiveDiagnostics`, `Reads`, `Signal`, `signal`, `memo`,
 `effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed` and the new helpers. It
 does not export `#[component]`, which would clash with Bevy's `#[component(..)]` derive
@@ -64,6 +66,9 @@ Behavior changes:
   instead of leaking it.
 - `webby` instance trees are freed when their host despawns (the parent link is weak).
 - The crate enables Bevy's `bevy_log` feature.
+- `ReactiveSet` has a new `PostLayout` variant (runs `layout_effect`s after UI layout and
+  transform propagation); exhaustive `match`es on `ReactiveSet` need an extra arm.
+  `ReactiveDiagnostics::effects_run` also counts post-layout effects.
 
 # Migrating from 0.3 to 0.4
 

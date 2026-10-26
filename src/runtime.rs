@@ -80,6 +80,71 @@ impl<'w> Reads<'w> {
         self.get(self.target)
     }
 
+    /// Whether `entity` has component `T`, depending only on its presence.
+    ///
+    /// Inserting or removing `T` (or despawning `entity`) re-runs the
+    /// effect; changing the value of an existing `T` does not. Use it for
+    /// marker components such as `Pressed`, `Checked` or a selection marker,
+    /// and for any component whose value the effect does not need.
+    ///
+    /// ```ignore
+    /// computed(|r: &Reads| BorderColor::all(if r.this_has::<Pressed>() { ACCENT } else { IDLE }))
+    /// ```
+    pub fn has<T: Component>(&self, entity: Entity) -> bool {
+        let present = self
+            .world
+            .get_entity(entity)
+            .is_ok_and(|entity| entity.contains::<T>());
+        let key = match self.world.component_id::<T>() {
+            Some(id) => DepKey::Presence(entity, id),
+            None => DepKey::Unregistered(TypeId::of::<T>()),
+        };
+        self.track(key, present);
+        present
+    }
+
+    /// Whether the effect's own entity has component `T`, depending only on
+    /// its presence. See [`has`](Self::has).
+    pub fn this_has<T: Component>(&self) -> bool {
+        self.has::<T>(self.target)
+    }
+
+    /// Component `C` inherited down the entity hierarchy: `C` on the
+    /// effect's own entity, or else on its nearest `ChildOf` ancestor that
+    /// has one.
+    ///
+    /// This is context provided through the ECS: an ancestor provides a
+    /// value by holding `C`, and the nearest provider wins, so a subtree can
+    /// override it. The effect depends on the provider's `C`, on `C`
+    /// appearing on any entity between it and the provider (a closer
+    /// override), and on the `ChildOf` links walked (reparenting).
+    ///
+    /// ```ignore
+    /// #[derive(Component, Clone, PartialEq)]
+    /// struct Theme { accent: Color }
+    ///
+    /// bsn! {
+    ///     Node Theme { accent: RED }
+    ///     Children [
+    ///         Node
+    ///         computed(|r: &Reads| BackgroundColor(r.inherited::<Theme>().map_or(GRAY, |t| t.accent)))
+    ///     ]
+    /// }
+    /// ```
+    pub fn inherited<C: Component>(&self) -> Option<&'w C> {
+        self.inherited_from(self.target)
+    }
+
+    /// Like [`inherited`](Self::inherited), starting at `entity`.
+    pub fn inherited_from<C: Component>(&self, mut entity: Entity) -> Option<&'w C> {
+        loop {
+            if let Some(value) = self.get::<C>(entity) {
+                return Some(value);
+            }
+            entity = self.get::<ChildOf>(entity)?.parent();
+        }
+    }
+
     /// Reads resource `T` and depends on it.
     pub fn resource<T: Resource>(&self) -> Option<&'w T> {
         let value = self.world.get_resource::<T>();
@@ -105,6 +170,8 @@ impl<'w> Reads<'w> {
 #[derive(Clone)]
 enum DepKey {
     Component(Entity, ComponentId),
+    /// Only whether the entity has the component.
+    Presence(Entity, ComponentId),
     Resource(ComponentId),
     Unregistered(TypeId),
     Signal(crate::coat::SignalDep),
@@ -123,6 +190,12 @@ impl Dep {
                 .get_entity(entity)
                 .ok()
                 .and_then(|entity| entity.get_change_ticks_by_id(id)),
+            &DepKey::Presence(entity, id) => {
+                let present = world
+                    .get_entity(entity)
+                    .is_ok_and(|entity| entity.contains_id(id));
+                return present != self.present;
+            }
             &DepKey::Resource(id) => world
                 .resource_entities()
                 .get(id)
@@ -191,8 +264,21 @@ impl From<Vec<Dep>> for Ran {
 
 pub(crate) type RunFn = Box<dyn FnMut(&mut World, Entity) -> Ran + Send + Sync>;
 
+/// When an effect runs within a frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// In [`ReactiveSet::Publish`](crate::ReactiveSet::Publish), before UI
+    /// layout, until stable.
+    #[default]
+    Main,
+    /// In [`ReactiveSet::PostLayout`](crate::ReactiveSet::PostLayout), after
+    /// UI layout and transform propagation.
+    PostLayout,
+}
+
 struct Slot {
     run: RunFn,
+    phase: Phase,
     deps: Vec<Dep>,
     last_run: Option<Tick>,
     cleanup: Option<Cleanup>,
@@ -243,6 +329,8 @@ fn run_unmounted(world: &mut World) -> usize {
 struct EffectHosts {
     all: EntityHashSet,
     fresh: Vec<Entity>,
+    /// Hosts with at least one [`Phase::PostLayout`] effect.
+    post_layout: EntityHashSet,
 }
 
 fn register_host(mut world: DeferredWorld, context: HookContext) {
@@ -255,6 +343,7 @@ fn register_host(mut world: DeferredWorld, context: HookContext) {
 fn unregister_host(mut world: DeferredWorld, context: HookContext) {
     if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
         hosts.all.remove(&context.entity);
+        hosts.post_layout.remove(&context.entity);
     }
     let cleanups: Vec<Cleanup> = world
         .get_mut::<Effects>(context.entity)
@@ -283,19 +372,26 @@ fn depth(world: &World, mut entity: Entity) -> usize {
     depth
 }
 
-/// Runs every dirty effect once. Returns the number of effects that ran.
+/// Runs every dirty effect of `phase` once. Returns the number of effects
+/// that ran.
 ///
 /// Hosts run parent-first, so a parent that re-renders despawns stale
-/// children before they run. Hosts spawned during the pass (child
+/// children before they run. Hosts spawned during a main pass (child
 /// components and nested regions) run in the same pass, so a pass settles a
-/// whole tree rather than one level of it.
-pub(crate) fn run_effects(world: &mut World) -> usize {
+/// whole tree rather than one level of it. Hosts spawned during a
+/// post-layout pass wait for the next main pass.
+pub(crate) fn run_effects(world: &mut World, phase: Phase) -> usize {
     let mut queue: Vec<Entity> = {
         let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() else {
             return 0;
         };
-        hosts.fresh.clear();
-        hosts.all.iter().copied().collect()
+        match phase {
+            Phase::Main => {
+                hosts.fresh.clear();
+                hosts.all.iter().copied().collect()
+            }
+            Phase::PostLayout => hosts.post_layout.iter().copied().collect(),
+        }
     };
     queue.sort_by_cached_key(|&host| depth(world, host));
     let mut ran = run_unmounted(world);
@@ -303,9 +399,11 @@ pub(crate) fn run_effects(world: &mut World) -> usize {
     while next < queue.len() {
         let host = queue[next];
         next += 1;
-        ran += run_host(world, host);
-        let fresh = std::mem::take(&mut world.resource_mut::<EffectHosts>().fresh);
-        queue.extend(fresh);
+        ran += run_host(world, host, phase);
+        if phase == Phase::Main {
+            let fresh = std::mem::take(&mut world.resource_mut::<EffectHosts>().fresh);
+            queue.extend(fresh);
+        }
     }
     ran += run_unmounted(world);
     let post = world
@@ -319,7 +417,7 @@ pub(crate) fn run_effects(world: &mut World) -> usize {
     ran
 }
 
-fn run_host(world: &mut World, host: Entity) -> usize {
+fn run_host(world: &mut World, host: Entity, phase: Phase) -> usize {
     let Ok(mut entity) = world.get_entity_mut(host) else {
         return 0;
     };
@@ -332,6 +430,9 @@ fn run_host(world: &mut World, host: Entity) -> usize {
     let mut slots = std::mem::take(&mut effects.bypass_change_detection().0);
     let mut ran = 0;
     for slot in &mut slots {
+        if slot.phase != phase {
+            continue;
+        }
         let this_run = world.read_change_tick();
         let dirty = slot.last_run.is_none_or(|last_run| {
             slot.deps
@@ -498,6 +599,7 @@ impl<D: Deps> Deps for Vec<D> {
 pub struct Effect<D, F> {
     deps: D,
     make: F,
+    phase: Phase,
 }
 
 impl<D, F> Template for Effect<D, F>
@@ -510,7 +612,7 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         ensure_runtime(context)?;
         let deps = self.deps.resolve(context)?;
-        attach(context, (self.make)(deps));
+        attach_in(context, (self.make)(deps), self.phase);
         Ok(EmptySceneEffect)
     }
 
@@ -518,6 +620,7 @@ where
         Self {
             deps: self.deps.clone_deps(),
             make: self.make.clone(),
+            phase: self.phase,
         }
     }
 }
@@ -541,7 +644,15 @@ pub(crate) fn effect_template<D: Deps>(
     deps: D,
     make: impl Fn(D::Output) -> RunFn + Clone + Send + Sync + 'static,
 ) -> impl Template<Output = EmptySceneEffect> + Scene {
-    Effect { deps, make }
+    effect_template_in(Phase::Main, deps, make)
+}
+
+pub(crate) fn effect_template_in<D: Deps>(
+    phase: Phase,
+    deps: D,
+    make: impl Fn(D::Output) -> RunFn + Clone + Send + Sync + 'static,
+) -> impl Template<Output = EmptySceneEffect> + Scene {
+    Effect { deps, make, phase }
 }
 
 pub(crate) fn tracked<R>(
@@ -564,7 +675,9 @@ pub(crate) fn tracked<R>(
 pub(crate) fn forget<C: Component>(world: &World, deps: &mut Vec<Dep>, target: Entity) {
     let id = world.component_id::<C>();
     deps.retain(|dep| match dep.key {
-        DepKey::Component(entity, other) => entity != target || Some(other) != id,
+        DepKey::Component(entity, other) | DepKey::Presence(entity, other) => {
+            entity != target || Some(other) != id
+        }
         DepKey::Unregistered(type_id) => type_id != TypeId::of::<C>(),
         _ => true,
     });
@@ -611,8 +724,14 @@ pub(crate) fn ensure_runtime(context: &mut TemplateContext) -> Result {
 
 /// Adds an effect to the entity being built.
 pub(crate) fn attach(context: &mut TemplateContext, run: RunFn) {
+    attach_in(context, run, Phase::Main);
+}
+
+/// Adds an effect that runs in `phase` to the entity being built.
+pub(crate) fn attach_in(context: &mut TemplateContext, run: RunFn, phase: Phase) {
     let slot = Slot {
         run,
+        phase,
         deps: Vec::new(),
         last_run: None,
         cleanup: None,
@@ -621,6 +740,14 @@ pub(crate) fn attach(context: &mut TemplateContext, run: RunFn) {
         effects.0.push(slot);
     } else {
         context.entity.insert(Effects(vec![slot]));
+    }
+    if phase == Phase::PostLayout {
+        let host = context.entity.id();
+        context.entity.world_scope(|world| {
+            if let Some(mut hosts) = world.get_resource_mut::<EffectHosts>() {
+                hosts.post_layout.insert(host);
+            }
+        });
     }
 }
 

@@ -120,7 +120,9 @@ use bevy::{
 pub use crate::macros::{coat, coat_list};
 
 pub use crate::runtime::{Cleanup, IntoCleanup, Reads};
-use crate::runtime::{Ran, RunFn, effect_template, signal_deps, spawn_child, tracked};
+use crate::runtime::{
+    Phase, Ran, RunFn, effect_template, effect_template_in, signal_deps, spawn_child, tracked,
+};
 
 // ---------------------------------------------------------------------------
 // Dependency tracking
@@ -562,7 +564,42 @@ where
     F: Fn(&Reads, &mut Commands) -> C + Clone + Send + Sync + 'static,
     C: IntoCleanup,
 {
-    effect_template((), move |()| -> RunFn {
+    effect_in(Phase::Main, f)
+}
+
+/// Like [`effect`], but runs after UI layout and transform propagation, in
+/// [`ReactiveSet::PostLayout`], like Vue's `flush: 'post'` watchers or
+/// React's `useLayoutEffect`.
+///
+/// Use it to read what layout computed this frame, such as `ComputedNode`
+/// or `GlobalTransform`. It runs when spawned (in the first post-layout
+/// phase after its entity spawns) and again whenever something it read
+/// changed since its last run. Writes it makes are seen by ordinary effects
+/// and laid out on the next frame.
+///
+/// ```ignore
+/// layout_effect(|r: &Reads, commands: &mut Commands| {
+///     if let Some(node) = r.this::<ComputedNode>() {
+///         commands.trigger(Measured { entity: r.entity(), size: node.size() });
+///     }
+/// })
+/// ```
+///
+/// [`ReactiveSet::PostLayout`]: crate::reactivity::ReactiveSet::PostLayout
+pub fn layout_effect<F, C>(f: F) -> impl Template<Output = EmptySceneEffect>
+where
+    F: Fn(&Reads, &mut Commands) -> C + Clone + Send + Sync + 'static,
+    C: IntoCleanup,
+{
+    effect_in(Phase::PostLayout, f)
+}
+
+fn effect_in<F, C>(phase: Phase, f: F) -> impl Template<Output = EmptySceneEffect>
+where
+    F: Fn(&Reads, &mut Commands) -> C + Clone + Send + Sync + 'static,
+    C: IntoCleanup,
+{
+    effect_template_in(phase, (), move |()| -> RunFn {
         let f = f.clone();
         Box::new(move |world: &mut World, target| {
             let mut queue = CommandQueue::default();

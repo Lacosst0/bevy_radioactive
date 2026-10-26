@@ -23,6 +23,7 @@ use bevy::{
     scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, Scene},
 };
 
+use crate::runtime::Phase;
 use crate::subscription::{
     Replay, Source, Subscribe, Subscribers, Subscription, SubscriptionEvent, forwarder,
     install_subscription, register_routed, route, spawn_subscriptions,
@@ -49,6 +50,11 @@ pub enum ReactiveSet {
     /// feature still before UI layout. Put systems that read reactive
     /// output in this set.
     Settled,
+    /// Runs [`layout_effect`](crate::coat::layout_effect)s, after transform
+    /// propagation and, with the `ui` feature, after UI layout
+    /// (`UiSystems::PostLayout`), so they can read `ComputedNode` and
+    /// `GlobalTransform` of the current frame.
+    PostLayout,
 }
 
 /// Schedule containing one publisher per tracked type.
@@ -88,13 +94,25 @@ impl Plugin for RadioactivePlugin {
             .init_resource::<ReactiveDiagnostics>()
             .init_resource::<PendingReplays>()
             .init_schedule(ReactivePublish)
-            .add_systems(PostUpdate, run_reactive.in_set(ReactiveSet::Publish));
+            .add_systems(PostUpdate, run_reactive.in_set(ReactiveSet::Publish))
+            .add_systems(PostUpdate, run_post_layout.in_set(ReactiveSet::PostLayout));
         crate::runtime::init(app.world_mut());
-        app.configure_sets(PostUpdate, ReactiveSet::Settled.after(ReactiveSet::Publish));
+        app.configure_sets(
+            PostUpdate,
+            (
+                ReactiveSet::Settled.after(ReactiveSet::Publish),
+                ReactiveSet::PostLayout
+                    .after(ReactiveSet::Settled)
+                    .after(bevy::transform::TransformSystems::Propagate),
+            ),
+        );
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
-            (ReactiveSet::Publish, ReactiveSet::Settled).before(bevy::ui::UiSystems::Prepare),
+            (
+                (ReactiveSet::Publish, ReactiveSet::Settled).before(bevy::ui::UiSystems::Prepare),
+                ReactiveSet::PostLayout.after(bevy::ui::UiSystems::PostLayout),
+            ),
         );
     }
 }
@@ -196,7 +214,7 @@ fn run_reactive(world: &mut World) {
         let _ = world.try_run_schedule(ReactivePublish);
         world.flush();
         let published = world.resource::<PublishCounter>().0.load(Ordering::Relaxed);
-        let ran = crate::runtime::run_effects(world);
+        let ran = crate::runtime::run_effects(world, Phase::Main);
         frame.passes += 1;
         frame.publications += published;
         frame.effects_run += ran;
@@ -212,6 +230,21 @@ fn run_reactive(world: &mut World) {
         warn_once!(
             "bevy_radioactive: reached `ReactiveSettings::max_passes` ({max_passes}) with              reactive work left; it continues next frame. This usually means a feedback              cycle, such as an effect that writes a value it reads."
         );
+    }
+}
+
+/// Runs post-layout effects until they stop writing each other's inputs, up
+/// to [`ReactiveSettings::max_passes`] passes. Values they write are seen by
+/// main-phase effects and laid out on the next frame.
+fn run_post_layout(world: &mut World) {
+    let max_passes = world.resource::<ReactiveSettings>().max_passes.max(1);
+    for _ in 0..max_passes {
+        let ran = crate::runtime::run_effects(world, Phase::PostLayout);
+        world.flush();
+        if ran == 0 {
+            break;
+        }
+        world.resource_mut::<ReactiveDiagnostics>().effects_run += ran;
     }
 }
 
