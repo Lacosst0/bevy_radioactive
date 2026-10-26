@@ -1,8 +1,8 @@
 //! Convenient imports for BSN code using `bevy_radioactive`.
 //!
 //! Brings in the watching, binding and subscription helpers, `computed`,
-//! the runtime's settings and system sets, and the constructors of the
-//! `coat` and `webby` layers. The `#[component]` attribute is not included,
+//! the runtime's settings and system sets, selections, monitors, and the
+//! constructors of the `coat` and `webby` layers. The `#[component]` attribute is not included,
 //! because it would make Bevy's `#[component(..)]` derive helper ambiguous;
 //! import it from [`webby`](crate::webby) where components are defined.
 //!
@@ -37,4 +37,6 @@ pub use crate::{
 pub use crate::{bind_or, on_removed};
 
 pub use crate::coat::{Signal, coat, coat_list, effect, layout_effect, memo, signal};
+pub use crate::monitor::{Monitor, MonitorAppExt};
+pub use crate::select::{SelectCommandsExt, SelectEntityCommandsExt, Selected, Selection};
 pub use crate::webby::{Cx, Either, either};

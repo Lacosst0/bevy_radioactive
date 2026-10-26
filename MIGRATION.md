@@ -21,7 +21,9 @@ New: `watch_immediate`, `bind_deferred` and `Bind::deferred`, `computed` and
 signal reads in `coat!`, `ReactiveDiagnostics`, `ReactiveSet::Settled`, and the
 `testing` module (`settle`, `settle_n`). Also new: presence-only reads
 (`Reads::has`/`this_has`), hierarchy-inherited components (`Reads::inherited`),
-`layout_effect` with `ReactiveSet::PostLayout`. The prelude now also exports `ReactiveSet`,
+`layout_effect` with `ReactiveSet::PostLayout`, `Selection`/`Selected` with
+`SelectCommandsExt`/`SelectEntityCommandsExt`, and query monitors
+(`Monitor`, `MonitorAppExt::add_monitor`). The prelude now also exports `ReactiveSet`,
 `ReactiveSettings`, `ReactiveDiagnostics`, `Reads`, `Signal`, `signal`, `memo`,
 `effect`, `coat!`, `coat_list!`, `Cx`, `either`, `computed` and the new helpers. It
 does not export `#[component]`, which would clash with Bevy's `#[component(..)]` derive

@@ -185,6 +185,67 @@ fn panel() -> impl Scene {
 }
 ```
 
+### Selection by marker move
+
+`Selection` on a group entity remembers which of its entities is selected, and that
+entity holds the `Selected` marker. Selecting another entity moves the marker, so only
+the old and the new row's `r.this_has::<Selected>()` readers re-run, however long the
+list is (Solid's `createSelector`). `commands.select::<Selected>(list, Some(row))` sets
+it, and `commands.entity(row).select::<Selected>()` / `.toggle_select::<Selected>()`
+select in the nearest ancestor with a `Selection`. Despawning the selected entity clears
+the selection; removing or despawning the group removes the marker. Use another marker
+type with `Selection<Hovered>` for independent selections on the same group.
+
+```rust
+use bevy::{prelude::*, ui_widgets::{Activate, Button}};
+use bevy_radioactive::prelude::*;
+
+fn row(label: &'static str) -> impl Scene {
+    bsn! {
+        Button
+        on(|activate: On<Activate>, mut commands: Commands| {
+            commands.entity(activate.entity).select::<Selected>();
+        })
+        computed(|r: &Reads| BackgroundColor(if r.this_has::<Selected>() {
+            Color::WHITE
+        } else {
+            Color::BLACK
+        }))
+        Children [ Text({label}) ]
+    }
+}
+
+fn list() -> impl Scene {
+    bsn! { Node Selection Children [ @row("a") -- @row("b") -- @row("c") ] }
+}
+```
+
+### Query monitors
+
+`app.add_monitor::<M>(Monitor::new().with::<A>().without::<B>())` keeps marker `M` on
+exactly the entities that match the filter, after flecs monitors. Observers on each
+term's `Add`/`Remove` re-check only the entity that changed, and entities that already
+match when the monitor is added get the marker too. `On<Add<M>>` and `On<Remove<M>>`
+observers are the "entered" and "left" callbacks, and `r.this_has::<M>()` makes the
+membership a reactive input.
+
+```rust
+use bevy::prelude::*;
+use bevy_radioactive::prelude::*;
+
+#[derive(Component)]
+struct Health(u32);
+#[derive(Component)]
+struct Dead;
+#[derive(Component, Default)]
+struct Alive;
+
+fn plugin(app: &mut App) {
+    app.add_monitor::<Alive>(Monitor::new().with::<Health>().without::<Dead>())
+        .add_observer(|died: On<Remove<Alive>>| info!("{} is out", died.entity));
+}
+```
+
 ```rust
 use bevy::prelude::*;
 use bevy_radioactive::prelude::*;
