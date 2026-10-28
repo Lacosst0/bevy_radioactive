@@ -10,10 +10,15 @@ glob: `use bevy_radioactive::view::*;`.
 | `RadioactivePlugin` | `WatchPlugin`, `HooksPlugin` or `ViewPlugin` for each style you use; `subscribe` needs none |
 | `ReactiveSet::Publish` | `WatchSystems`, `HooksSystems`, `ViewSystems` |
 | `ReactiveSettings { max_passes }` | removed; each runtime settles in up to 8 rounds per frame |
-| `ReactiveAppExt` | `WatchAppExt` (`app.track::<T>()`) |
-| `app.observe_value(o)` | `app.track::<T>().add_observer(o)` |
-| `on_removed(source, handler)` | `watch_removed(source, handler)` |
-| `reaction.event().0`, `reaction.value()` | `reaction.0` (`Reaction<T>` dereferences to `T`) |
+| `app.track::<T>()`, `ReactiveAppExt` | `#[derive(Track)]` on `T` |
+| `app.observe_value(\|e: On<ValueChanged<T>>\| ..)` | `app.watch(\|e: Watch<Query<&T>>\| ..)` |
+| `watch(#Source, \|r: Reaction<T>\| ..)` | `watch(\|w: Watch<Query<&T, F>>\| ..)`: every matching entity; narrow it with a query filter |
+| `watch(Singleton, \|r: Reaction<T>\| ..)` | `watch(\|w: Watch<Res<T>>\| ..)` |
+| `on_removed(source, h)` / `Removal<T>` | `watch(\|r: Removed<Query<&T>>\| ..)` |
+| `reaction.source()`, `reaction.event().0` | `w.entity()`, `w.0` (`Watch` dereferences to `T`) |
+| `bind(source, \|&T, &mut C\|)` | `bind(\|&T, &mut C\|)`, which also writes the current value on spawn |
+| `bind_or(source, write, or_else)` | removed; use `watch` with `Removed<..>` |
+| `ValueSource`, `Singleton`, `ValueChanged`, `ValueRemoved` | removed |
 | `Watch`, `WatchRemoval`, `Subscribe` return types | `impl Template` |
 | `subscription` module | `subscribe` module |
 | `SubscribedTo`, `Subscribers`, `SubscriptionOf`, `Subscriptions`, `SubscriptionAppExt::register_subscription` | removed; use `subscribe_to` |
@@ -33,7 +38,9 @@ glob: `use bevy_radioactive::view::*;`.
 | `Region` | internal |
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
-New: `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
+New: `watch` takes no source: `#[derive(Track)]` on a component or resource, then
+`watch(|w: Watch<Query<&T, F>>| ..)`, `Watch<Res<T>>` or `Removed<..>`, and
+`app.watch(..)` outside scenes. `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
 an event fires on a source. `hooks` has `cx.use_task(deps, start)` for async work
 (returns `TaskState`). `view` has `for $item in ..` rows that receive their item as a
 signal, `CopySignal` (`copy_signal`, `owns`, `SignalCommandsExt::spawn_signal`) and
@@ -53,10 +60,10 @@ Behavior changes:
 - Unkeyed `hooks` child components are matched by the `@name(..)` call that created
   them rather than by position, so a conditional sibling no longer shifts their state.
   A hook that changes type resets with a warning instead of panicking.
-- A `Singleton` source whose resource doesn't exist yet waits for it instead of failing
-  the scene.
-- Delivery entities of `watch` and `subscribe` despawn when their source does, not only
-  with the declaring entity.
+- `Watch<Res<T>>` is delivered the resource's first insertion, so a resource that
+  doesn't exist when the scene spawns is picked up when it's added.
+- `subscribe` delivery entities despawn when their source does, not only with the
+  declaring entity.
 - A duplicate key in a keyed `view!` `for` shows the last item with that key and logs a
   warning; reading or writing a signal inside its own `with`/`update` panics instead of
   deadlocking.

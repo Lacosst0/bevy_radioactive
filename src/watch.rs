@@ -1,47 +1,63 @@
-//! React to components and resources changing on other entities.
+//! React to tracked components and resources changing.
 //!
-//! [`bind`] keeps a component of the declaring entity in sync with a value on
-//! a source, and [`watch`] runs a handler instead:
+//! Derive [`Track`] on a component or resource, then [`watch`] it from a
+//! scene. The handler's first parameter says what to react to, written like
+//! the system parameter you would use to read it:
 //!
 //! ```ignore
 //! use bevy_radioactive::watch::*;
 //!
+//! #[derive(Component, Clone, Track)]
+//! struct Health(u32);
+//!
+//! #[derive(Resource, Clone, Track)]
+//! struct Score(u32);
+//!
 //! app.add_plugins(WatchPlugin);
 //!
 //! bsn! {
-//!     Children [
-//!         #Player Health(100)
-//!         --
-//!         Text("")
-//!         bind_or(
-//!             #Player,
-//!             |hp: &Health, text: &mut Text| **text = hp.0.to_string(),
-//!             |text: &mut Text| **text = "DEAD".into(),
-//!         )
-//!         --
-//!         Text("")
-//!         bind(Singleton, |score: &Score, text: &mut Text| **text = score.0.to_string())
-//!         --
-//!         watch(#Player, |hp: Reaction<Health>, mut log: ResMut<Log>| log.push(hp.0))
-//!     ]
+//!     Text("")
+//!     // Any entity's `Health`, as `Query<&Health>` would see it.
+//!     watch(|hp: Watch<Query<&Health>>, mut commands: Commands| {
+//!         info!("{:?} has {} HP", hp.entity(), hp.0);
+//!     })
+//!     // Query filters narrow it down.
+//!     watch(|hp: Watch<Query<&Health, With<Enemy>>>| { /* .. */ })
+//!     // The resource.
+//!     watch(|score: Watch<Res<Score>>, mut texts: Query<&mut Text>| {
+//!         if let Ok(mut text) = texts.get_mut(score.target()) {
+//!             **text = score.0.to_string();
+//!         }
+//!     })
+//!     // Removal, or the entity despawning.
+//!     watch(|gone: Removed<Query<&Health>>| { /* .. */ })
+//!     // Write a component of this entity from the latest value.
+//!     bind(|score: &Score, text: &mut Text| **text = score.0.to_string())
 //! }
 //! ```
 //!
-//! A source is a `#Name`, an [`Entity`], [`Singleton`] for resource `T`, or a
-//! list such as `[#A, #B]`. Resources are singleton components in Bevy, so one
-//! API covers both.
+//! - [`Watch<Query<&T, F>>`](Watch) runs for every entity that `Query<&T, F>`
+//!   would return when `T` is inserted or changed on it, so default query
+//!   filters apply: disabled entities are skipped unless `F` allows them.
+//!   [`Watch<Res<T>>`](Watch) runs when resource `T` is inserted or changed.
+//! - [`Removed<..>`](Removed) takes the same selectors and runs when `T` is
+//!   removed or its entity despawns.
+//! - A watch declared in a scene despawns with its entity, and
+//!   [`target()`](Watch::target) is that entity. [`WatchAppExt::watch`] adds
+//!   one to the app instead.
 //!
 //! Insertion and mutable access count as changes; use `set_if_neq` to skip
 //! no-op writes. Changes are published in [`WatchSystems`] in `PostUpdate`,
-//! before UI layout. A reaction that writes another watched value is published
-//! in the same frame, for up to 8 rounds.
+//! before UI layout, once per frame with the latest value. A handler that
+//! writes another tracked value is published in the same frame, for up to 8
+//! rounds.
 
 use std::{
     any::{TypeId, type_name},
     marker::PhantomData,
     ops::Deref,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -50,23 +66,36 @@ use bevy::{
     ecs::{
         component::Mutable,
         entity_disabling::Disabled,
-        event::{EntityEvent, EntityTrigger, Event},
+        event::EntityEvent,
         lifecycle::HookContext,
-        query::Allow,
+        query::{Allow, QueryFilter},
         schedule::ScheduleLabel,
         system::{FromInput, IntoObserverSystem, SystemInput},
-        template::{EntityTemplate, Template, TemplateContext},
-        world::DeferredWorld,
+        template::{Template, TemplateContext},
+        world::{CommandQueue, DeferredWorld},
     },
     platform::collections::HashSet,
     prelude::*,
     scene::EmptySceneEffect,
 };
 
+pub use crate::macros::Track;
+
 /// Rounds of publishing per frame, so chained reactions settle in one frame.
 const MAX_ROUNDS: usize = 8;
 
-/// Publishes watched values each frame. Required by [`watch`] and [`bind`].
+/// A component or resource that [`watch`] and [`bind`] react to.
+///
+/// Derive it next to `Component` or `Resource`; the type must be `Clone`,
+/// since each change is delivered as a snapshot:
+///
+/// ```ignore
+/// #[derive(Component, Clone, Track)]
+/// struct Player { coords: Vec2 }
+/// ```
+pub trait Track: Component + Clone {}
+
+/// Publishes tracked changes each frame. Required by [`watch`] and [`bind`].
 #[derive(Default)]
 pub struct WatchPlugin;
 
@@ -74,6 +103,7 @@ impl Plugin for WatchPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Watched>()
             .init_resource::<Published>()
+            .init_resource::<PendingBinds>()
             .init_schedule(Publish)
             .add_systems(PostUpdate, publish_all.in_set(WatchSystems));
         #[cfg(feature = "ui")]
@@ -84,458 +114,400 @@ impl Plugin for WatchPlugin {
     }
 }
 
-/// System set in `PostUpdate` that publishes watched values.
+/// System set in `PostUpdate` that publishes tracked changes.
 ///
-/// Order systems that write watched values in `PostUpdate`
+/// Order systems that write tracked values in `PostUpdate`
 /// `.before(WatchSystems)` to have them shown in the same frame.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WatchSystems;
 
-/// App helper to watch a type up front.
+/// Watches from the app instead of a scene.
 pub trait WatchAppExt {
-    /// Publishes [`ValueChanged<T>`] and [`ValueRemoved<T>`] for every entity
-    /// with `T`, so global observers can listen to them. Adds [`WatchPlugin`]
-    /// if needed.
+    /// Runs `handler` like a scene's [`watch`], for as long as the app runs.
+    /// Its [`target()`](Watch::target) is an entity holding the watch. Adds
+    /// [`WatchPlugin`] if needed.
     ///
-    /// Scenes don't need this: [`watch`] and [`bind`] start tracking their
-    /// type on first use.
-    fn track<T: Component + Clone>(&mut self) -> &mut Self;
+    /// ```ignore
+    /// app.watch(|player: Watch<Query<&Player>>| info!("{:?} moved", player.entity()));
+    /// ```
+    fn watch<E, I, M>(&mut self, handler: I) -> &mut Self
+    where
+        E: WatchEvent,
+        I: IntoObserverSystem<E, M>;
 }
 
 impl WatchAppExt for App {
-    fn track<T: Component + Clone>(&mut self) -> &mut Self {
+    fn watch<E, I, M>(&mut self, handler: I) -> &mut Self
+    where
+        E: WatchEvent,
+        I: IntoObserverSystem<E, M>,
+    {
         if !self.is_plugin_added::<WatchPlugin>() {
             self.add_plugins(WatchPlugin);
         }
-        track::<T>(self.world_mut());
+        let world = self.world_mut();
+        let holder = world.spawn_empty().id();
+        spawn_watcher::<E>(world, holder, None).observe(handler);
         self
     }
 }
 
-/// Runs `handler` whenever `T` changes on `source`.
+// ---------------------------------------------------------------------------
+// Scene templates
+// ---------------------------------------------------------------------------
+
+/// Runs `handler` when a tracked value changes or is removed.
 ///
-/// The handler receives a [`Reaction<T>`]: it dereferences to the new value,
-/// `target()` is the declaring entity and `source()` the entity that owns `T`.
-/// The current value is not replayed when the scene spawns.
-pub fn watch<T, S, I, M>(source: S, handler: I) -> impl Template<Output = EmptySceneEffect>
+/// The handler is an observer whose first parameter selects what it reacts
+/// to: [`Watch<Query<&T, F>>`](Watch), [`Watch<Res<T>>`](Watch),
+/// [`Removed<Query<&T, F>>`](Removed) or [`Removed<Res<T>>`](Removed), where
+/// `T` derives [`Track`]. Other parameters are ordinary system parameters.
+/// A watch isn't sent current values when it spawns; it sees what is
+/// inserted or changed afterwards, including by the same scene. The first
+/// time a type is watched, every existing value counts as new.
+pub fn watch<E, I, M>(handler: I) -> impl Template<Output = EmptySceneEffect>
 where
-    T: Component + Clone,
-    S: ValueSource<T>,
-    I: IntoObserverSystem<Delivery<ValueChanged<T>>, M> + Clone,
+    E: WatchEvent,
+    I: IntoObserverSystem<E, M> + Clone,
     M: 'static,
 {
-    Watch {
-        source,
+    WatchTemplate {
         handler,
-        marker: PhantomData::<fn() -> (ValueChanged<T>, M)>,
+        marker: PhantomData::<fn() -> (E, M)>,
     }
 }
 
-/// Runs `handler` when `T` is removed from `source`, or `source` despawns.
+/// Writes component `C` of the current entity from the latest `T`, on spawn
+/// and whenever `T` changes.
 ///
-/// The handler receives a [`Removal<T>`].
-pub fn watch_removed<T, S, I, M>(source: S, handler: I) -> impl Template<Output = EmptySceneEffect>
-where
-    T: Component + Clone,
-    S: ValueSource<T>,
-    I: IntoObserverSystem<Delivery<ValueRemoved<T>>, M> + Clone,
-    M: 'static,
-{
-    Watch {
-        source,
-        handler,
-        marker: PhantomData::<fn() -> (ValueRemoved<T>, M)>,
-    }
-}
-
-/// Writes component `C` of the current BSN entity whenever `T` changes on
-/// `source`.
+/// It follows `T` on every entity `Query<&T>` returns, so it suits
+/// resources and components that exist once, like a player:
 ///
 /// ```ignore
 /// Text("")
-/// bind(#Player, |hp: &Health, text: &mut Text| **text = hp.0.to_string())
+/// bind(|score: &Score, text: &mut Text| **text = score.0.to_string())
 /// ```
-pub fn bind<T, C, S, F>(source: S, write: F) -> impl Template<Output = EmptySceneEffect>
+pub fn bind<T, C, F>(write: F) -> impl Template<Output = EmptySceneEffect>
 where
-    T: Component + Clone,
+    T: Track,
     C: Component<Mutability = Mutable>,
-    S: ValueSource<T>,
     F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
 {
-    Bind {
-        source,
+    BindTemplate {
         write,
-        removed: None::<fn(&mut C)>,
-        marker: PhantomData,
+        marker: PhantomData::<fn() -> (T, C)>,
     }
 }
 
-/// Like [`bind`], and also writes `C` with `removed` when `T` is removed from
-/// `source` or it despawns.
-///
-/// ```ignore
-/// Text("")
-/// bind_or(
-///     #Player,
-///     |hp: &Health, text: &mut Text| **text = hp.0.to_string(),
-///     |text: &mut Text| **text = "DEAD".into(),
-/// )
-/// ```
-pub fn bind_or<T, C, S, F, R>(
-    source: S,
-    write: F,
-    removed: R,
-) -> impl Template<Output = EmptySceneEffect>
+struct WatchTemplate<E, I, M> {
+    handler: I,
+    marker: PhantomData<fn() -> (E, M)>,
+}
+
+impl<E, I, M> Template for WatchTemplate<E, I, M>
 where
-    T: Component + Clone,
-    C: Component<Mutability = Mutable>,
-    S: ValueSource<T>,
-    F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
-    R: Fn(&mut C) + Clone + Send + Sync + 'static,
+    E: WatchEvent,
+    I: IntoObserverSystem<E, M> + Clone,
+    M: 'static,
 {
-    Bind {
-        source,
-        write,
-        removed: Some(removed),
-        marker: PhantomData,
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        let owner = context.entity.id();
+        context.entity.world_scope(|world| {
+            ensure_plugin::<E::Value>(world)?;
+            spawn_watcher::<E>(world, owner, Some(owner)).observe(self.handler.clone());
+            Ok(EmptySceneEffect)
+        })
+    }
+
+    fn clone_template(&self) -> Self {
+        Self {
+            handler: self.handler.clone(),
+            marker: PhantomData,
+        }
     }
 }
 
-struct Bind<T, C, S, F, R> {
-    source: S,
+struct BindTemplate<T, C, F> {
     write: F,
-    removed: Option<R>,
     marker: PhantomData<fn() -> (T, C)>,
 }
 
-impl<T, C, S, F, R> Template for Bind<T, C, S, F, R>
+impl<T, C, F> Template for BindTemplate<T, C, F>
 where
-    T: Component + Clone,
+    T: Track,
     C: Component<Mutability = Mutable>,
-    S: ValueSource<T>,
     F: Fn(&T, &mut C) + Clone + Send + Sync + 'static,
-    R: Fn(&mut C) + Clone + Send + Sync + 'static,
 {
     type Output = EmptySceneEffect;
 
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         let write = self.write.clone();
         watch(
-            self.source.clone_source(),
-            move |change: Reaction<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
+            move |change: Watch<Query<&T>>, mut targets: Query<&mut C, Allow<Disabled>>| {
                 if let Ok(mut target) = targets.get_mut(change.target()) {
                     write(&change, &mut target);
                 }
             },
         )
         .build_template(context)?;
-        if let Some(removed) = self.removed.clone() {
-            watch_removed(
-                self.source.clone_source(),
-                move |removal: Removal<T>, mut targets: Query<&mut C, Allow<Disabled>>| {
-                    if let Ok(mut target) = targets.get_mut(removal.target()) {
-                        removed(&mut target);
+        // Write the current value once the scene, including `C`, exists.
+        let (owner, write) = (context.entity.id(), self.write.clone());
+        context.entity.world_scope(|world| {
+            world
+                .resource_mut::<PendingBinds>()
+                .0
+                .push(Box::new(move |world: &mut World| {
+                    let Some(value) = world.query::<&T>().iter(world).last().cloned() else {
+                        return;
+                    };
+                    if let Some(mut target) = world.get_mut::<C>(owner) {
+                        write(&value, &mut target);
                     }
-                },
-            )
-            .build_template(context)?;
-        }
+                }));
+        });
         Ok(EmptySceneEffect)
     }
 
     fn clone_template(&self) -> Self {
         Self {
-            source: self.source.clone_source(),
             write: self.write.clone(),
-            removed: self.removed.clone(),
             marker: PhantomData,
         }
     }
 }
 
-/// Source for resource `T`: `bind(Singleton, |score: &Score, ..| ..)`.
-///
-/// If the resource doesn't exist yet when the scene spawns, the watch waits
-/// for it: its first insertion is delivered as a change.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Singleton;
-
-/// Entities accepted as a watch source: a `#Name`, an [`Entity`],
-/// [`Singleton`], or an array or `Vec` of sources.
-pub trait ValueSource<T>: Send + Sync + 'static {
-    #[doc(hidden)]
-    fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result;
-
-    #[doc(hidden)]
-    #[must_use]
-    fn clone_source(&self) -> Self
-    where
-        Self: Sized;
-}
-
-impl<T> ValueSource<T> for EntityTemplate {
-    fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        out.push(self.build_template(context)?);
+fn ensure_plugin<T>(world: &World) -> Result {
+    if world.contains_resource::<Watched>() {
         Ok(())
-    }
-
-    fn clone_source(&self) -> Self {
-        self.clone_template()
-    }
-}
-
-impl<T> ValueSource<T> for Entity {
-    fn resolve(&self, _: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        out.push(*self);
-        Ok(())
-    }
-
-    fn clone_source(&self) -> Self {
-        *self
-    }
-}
-
-impl<T: Resource> ValueSource<T> for Singleton {
-    fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        out.push(context.entity.world_scope(|world| {
-            world
-                .resource_entity::<T>()
-                .filter(|_| world.contains_resource::<T>())
-                .unwrap_or_else(|| pending_resource::<T>(world))
-        }));
-        Ok(())
-    }
-
-    fn clone_source(&self) -> Self {
-        Self
-    }
-}
-
-/// Stands in for the entity of resource `T` until the resource is added;
-/// its watchers then move to the resource's entity.
-#[derive(Component)]
-struct PendingResource<T: Resource> {
-    observer: Entity,
-    marker: PhantomData<fn() -> T>,
-}
-
-/// The placeholder entity of missing resource `T`, shared by its watchers.
-fn pending_resource<T: Resource>(world: &mut World) -> Entity {
-    let mut pending = world.query_filtered::<Entity, With<PendingResource<T>>>();
-    if let Some(entity) = pending.iter(world).next() {
-        return entity;
-    }
-    let observer = world.add_observer(adopt_pending::<T>).id();
-    world
-        .spawn(PendingResource::<T> {
-            observer,
-            marker: PhantomData,
-        })
-        .id()
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Bevy observer systems receive SystemInput parameters by value"
-)]
-fn adopt_pending<T: Resource>(event: On<Add<T>>, mut commands: Commands) {
-    let resource = event.entity;
-    commands.queue(move |world: &mut World| {
-        if world.resource_entity::<T>() != Some(resource) {
-            return;
-        }
-        let mut pending = world.query::<(Entity, &PendingResource<T>, Option<&Watchers<T>>)>();
-        let placeholders: Vec<(Entity, Entity, Vec<Entity>)> = pending
-            .iter(world)
-            .map(|(entity, pending, watchers)| {
-                let deliveries = watchers.map(|w| w.0.clone()).unwrap_or_default();
-                (entity, pending.observer, deliveries)
-            })
-            .collect();
-        for (placeholder, observer, deliveries) in placeholders {
-            // Replacing the relationship is not a removal, so the delivery
-            // entities survive.
-            for delivery in deliveries {
-                world
-                    .entity_mut(delivery)
-                    .insert(Watches::<T>::new(resource));
-            }
-            world.despawn(placeholder);
-            world.despawn(observer);
-        }
-    });
-}
-
-impl<T, S: ValueSource<T>, const N: usize> ValueSource<T> for [S; N] {
-    fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        self.iter()
-            .try_for_each(|source| source.resolve(context, out))
-    }
-
-    fn clone_source(&self) -> Self {
-        std::array::from_fn(|index| self[index].clone_source())
-    }
-}
-
-impl<T, S: ValueSource<T>> ValueSource<T> for Vec<S> {
-    fn resolve(&self, context: &mut TemplateContext, out: &mut Vec<Entity>) -> Result {
-        self.iter()
-            .try_for_each(|source| source.resolve(context, out))
-    }
-
-    fn clone_source(&self) -> Self {
-        self.iter().map(ValueSource::clone_source).collect()
+    } else {
+        Err(format!(
+            "watching `{}` needs `WatchPlugin`; add it to the app",
+            type_name::<T>(),
+        )
+        .into())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Events
+// Selectors
 // ---------------------------------------------------------------------------
 
-/// Global event: `T` was inserted or changed on an entity.
-///
-/// Observe it with `app.track::<T>().add_observer(..)`. In scenes, use
-/// [`watch`] or [`bind`].
-pub struct ValueChanged<T: Component> {
-    source: Entity,
-    value: Arc<T>,
+/// What a watch reacts to: `Query<&T, F>` or `Res<T>`, for a [`Track`] type
+/// `T`. Used as the parameter of [`Watch`] and [`Removed`].
+pub trait Selector {
+    /// The tracked type.
+    type Value: Track;
+    #[doc(hidden)]
+    type Key: SelectorKey<Value = Self::Value>;
+    #[doc(hidden)]
+    type At<'i>: Selector<Value = Self::Value, Key = Self::Key>;
 }
 
-impl<T: Component> ValueChanged<T> {
-    /// Entity that owns the value; for a resource, its singleton entity.
-    #[must_use]
-    pub fn source(&self) -> Entity {
-        self.source
-    }
-}
-
-impl<T: Component> Deref for ValueChanged<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T: Component> Clone for ValueChanged<T> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source,
-            value: Arc::clone(&self.value),
-        }
-    }
-}
-
-impl<T: Component> Event for ValueChanged<T> {
-    type Trigger<'a> = EntityTrigger;
-}
-
-impl<T: Component> EntityEvent for ValueChanged<T> {
-    fn event_target(&self) -> Entity {
-        self.source
-    }
-}
-
-/// Global event: `T` was removed from an entity, or the entity despawned.
-pub struct ValueRemoved<T: Component> {
-    source: Entity,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<T: Component> ValueRemoved<T> {
-    /// Entity that lost the value.
-    #[must_use]
-    pub fn source(&self) -> Entity {
-        self.source
-    }
-}
-
-impl<T: Component> Clone for ValueRemoved<T> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<T: Component> Event for ValueRemoved<T> {
-    type Trigger<'a> = EntityTrigger;
-}
-
-impl<T: Component> EntityEvent for ValueRemoved<T> {
-    fn event_target(&self) -> Entity {
-        self.source
-    }
-}
-
-/// A global event delivered to one watcher. Use [`Reaction`] or [`Removal`]
-/// in handlers.
+/// `'static` stand-in for a [`Selector`], which borrows.
 #[doc(hidden)]
-#[derive(Clone, EntityEvent)]
-pub struct Delivery<E: Clone + Send + Sync + 'static> {
+pub trait SelectorKey: Send + Sync + 'static {
+    type Value: Track;
+
+    /// Tests whether a source entity is selected.
+    fn matcher(world: &mut World) -> WatchMatcher;
+}
+
+#[doc(hidden)]
+pub type WatchMatcher = Box<dyn FnMut(&World, Entity) -> bool + Send + Sync>;
+
+#[doc(hidden)]
+pub struct QueryKey<T, F>(PhantomData<fn() -> (T, F)>);
+
+#[doc(hidden)]
+pub struct ResKey<T>(PhantomData<fn() -> T>);
+
+impl<T: Track, F: QueryFilter + 'static> Selector for Query<'_, '_, &T, F> {
+    type Value = T;
+    type Key = QueryKey<T, F>;
+    type At<'i> = Query<'i, 'i, &'i T, F>;
+}
+
+impl<T: Track, F: QueryFilter + 'static> SelectorKey for QueryKey<T, F> {
+    type Value = T;
+
+    fn matcher(world: &mut World) -> WatchMatcher {
+        // Exactly the entities `Query<&T, F>` returns, default filters included.
+        let mut state = QueryState::<(), (With<T>, F)>::new(world);
+        Box::new(move |world, entity| {
+            state.update_archetypes(world);
+            state.contains(
+                entity,
+                world,
+                world.last_change_tick(),
+                world.read_change_tick(),
+            )
+        })
+    }
+}
+
+impl<T: Track + Resource> Selector for Res<'_, T> {
+    type Value = T;
+    type Key = ResKey<T>;
+    type At<'i> = Res<'i, T>;
+}
+
+impl<T: Track + Resource> SelectorKey for ResKey<T> {
+    type Value = T;
+
+    fn matcher(_: &mut World) -> WatchMatcher {
+        Box::new(|world, entity| world.resource_entity::<T>() == Some(entity))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events and handler inputs
+// ---------------------------------------------------------------------------
+
+/// A change delivered to one watch. Use [`Watch`] in handlers.
+#[doc(hidden)]
+#[derive(EntityEvent)]
+pub struct WatchChanged<K: SelectorKey> {
     #[event_target]
-    entity: Entity,
+    delivery: Entity,
     target: Entity,
-    event: E,
+    source: Entity,
+    value: Arc<K::Value>,
 }
 
-/// Handler input for [`watch`]. Dereferences to the new value.
-pub struct Reaction<'w, 't, T: Component>(On<'w, 't, Delivery<ValueChanged<T>>>);
+/// A removal delivered to one watch. Use [`Removed`] in handlers.
+#[doc(hidden)]
+#[derive(EntityEvent)]
+pub struct WatchRemoved<K: SelectorKey> {
+    #[event_target]
+    delivery: Entity,
+    target: Entity,
+    source: Entity,
+    marker: PhantomData<fn() -> K>,
+}
 
-impl<T: Component> Reaction<'_, '_, T> {
+/// The event behind a [`watch`] handler's first parameter.
+#[doc(hidden)]
+pub trait WatchEvent: EntityEvent + Sized {
+    type Value: Track;
+    type Key: SelectorKey<Value = Self::Value>;
+    const REMOVAL: bool;
+
+    fn send(commands: &mut Commands, delivery: WatchDelivery, value: Option<&Arc<Self::Value>>);
+}
+
+/// Where one delivery goes.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct WatchDelivery {
+    watcher: Entity,
+    target: Entity,
+    source: Entity,
+}
+
+impl<K: SelectorKey> WatchEvent for WatchChanged<K> {
+    type Value = K::Value;
+    type Key = K;
+    const REMOVAL: bool = false;
+
+    fn send(commands: &mut Commands, delivery: WatchDelivery, value: Option<&Arc<K::Value>>) {
+        if let Some(value) = value {
+            commands.trigger(Self {
+                delivery: delivery.watcher,
+                target: delivery.target,
+                source: delivery.source,
+                value: Arc::clone(value),
+            });
+        }
+    }
+}
+
+impl<K: SelectorKey> WatchEvent for WatchRemoved<K> {
+    type Value = K::Value;
+    type Key = K;
+    const REMOVAL: bool = true;
+
+    fn send(commands: &mut Commands, delivery: WatchDelivery, _: Option<&Arc<K::Value>>) {
+        commands.trigger(Self {
+            delivery: delivery.watcher,
+            target: delivery.target,
+            source: delivery.source,
+            marker: PhantomData,
+        });
+    }
+}
+
+/// Handler input for [`watch`]: `T` was inserted or changed on an entity
+/// that `S` selects. Dereferences to the new value.
+///
+/// `S` is `Query<&T>`, `Query<&T, F>` with any query filter, or `Res<T>`:
+/// `|player: Watch<Query<&Player>>, mut commands: Commands| ..`.
+pub struct Watch<'w, 't, S: Selector> {
+    on: On<'w, 't, WatchChanged<S::Key>>,
+    marker: PhantomData<fn() -> S>,
+}
+
+impl<S: Selector> Watch<'_, '_, S> {
+    /// Entity whose value changed; for a resource, its singleton entity.
+    #[must_use]
+    pub fn entity(&self) -> Entity {
+        self.on.event().source
+    }
+
     /// Entity that declared the watch.
     #[must_use]
     pub fn target(&self) -> Entity {
-        self.0.event().target
-    }
-
-    /// Entity that owns the value.
-    #[must_use]
-    pub fn source(&self) -> Entity {
-        self.0.event().event.source
+        self.on.event().target
     }
 }
 
-impl<T: Component> Deref for Reaction<'_, '_, T> {
-    type Target = T;
+impl<S: Selector> Deref for Watch<'_, '_, S> {
+    type Target = S::Value;
 
-    fn deref(&self) -> &T {
-        &self.0.event().event.value
+    fn deref(&self) -> &S::Value {
+        &self.on.event().value
     }
 }
 
-/// Handler input for [`watch_removed`].
-pub struct Removal<'w, 't, T: Component>(On<'w, 't, Delivery<ValueRemoved<T>>>);
+/// Handler input for [`watch`]: `T` was removed from an entity that `S`
+/// selects, or the entity despawned. `S` is as for [`Watch`].
+pub struct Removed<'w, 't, S: Selector> {
+    on: On<'w, 't, WatchRemoved<S::Key>>,
+    marker: PhantomData<fn() -> S>,
+}
 
-impl<T: Component> Removal<'_, '_, T> {
-    /// Entity that declared the watch.
-    #[must_use]
-    pub fn target(&self) -> Entity {
-        self.0.event().target
-    }
-
+impl<S: Selector> Removed<'_, '_, S> {
     /// Entity that lost the value.
     #[must_use]
-    pub fn source(&self) -> Entity {
-        self.0.event().event.source
+    pub fn entity(&self) -> Entity {
+        self.on.event().source
+    }
+
+    /// Entity that declared the watch.
+    #[must_use]
+    pub fn target(&self) -> Entity {
+        self.on.event().target
     }
 }
 
 macro_rules! handler_input {
     ($input:ident, $event:ident) => {
-        impl<T: Component> SystemInput for $input<'_, '_, T> {
-            type Param<'i> = $input<'i, 'i, T>;
-            type Inner<'i> = On<'i, 'i, Delivery<$event<T>>>;
+        impl<S: Selector> SystemInput for $input<'_, '_, S> {
+            type Param<'i> = $input<'i, 'i, S::At<'i>>;
+            type Inner<'i> = On<'i, 'i, $event<S::Key>>;
 
             fn wrap(on: Self::Inner<'_>) -> Self::Param<'_> {
-                $input(on)
+                $input {
+                    on,
+                    marker: PhantomData,
+                }
             }
         }
 
-        impl<T: Component> FromInput<On<'_, '_, Delivery<$event<T>>>> for $input<'_, '_, T> {
+        impl<S: Selector> FromInput<On<'_, '_, $event<S::Key>>> for $input<'_, '_, S> {
             fn from_inner<'i>(
-                on: <On<'_, '_, Delivery<$event<T>>> as SystemInput>::Inner<'i>,
+                on: <On<'_, '_, $event<S::Key>> as SystemInput>::Inner<'i>,
             ) -> Self::Inner<'i> {
                 on
             }
@@ -543,144 +515,94 @@ macro_rules! handler_input {
     };
 }
 
-handler_input!(Reaction, ValueChanged);
-handler_input!(Removal, ValueRemoved);
+handler_input!(Watch, WatchChanged);
+handler_input!(Removed, WatchRemoved);
 
 // ---------------------------------------------------------------------------
-// Watch template and routing
+// Watchers
 // ---------------------------------------------------------------------------
 
-struct Watch<E, S, I, M> {
-    source: S,
-    handler: I,
-    marker: PhantomData<fn() -> (E, M)>,
+/// One watch: an entity observing its own deliveries.
+#[derive(Component)]
+#[component(on_add = add_watcher::<T>, on_remove = remove_watcher::<T>)]
+struct Watcher<T: Track> {
+    target: Entity,
+    removal: bool,
+    matcher: Mutex<WatchMatcher>,
+    send: fn(&mut Commands, WatchDelivery, Option<&Arc<T>>),
 }
 
-/// The watched type `T` of a [`ValueChanged`] or [`ValueRemoved`] event.
-trait ValueEvent: Clone + Send + Sync + 'static {
-    type Value: Component + Clone;
-}
+/// Every [`Watcher<T>`] entity, so publishing doesn't need a query.
+#[derive(Resource)]
+struct WatcherList<T: Track>(Vec<Entity>, PhantomData<fn() -> T>);
 
-impl<T: Component + Clone> ValueEvent for ValueChanged<T> {
-    type Value = T;
-}
-
-impl<T: Component + Clone> ValueEvent for ValueRemoved<T> {
-    type Value = T;
-}
-
-impl<E, S, I, M> Template for Watch<E, S, I, M>
-where
-    E: ValueEvent,
-    S: ValueSource<E::Value>,
-    I: IntoObserverSystem<Delivery<E>, M> + Clone,
-    M: 'static,
-{
-    type Output = EmptySceneEffect;
-
-    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
-        context.entity.world_scope(|world| {
-            if world.contains_resource::<Watched>() {
-                track::<E::Value>(world);
-                Ok(())
-            } else {
-                Err(format!(
-                    "watching `{}` needs `WatchPlugin`; add it to the app",
-                    type_name::<E::Value>(),
-                ))
-            }
-        })?;
-        let mut sources = Vec::new();
-        self.source.resolve(context, &mut sources)?;
-        let listener = context.entity.id();
-        context.entity.world_scope(|world| {
-            for source in sources {
-                world
-                    .spawn((WatchOf(listener), Watches::<E::Value>::new(source)))
-                    .observe(self.handler.clone());
-            }
-        });
-        Ok(EmptySceneEffect)
-    }
-
-    fn clone_template(&self) -> Self {
-        Self {
-            source: self.source.clone_source(),
-            handler: self.handler.clone(),
-            marker: PhantomData,
-        }
+fn add_watcher<T: Track>(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut list) = world.get_resource_mut::<WatcherList<T>>() {
+        list.0.push(context.entity);
     }
 }
 
-/// One delivery entity per (watcher, source) pair, pointing at the source.
-/// It is despawned after its source despawns.
-#[derive(Component)]
-#[component(on_remove = despawn_delivery)]
-#[relationship(relationship_target = Watchers<T>)]
-struct Watches<T: Component> {
-    #[relationship]
-    source: Entity,
-    marker: PhantomData<fn() -> T>,
-}
-
-impl<T: Component> Watches<T> {
-    fn new(source: Entity) -> Self {
-        Self {
-            source,
-            marker: PhantomData,
-        }
+fn remove_watcher<T: Track>(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut list) = world.get_resource_mut::<WatcherList<T>>() {
+        list.0.retain(|&entity| entity != context.entity);
     }
 }
 
+/// Owns watcher entities, so they despawn with the entity that declared them.
 #[derive(Component)]
-#[relationship_target(relationship = Watches<T>)]
-struct Watchers<T: Component>(#[relationship] Vec<Entity>, PhantomData<fn() -> T>);
-
-/// Marks a delivery entity whose source is gone. A despawning source still
-/// routes its removal to it afterwards, so it is despawned by the next
-/// [`publish_all`] rather than right away.
-fn despawn_delivery(mut world: DeferredWorld, context: HookContext) {
-    world.commands().entity(context.entity).try_insert(Orphaned);
-}
-
-/// A delivery entity whose source is gone.
-#[derive(Component)]
-struct Orphaned;
-
-/// Owns delivery entities, so they despawn with the watcher.
-#[derive(Component)]
-#[relationship(relationship_target = WatchDeliveries)]
+#[relationship(relationship_target = Watches)]
 struct WatchOf(Entity);
 
 #[derive(Component)]
 #[relationship_target(relationship = WatchOf, linked_spawn)]
-struct WatchDeliveries(Vec<Entity>);
+struct Watches(Vec<Entity>);
 
-/// Sends `event` to every watcher of `T` on `source`.
-fn route<T: Component, E: Clone + Send + Sync + 'static>(
-    world: &mut DeferredWorld,
-    source: Entity,
-    event: &E,
-) {
-    let (entities, mut commands) = world.entities_and_commands();
-    let Some(watchers) = entities
-        .get(source)
-        .ok()
-        .and_then(|entity| entity.get::<Watchers<T>>())
-    else {
+/// Spawns the watcher entity for an `E` handler, delivering to `target`.
+fn spawn_watcher<E: WatchEvent>(
+    world: &mut World,
+    target: Entity,
+    owner: Option<Entity>,
+) -> EntityWorldMut<'_> {
+    track::<E::Value>(world);
+    let matcher = <E::Key as SelectorKey>::matcher(world);
+    let watcher = Watcher::<E::Value> {
+        target,
+        removal: E::REMOVAL,
+        matcher: Mutex::new(matcher),
+        send: E::send,
+    };
+    if let Some(owner) = owner {
+        world.spawn((watcher, WatchOf(owner)))
+    } else {
+        let mut entity = world.entity_mut(target);
+        entity.insert(watcher);
+        entity
+    }
+}
+
+/// Sends a change (`value`) or removal (`None`) of `T` on `source` to every
+/// watcher whose selector matches it.
+fn route<T: Track>(world: &World, commands: &mut Commands, source: Entity, value: Option<&Arc<T>>) {
+    let Some(list) = world.get_resource::<WatcherList<T>>() else {
         return;
     };
-    for &delivery in &watchers.0 {
-        let target = entities
-            .get(delivery)
-            .ok()
-            .and_then(|entity| entity.get::<WatchOf>())
-            .map_or(delivery, |owner| owner.0);
-        commands.trigger(Delivery {
-            entity: delivery,
-            target,
-            event: event.clone(),
-        });
+    for &watcher in &list.0 {
+        let Some(entry) = world.get::<Watcher<T>>(watcher) else {
+            continue;
+        };
+        if entry.removal != value.is_none() {
+            continue;
+        }
+        let selected =
+            (entry.matcher.lock().unwrap_or_else(PoisonError::into_inner))(world, source);
+        if selected {
+            let delivery = WatchDelivery {
+                watcher,
+                target: entry.target,
+                source,
+            };
+            (entry.send)(commands, delivery, value);
+        }
     }
 }
 
@@ -701,9 +623,13 @@ struct Watched {
 #[derive(Default, Resource)]
 struct Published(AtomicUsize);
 
+/// [`bind`]s waiting to write their current value.
+#[derive(Default, Resource)]
+struct PendingBinds(Vec<Box<dyn FnOnce(&mut World) + Send + Sync>>);
+
 /// Starts publishing `T`. Safe while scenes spawn mid-round: the publisher
 /// joins the schedule before the next round.
-fn track<T: Component + Clone>(world: &mut World) {
+fn track<T: Track>(world: &mut World) {
     let mut watched = world.resource_mut::<Watched>();
     if !watched.types.insert(TypeId::of::<T>()) {
         return;
@@ -711,16 +637,16 @@ fn track<T: Component + Clone>(world: &mut World) {
     watched.pending.push(|schedule| {
         schedule.add_systems(publish::<T>);
     });
+    world.insert_resource(WatcherList::<T>(Vec::new(), PhantomData));
     world.add_observer(publish_removed::<T>);
 }
 
 fn publish_all(world: &mut World) {
-    let mut orphans = world.query_filtered::<Entity, (With<Orphaned>, Allow<Disabled>)>();
-    let orphans: Vec<Entity> = orphans.iter(world).collect();
-    for orphan in orphans {
-        world.despawn(orphan);
-    }
     for _ in 0..MAX_ROUNDS {
+        let binds = std::mem::take(&mut world.resource_mut::<PendingBinds>().0);
+        for bind in binds {
+            bind(world);
+        }
         let pending = std::mem::take(&mut world.resource_mut::<Watched>().pending);
         if !pending.is_empty() {
             world.schedule_scope(Publish, |_, schedule| {
@@ -732,13 +658,15 @@ fn publish_all(world: &mut World) {
         world.resource::<Published>().0.store(0, Ordering::Relaxed);
         let _ = world.try_run_schedule(Publish);
         world.flush();
-        if world.resource::<Published>().0.load(Ordering::Relaxed) == 0 {
+        if world.resource::<Published>().0.load(Ordering::Relaxed) == 0
+            && world.resource::<PendingBinds>().0.is_empty()
+        {
             return;
         }
     }
     warn!(
         "watch: values still changing after {MAX_ROUNDS} rounds; the rest is published next \
-         frame. A reaction may be writing a value it watches."
+         frame. A handler may be writing a value it watches."
     );
 }
 
@@ -746,20 +674,23 @@ fn publish_all(world: &mut World) {
     clippy::needless_pass_by_value,
     reason = "Bevy system parameters are passed by value"
 )]
-fn publish<T: Component + Clone>(
-    values: Query<(Entity, &T), (Changed<T>, Allow<Disabled>)>,
+fn publish<T: Track>(
+    values: Query<(Entity, &T), (bevy::ecs::query::Changed<T>, Allow<Disabled>)>,
     published: Res<Published>,
     mut commands: Commands,
 ) {
     for (source, value) in &values {
         published.0.fetch_add(1, Ordering::Relaxed);
-        let event = ValueChanged {
-            source,
-            value: Arc::new(value.clone()),
-        };
+        let value = Arc::new(value.clone());
         commands.queue(move |world: &mut World| {
-            route::<T, _>(&mut DeferredWorld::from(&mut *world), source, &event);
-            world.trigger(event);
+            let mut queue = CommandQueue::default();
+            route(
+                world,
+                &mut Commands::new(&mut queue, world),
+                source,
+                Some(&value),
+            );
+            queue.apply(world);
         });
     }
 }
@@ -768,11 +699,15 @@ fn publish<T: Component + Clone>(
     clippy::needless_pass_by_value,
     reason = "Bevy observer systems receive SystemInput parameters by value"
 )]
-fn publish_removed<T: Component>(event: On<Remove<T>>, mut world: DeferredWorld) {
-    let removed = ValueRemoved::<T> {
-        source: event.entity,
-        marker: PhantomData,
-    };
-    route::<T, _>(&mut world, removed.source, &removed);
-    world.trigger(removed);
+fn publish_removed<T: Track>(event: On<Remove<T>>, mut world: DeferredWorld) {
+    // `Remove` observers run before the value goes, so selectors still see
+    // the entity as it was.
+    let mut queue = CommandQueue::default();
+    route::<T>(
+        &world,
+        &mut Commands::new(&mut queue, &world),
+        event.entity,
+        None,
+    );
+    world.commands().append(&mut queue);
 }

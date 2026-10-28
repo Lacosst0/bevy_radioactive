@@ -1075,3 +1075,26 @@ fn store(input: &syn::DeriveInput) -> syn::Result<TokenStream> {
         }
     })
 }
+
+// ---------------------------------------------------------------------------
+// #[derive(Track)]
+// ---------------------------------------------------------------------------
+
+/// Derives `bevy_radioactive::watch::Track`, so `watch` and `bind` can react
+/// to the component or resource. The type must also derive `Component` or
+/// `Resource`, and `Clone`.
+#[proc_macro_derive(Track)]
+pub fn derive_track(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    match syn::parse::<syn::DeriveInput>(input) {
+        Ok(input) => {
+            let name = &input.ident;
+            let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+            quote! {
+                impl #impl_generics ::bevy_radioactive::watch::Track for #name #ty_generics
+                    #where_clause {}
+            }
+            .into()
+        }
+        Err(error) => error.into_compile_error().into(),
+    }
+}
