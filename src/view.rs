@@ -911,15 +911,19 @@ pub mod __private {
 // wrappers give it that call site when invoked from `view!` output, whose
 // own call site is `view!`. `bsn`/`bsn_list` resolve through `__private`,
 // which `view!` output glob-imports.
+//
+// The body is passed as one braced group rather than token by token:
+// rust-analyzer drops the joint spacing of punctuation forwarded one token
+// at a time, which splits `--` and `::` and breaks the expansion there.
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __view_bsn {
-    ($($tokens:tt)*) => { bsn! { $($tokens)* } };
+    ($body:tt) => { bsn! $body };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __view_bsn_list {
-    ($($tokens:tt)*) => { bsn_list! { $($tokens)* } };
+    ($body:tt) => { bsn_list! $body };
 }

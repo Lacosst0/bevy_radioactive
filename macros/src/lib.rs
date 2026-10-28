@@ -31,7 +31,7 @@ pub fn view(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         #[allow(unused_imports)]
         use ::bevy_radioactive::view::__private::*;
         #prelude
-        #bsn { #body }
+        #bsn { { #body } }
     }};
     debug(&output);
     output.into()
@@ -50,7 +50,7 @@ pub fn view_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         #[allow(unused_imports)]
         use ::bevy_radioactive::view::__private::*;
         #prelude
-        #bsn_list { #body }
+        #bsn_list { { #body } }
     }};
     debug(&output);
     output.into()
@@ -448,7 +448,7 @@ fn let_item(item: &[TokenTree], following: &[Tokens], scope: &mut Scope) -> Toke
     let body = list(&rest, scope);
     let bsn_list = invoke("bsn_list");
     // Doubled braces: `bsn!` unwraps one level of a list item expression.
-    quote! {{ { #statements #bsn_list { #body } } }}
+    quote! {{ { #statements #bsn_list { { #body } } } }}
 }
 
 fn capturing_statement(statement: &[TokenTree], scope: &mut Scope) -> TokenStream {
@@ -477,7 +477,7 @@ fn boxed_list(body: &Group, scope: &mut Scope) -> TokenStream {
     let body = list(&tokens_of(body), scope);
     let bsn_list = invoke("bsn_list");
     quote! {
-        ::std::boxed::Box::new(#bsn_list { #body })
+        ::std::boxed::Box::new(#bsn_list { { #body } })
             as ::std::boxed::Box<dyn ::bevy::scene::SceneList>
     }
 }
