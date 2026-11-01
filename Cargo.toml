@@ -11,7 +11,7 @@ categories = ["game-development", "gui"]
 
 [features]
 default = ["watch", "subscribe", "hooks", "view", "ui"]
-## `watch`, `bind`: react to components and resources on other entities.
+## `watch`, `watch_from`: re-run a closure when the components and resources it reads change.
 watch = []
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
 subscribe = []

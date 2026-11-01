@@ -10,14 +10,14 @@ glob: `use bevy_radioactive::view::*;`.
 | `RadioactivePlugin` | `WatchPlugin`, `HooksPlugin` or `ViewPlugin` for each style you use; `subscribe` needs none |
 | `ReactiveSet::Publish` | `WatchSystems`, `HooksSystems`, `ViewSystems` |
 | `ReactiveSettings { max_passes }` | removed; each runtime settles in up to 8 rounds per frame |
-| `app.track::<T>()`, `ReactiveAppExt` | `#[derive(Track)]` on `T` |
-| `app.observe_value(\|e: On<ValueChanged<T>>\| ..)` | `app.watch(\|e: Watch<Query<&T>>\| ..)` |
-| `watch(#Source, \|r: Reaction<T>\| ..)` | `watch(\|w: Watch<Query<&T, F>>\| ..)`: every matching entity; narrow it with a query filter |
-| `watch(Singleton, \|r: Reaction<T>\| ..)` | `watch(\|w: Watch<Res<T>>\| ..)` |
-| `on_removed(source, h)` / `Removal<T>` | `watch(\|r: Removed<Query<&T>>\| ..)` |
-| `reaction.source()`, `reaction.event().0` | `w.entity()`, `w.0` (`Watch` dereferences to `T`) |
-| `bind(source, \|&T, &mut C\|)` | `bind(\|&T, &mut C\|)`, which also writes the current value on spawn |
-| `bind_or(source, write, or_else)` | removed; use `watch` with `Removed<..>` |
+| `app.track::<T>()`, `ReactiveAppExt` | removed; any `Component` or `Resource` can be watched |
+| `app.observe_value(\|e: On<ValueChanged<T>>\| ..)` | `app.watch_from(any(), \|e: Entity, v: Ref<T>\| ..)` |
+| `watch(#Source, \|r: Reaction<T>\| ..)` | `watch_from(#Source, \|v: Ref<T>\| ..)`; `any()`, `any_with::<C>()` or `any_matching::<F>()` for every matching entity |
+| `watch(Singleton, \|r: Reaction<T>\| ..)` | `watch(\|v: Ref<T>\| ..)` |
+| `on_removed(source, h)` / `Removal<T>` | `watch_from(source, \|v: Option<Ref<T>>\| ..)` (`None` once removed), or Bevy's `On<Remove<T>>` |
+| `reaction.source()`, `reaction.event().0` | an `e: Entity` parameter, `v.0` (`Ref` dereferences to `T`) |
+| `bind(source, \|&T, &mut C\|)` | `watch_from(source, \|v: Ref<T>, c: &mut C\| ..)`, or return the new component; runs on spawn too |
+| `bind_or(source, write, or_else)` | `watch_from(source, \|v: Option<Ref<T>>, c: &mut C\| ..)` |
 | `ValueSource`, `Singleton`, `ValueChanged`, `ValueRemoved` | removed |
 | `Watch`, `WatchRemoval`, `Subscribe` return types | `impl Template` |
 | `subscription` module | `subscribe` module |
@@ -38,9 +38,11 @@ glob: `use bevy_radioactive::view::*;`.
 | `Region` | internal |
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
-New: `watch` takes no source: `#[derive(Track)]` on a component or resource, then
-`watch(|w: Watch<Query<&T, F>>| ..)`, `Watch<Res<T>>` or `Removed<..>`, and
-`app.watch(..)` outside scenes. `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
+New: `watch` takes one closure. `Ref<T>` parameters are tracked and re-run it,
+other system parameters are only read, `&mut C` writes a component of the declaring
+entity and a returned component is inserted on it. It runs on spawn, and
+`watch_from(source, ..)` reads inputs from another entity. `app.watch(..)` and
+`app.watch_from(..)` work outside scenes. `bind_event(source, |&E, &mut C|)` writes a component of the declaring entity when
 an event fires on a source. `hooks` has `cx.use_task(deps, start)` for async work
 (returns `TaskState`). `view` has `for $item in ..` rows that receive their item as a
 signal, `CopySignal` (`copy_signal`, `owns`, `SignalCommandsExt::spawn_signal`) and
@@ -60,8 +62,8 @@ Behavior changes:
 - Unkeyed `hooks` child components are matched by the `@name(..)` call that created
   them rather than by position, so a conditional sibling no longer shifts their state.
   A hook that changes type resets with a warning instead of panicking.
-- `Watch<Res<T>>` is delivered the resource's first insertion, so a resource that
-  doesn't exist when the scene spawns is picked up when it's added.
+- A `watch` whose `Ref<T>` input doesn't exist yet, such as a resource that isn't
+  inserted, skips its runs until the input is added.
 - `subscribe` delivery entities despawn when their source does, not only with the
   declaring entity.
 - A duplicate key in a keyed `view!` `for` shows the last item with that key and logs a

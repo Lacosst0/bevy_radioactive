@@ -9,7 +9,7 @@ or several side by side.
 
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
-| [`watch`](#watch) | `watch` | `WatchPlugin` | react to tracked components and resources changing |
+| [`watch`](#watch) | `watch` | `WatchPlugin` | re-run a closure when the components and resources it reads change |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
 | [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
@@ -35,22 +35,21 @@ affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
 
 ## `watch`
 
-Derive `Track` on a component or resource, then `watch` it. The handler's first
-parameter says what to react to, written like the system parameter you'd read it
-with: `Watch<Query<&T>>` for components, `Watch<Res<T>>` for a resource. `bind`
-writes a component of the current entity from the latest value instead.
+`watch` takes one closure. Its parameter types say what it reacts to, what it
+only reads, and what it writes. It runs once on spawn and again whenever one of
+its `Ref<T>` inputs changes.
 
 ```rust,ignore
 use bevy::{prelude::*, scene::CommandsSceneExt};
 use bevy_radioactive::watch::*;
 
-#[derive(Resource, Clone, Default, Track)]
+#[derive(Resource, Clone, Default)]
 struct Score(u32);
 
-#[derive(Component, Clone, Track)]
+#[derive(Component, Clone, Default)]
 struct Health(u32);
 
-#[derive(Component, Clone)]
+#[derive(Component, Clone, Default)]
 struct Enemy;
 
 fn main() {
@@ -68,42 +67,60 @@ fn hud() -> impl Scene {
     bsn! {
         Node
         Children [
+            #Player Health(100)
+            --
+            // Returns a new `Text` whenever `Score` changes.
             Text("0")
-            bind(|score: &Score, text: &mut Text| **text = score.0.to_string())
+            watch(|score: Ref<Score>| Text(score.0.to_string()))
             --
-            watch(|hp: Watch<Query<&Health>>, mut commands: Commands| {
-                info!("{:?} has {} HP", hp.entity(), hp.0);
+            // Reads `Health` from `#Player` and edits this entity's `Node`.
+            Node
+            watch_from(#Player, |hp: Ref<Health>, node: &mut Node| {
+                node.display = if hp.0 > 0 { Display::Flex } else { Display::None };
             })
             --
-            watch(|hp: Watch<Query<&Health, With<Enemy>>>, mut score: ResMut<Score>| {
-                if hp.0 == 0 { score.0 += 1; }
+            // Runs once per enemy whose `Health` changes. `ResMut` is a plain system param.
+            watch_from(any_with::<Enemy>(), |e: Entity, hp: Ref<Health>, mut score: ResMut<Score>| {
+                if hp.0 == 0 { score.0 += 1; info!("{e} died"); }
             })
             --
-            watch(|gone: Removed<Query<&Health>>| info!("{:?} is gone", gone.entity()))
+            // `Option<Ref<T>>` also runs when `T` is removed or its entity despawns.
+            watch_from(#Player, |hp: Option<Ref<Health>>| {
+                if hp.is_none() { info!("the player is gone"); }
+            })
         ]
     }
 }
 ```
 
-| Handler input | Runs when |
-| --- | --- |
-| `Watch<Query<&T>>` | `T` is inserted or changed on an entity |
-| `Watch<Query<&T, F>>` | the same, for entities matching filter `F` (`With<Enemy>`, `Allow<Disabled>`, ..) |
-| `Watch<Res<T>>` | resource `T` is inserted or changed |
-| `Removed<Query<&T, F>>` / `Removed<Res<T>>` | `T` is removed, or its entity despawns |
+| In the closure | Re-runs it? | Meaning |
+| --- | --- | --- |
+| `c: Ref<T>` | yes | `T` on the source entity, or resource `T` |
+| `c: Option<Ref<T>>` | yes | the same, and `None` once `T` is removed or missing |
+| `Res`, `ResMut`, `Query`, `Single`, `Commands`, `Local`, `MessageReader`, .. | no | ordinary Bevy system parameters; wrap a custom one in `Param<..>` |
+| `c: &mut C` | no | component `C` of the entity that declared the watch |
+| `e: Entity` | no | the source entity |
+| returns a component or bundle | no | inserted on the entity that declared the watch |
 
-`Watch` dereferences to the new value; `entity()` is the entity whose `T` changed and
-`target()` the entity that declared the watch. Other handler parameters are ordinary
-system parameters. `bind(|&T, &mut C|)` writes `C` on its entity when the scene spawns
-and whenever `T` changes, so it suits resources and components that exist once.
-`app.watch(handler)` adds a watch that isn't tied to a scene.
+`Ref` is Bevy's own change-aware reference, so with several inputs `is_changed()`
+tells you which one triggered the run. Any `Component` or `Resource` can be an input;
+nothing needs to be derived.
 
-- A `Query` selector matches exactly the entities that query would return, so
-  disabled entities are skipped unless the filter allows them.
+- `watch(..)` reads `Ref<T>` from the entity that declares it if that entity has a
+  `T`, otherwise from resource `T`.
+- `watch_from(source, ..)` reads them from `source` instead: a `#Name`, an `Entity`,
+  `any()`, `any_with::<C>()` or `any_matching::<F>()`. With the `any` sources it runs
+  once per matching entity whose inputs change, and default query filters apply, so
+  disabled entities are skipped unless `F` allows them.
+- A run is skipped while a plain `Ref<T>` or `&mut C` input is missing.
 - Insertion and mutable access count as changes; use `set_if_neq` to skip no-op
-  writes. Several writes in one frame are delivered once, with the latest value.
-- A handler that writes another tracked value is delivered in the same frame.
-- Watches despawn with the entity that declared them.
+  writes. Several writes in one frame cause one run, with the latest value.
+- A watch that changes another watched value re-runs it in the same frame.
+- Watches despawn with the entity that declared them. `app.watch(..)` and
+  `app.watch_from(..)` add watches that aren't tied to a scene.
+
+For add, insert and removal of a component on the entity itself, use Bevy's own
+observers: `on(|_: On<Add<Health>>| ..)`, `On<Insert<Health>>`, `On<Remove<Health>>`.
 
 Examples: `watch_component`, `watch_resource`.
 
@@ -334,14 +351,14 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 
 ### `watch`
 
-Same resource and buttons, but each node binds itself to the resource:
+Same resource and buttons, but each node watches the resource itself:
 
 ```rust,ignore
 Text("0")
-bind(|count: &Count, text: &mut Text| **text = count.0.to_string())
+watch(|count: Ref<Count>| Text(count.0.to_string()))
 --
 @FeathersButton
-bind(|count: &Count, node: &mut Node| {
+watch(|count: Ref<Count>, node: &mut Node| {
     node.display = if count.0 != 0 { Display::Flex } else { Display::None };
 })
 ```
@@ -414,12 +431,12 @@ systems that write watched values `.before(...)` the set to show them the same f
 Each runtime repeats until nothing changes, up to 8 rounds per frame; if changes are
 still pending after that, it logs a warning and continues next frame.
 
-- `watch` adds one publisher per tracked type using Bevy's `Changed<T>` filter. Each
-  changed value is cloned once and shared with every watch that selects it.
+- `watch` adds one change detector per watched type using Bevy's `Changed<T>`
+  filter, and runs only the watches that read the changed entity. Nothing is cloned.
 - `subscribe` adds one observer per event type and one small entity per
   subscription.
 - `hooks` components and `view` regions check what they read each round and do
-  nothing when it didn't change. Prefer `view` regions or `bind` for hot paths, and
+  nothing when it didn't change. Prefer `view` regions or `watch` for hot paths, and
   plain systems for thousands of entities changing every frame.
 
 ## Official Bevy references
