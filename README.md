@@ -170,7 +170,7 @@ bsn! {
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
 | `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
-| `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` (also named `@r#if`) |
+| `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` |
 | `@switch(\|..\| key, \|key\| ..)` | scene | `match`; arms are boxed with `.into()` |
 | `@each(\|..\| items, \|item\| key, \|item\| ..)` | scene | a keyed list |
 | `@each_indexed(\|..\| items, \|item\| ..)` | scene | a list by position |

@@ -351,7 +351,7 @@ fn if_and_nested_else_if_switch_branches_and_despawn_the_old_one() {
         .spawn_scene(bsn! {
             Count(0)
             Children [
-                @r#if(
+                @if_else(
                     |count: Ref<Count>| count.0 > 0,
                     || bsn! { Label("positive") },
                     || bsn! {
