@@ -187,16 +187,17 @@ fn bindings(pattern: &[TokenTree]) -> Vec<Ident> {
 }
 
 // ---------------------------------------------------------------------------
-// `$Type` reads
+// `$` reads
 // ---------------------------------------------------------------------------
 
 /// Where a `$` read comes from.
 enum Kind {
-    /// `#Name$Type`: `Type` on the nearest entity named `#Name`.
+    /// `$Ref<Type>(#Name)` or `$Ref<Type>("Name")`: `Type` on the nearest
+    /// entity named `Name`.
     Named(String),
     /// `$Res<T>`, `$Query<..>`, ..: that system parameter, as written.
     Exact,
-    /// `$(entity).Type`: `Type` on that entity.
+    /// `$Ref<Type>(entity)`: `Type` on that entity.
     Entity(TokenStream),
 }
 
@@ -209,7 +210,11 @@ struct Param {
 
 /// The `$` reads of one closure, one parameter per distinct read.
 #[derive(Default)]
-struct Params(Vec<Param>, bool);
+struct Params {
+    params: Vec<Param>,
+    /// In an `on(..)` handler, where `$Mut<T>(..)` writes.
+    write: bool,
+}
 
 impl Params {
     fn param(&mut self, ty: &[TokenTree], kind: Kind) -> Ident {
@@ -218,11 +223,11 @@ impl Params {
             Kind::Exact => format!("exact {}", stream(ty)),
             Kind::Entity(entity) => format!("({entity}).{}", stream(ty)),
         };
-        if let Some(param) = self.0.iter().find(|p| p.key == key) {
+        if let Some(param) = self.params.iter().find(|p| p.key == key) {
             return param.name.clone();
         }
-        let name = format_ident!("__rsn_{}", self.0.len());
-        self.0.push(Param {
+        let name = format_ident!("__rsn_{}", self.params.len());
+        self.params.push(Param {
             key,
             name: name.clone(),
             ty: stream(ty),
@@ -232,19 +237,19 @@ impl Params {
     }
 
     fn by_entity(&self) -> bool {
-        self.0
+        self.params
             .iter()
             .any(|p| matches!(p.kind, Kind::Entity(_) | Kind::Named(_)))
     }
 
     fn named(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.kind, Kind::Named(_)))
+        self.params.iter().any(|p| matches!(p.kind, Kind::Named(_)))
     }
 
     /// Closure parameters, ending with a comma when not empty.
     fn closure_params(&self, write: bool) -> TokenStream {
         let mut out = TokenStream::new();
-        for (index, param) in self.0.iter().enumerate() {
+        for (index, param) in self.params.iter().enumerate() {
             let Param { name, ty, kind, .. } = param;
             match (kind, write) {
                 (Kind::Exact, _) => quote!(#[allow(unused_mut)] mut #name: #ty,),
@@ -273,7 +278,7 @@ impl Params {
     /// missing, a handler does nothing.
     fn lookups(&self, write: bool) -> TokenStream {
         let mut out = TokenStream::new();
-        for (index, param) in self.0.iter().enumerate() {
+        for (index, param) in self.params.iter().enumerate() {
             let name = &param.name;
             let query = format_ident!("__rsn_q{index}");
             let ty = &param.ty;
@@ -396,7 +401,7 @@ fn dollar(
     if !is_ref && !is_mut {
         return Ok((params.param(&tokens[start..j], Kind::Exact), j));
     }
-    if is_mut && !params.1 {
+    if is_mut && !params.write {
         return Err((
             span,
             "`$Mut<T>(..)` writes, so it only works in `on(..)`; read with `$Ref<T>(..)`",
@@ -434,6 +439,9 @@ fn dollar(
     Ok((params.param(ty, kind), j + 1))
 }
 
+const MISPLACED_DOLLAR: &str =
+    "`$` reads work in component values, `on(..)` handlers and `if`/`match`/`for` headers";
+
 fn has_dollar(tokens: &[TokenTree]) -> bool {
     tokens.iter().enumerate().any(|(i, token)| match token {
         TokenTree::Punct(p) => p.as_char() == '$',
@@ -443,14 +451,14 @@ fn has_dollar(tokens: &[TokenTree]) -> bool {
 }
 
 /// Whether the group at `index` is the body of a nested `rsn!`/`rsn_list!`,
-/// whose `$Type`s belong to it.
+/// whose `$` reads belong to it.
 fn nested_rsn(tokens: &[TokenTree], index: usize) -> bool {
     index >= 2
         && is_punct(tokens.get(index - 1), '!')
         && (is_ident(tokens.get(index - 2), "rsn") || is_ident(tokens.get(index - 2), "rsn_list"))
 }
 
-/// Rewrites `$Type` (or `$path::Type`) to its parameter, deeply.
+/// Rewrites each `$` read to its parameter, deeply.
 fn reads(tokens: &[TokenTree], params: &mut Params) -> TokenStream {
     let mut out = TokenStream::new();
     let mut i = 0;
@@ -501,12 +509,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
         if !starts_path || named {
             match &tokens[i] {
                 TokenTree::Group(g) if has_dollar(&tokens_of(g)) => {
-                    error(
-                        g.span(),
-                        "`$Type` works in component values, `on(..)` handlers and \
-                         `if`/`match`/`for` headers",
-                    )
-                    .to_tokens(&mut out);
+                    error(g.span(), MISPLACED_DOLLAR).to_tokens(&mut out);
                 }
                 TokenTree::Group(g)
                     if g.delimiter() == Delimiter::Brace && scope.mentions(&tokens_of(g)) =>
@@ -557,12 +560,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
                     } else if is_on {
                         handler(g, scope).to_tokens(&mut out);
                     } else {
-                        error(
-                            g.span(),
-                            "`$Type` works in component values, `on(..)` handlers and \
-                             `if`/`match`/`for` headers",
-                        )
-                        .to_tokens(&mut out);
+                        error(g.span(), MISPLACED_DOLLAR).to_tokens(&mut out);
                     }
                 } else if scope.mentions(&content) {
                     stream(path).to_tokens(&mut out);
@@ -676,7 +674,7 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
             continue;
         }
         let Some((name, value)) = field_split(&field, Delimiter::Brace) else {
-            return error(group.span(), "expected `field: value` around `$Type`");
+            return error(group.span(), "expected `field: value` around a `$` read");
         };
         let value = reads(&unbrace(value).into_iter().collect::<Tokens>(), &mut params);
         quote!(__rsn_c.#name = ::core::convert::Into::into(#value);).to_tokens(&mut assignments);
@@ -765,7 +763,10 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
         }
     };
     let site = scope.site(&content);
-    let mut params = Params(Vec::new(), true);
+    let mut params = Params {
+        params: Vec::new(),
+        write: true,
+    };
     let body = reads(body, &mut params);
     let rest = closure_params.iter().map(|p| stream(p));
     let writers = params.closure_params(true);
@@ -1024,7 +1025,7 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
     match key {
         Some(key) => {
             if has_dollar(key) {
-                return error(item[0].span(), "a `#[key(..)]` can't read `$Type`");
+                return error(item[0].span(), "a `#[key(..)]` can't use `$` reads");
             }
             let key_tokens = stream(key);
             let key = scope.capture(
@@ -1086,25 +1087,14 @@ fn query_for(
                 .collect::<::std::vec::Vec<_>>()
         }
     };
-    let bound = bindings(pattern);
+    let rendered = rendered(body, scope, bindings(pattern));
     let pattern = stream(pattern);
-    let mut inner = scope.child(bound);
-    let mut list = TokenStream::new();
-    for (index, item) in split_items(&tokens_of(body)).iter().enumerate() {
-        if index > 0 {
-            dashes().to_tokens(&mut list);
-        }
-        list_item(item, &mut inner).to_tokens(&mut list);
-    }
-    let prelude = inner.prelude;
-    let bsn_list = invoke("bsn_list", body.span(), list);
     let row = scope.capture(
         quote! {
             move |__rsn_row: &_| -> ::std::boxed::Box<dyn ::bevy::scene::SceneList> {
                 #[allow(unused_variables)]
                 let (__rsn_e, #pattern) = ::core::clone::Clone::clone(__rsn_row);
-                #prelude
-                ::std::boxed::Box::new(#bsn_list) as ::std::boxed::Box<dyn ::bevy::scene::SceneList>
+                #rendered
             }
         },
         &tokens_of(body),
