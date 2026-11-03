@@ -40,8 +40,11 @@ affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
 
 One API for reactivity and control flow where the ECS is the reactive graph:
 state is a component or resource, context is an ancestor's component, a branch
-is an entity, and cleanup is despawning. Every closure takes ordinary Bevy system
-parameters, so there is nothing new to learn about reading data.
+is an entity, and cleanup is despawning.
+
+Write scenes with `rsn!`: it is `bsn!` plus Rust `if`/`match`/`for` and `$Type`,
+which means "the nearest `Type`" (this entity, its `Source`, its ancestors, then
+resource `Type`). Anything that reads a `$Type` re-runs when it changes.
 
 ```rust,ignore
 use bevy::{prelude::*, ui_widgets::Activate};
@@ -56,48 +59,83 @@ struct Todo { id: u32, title: String }
 #[derive(Resource, Clone, Default)]
 struct Todos(Vec<Todo>);
 
-#[derive(Component, Clone, Default)]
-struct Enemy;
+#[derive(Resource, Clone, Copy, PartialEq, Default)]
+enum Tab { #[default] Home, Settings }
 
 fn counter() -> impl Scene {
-    bsn! {
+    rsn! {
         Node
-        Count(0)                          // state; every @counter() has its own
+        Count(0)                                  // state; every @counter() has its own
         Children [
             Button
-            handle(|_: &Activate, count: &mut Count| count.0 += 1)   // writes the nearest Count
+            on(|_: On<Activate>| $Count.0 += 1)  // writes the nearest Count
             --
-            Text("0")
-            watch(|count: Ref<Count>| Text(count.0.to_string()))     // re-runs when it changes
+            Text({ $Count.0.to_string() })        // re-renders when it changes
             --
-            @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
-            --
-            @r#if(
-                |count: Ref<Count>| count.0 >= 0,
-                || bsn! { Text("zero or more") },
-                || bsn! { Text("negative") },
-            )
+            if $Count.0 > 10 {
+                Text("That's a lot")
+            } else if $Count.0 < 0 {
+                Text("Negative")
+            }
         ]
     }
 }
 
-fn todo_list() -> impl Scene {
-    bsn! {
+fn app_body() -> impl Scene {
+    rsn! {
         Node
         Children [
-            @each(
-                |todos: Res<Todos>| todos.0.clone(),
-                |todo| todo.id,                                     // key
-                |todo| bsn! { Text({todo.title.clone()}) },
-            )
+            match *$Tab {
+                Tab::Home => @counter(),
+                Tab::Settings => Text("Settings"),
+            }
             --
-            Text("")
-            watch(|enemies: Query<(), With<Enemy>>| Text(format!("{} enemies", enemies.iter().count())))
+            #[key(todo.id)]
+            for todo in $Todos.0.clone() {
+                Text({ todo.title.clone() })
+            }
         ]
     }
 }
 
 // app.add_plugins(ReactivePlugin)
+```
+
+| In `rsn!` | Becomes |
+| --- | --- |
+| `Comp(.. $T ..)` | a `watch` that rebuilds `Comp` when `T` changes |
+| `Comp { a: .. $T .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
+| `on(\|e: On<E>\| .. $T ..)` | a handler; `$T` is the nearest `T`, writable (`$Count.0 += 1`) |
+| `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
+| `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
+| `#[key(expr)] for pat in iter { .. }` | a keyed list; rows are kept, moved or rebuilt per key |
+| `for pat in iter { .. }` | a list by position |
+| anything else | passed to `bsn!` unchanged |
+
+- `if`, `match` and `for` work without `$` too: they then run once.
+- `for` needs owned items (`$Todos.0.clone()`, a range, a `Vec`), and items need
+  `PartialEq` so unchanged rows are kept. Loop and match bindings can be used any
+  number of times in the body.
+- `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
+- A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
+  feature) whose children are the content.
+
+### The functions under `rsn!`
+
+`rsn!` expands to functions you can use directly in `bsn!` or plain Rust. They
+take closures with ordinary Bevy system parameters, which is also how to react
+to a `Query` or anything else `$Type` doesn't cover:
+
+```rust,ignore
+bsn! {
+    Text("")
+    watch(|enemies: Query<(), With<Enemy>>| Text(format!("{} enemies", enemies.iter().count())))
+    --
+    Button
+    handle(|_: &Activate, count: &mut Count| count.0 += 1)
+    --
+    @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
+}
 ```
 
 | In a closure | Re-runs it? | Meaning |
@@ -115,23 +153,17 @@ fn todo_list() -> impl Scene {
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
 | `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
-| `@r#if(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else`; nest another in `otherwise` for `else if`. Also named `@if_else` |
-| `@switch(\|..\| key, \|key\| match key { .. })` | scene | `match`; arms are boxed with `.into()` |
+| `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` (also named `@r#if`) |
+| `@switch(\|..\| key, \|key\| ..)` | scene | `match`; arms are boxed with `.into()` |
 | `@each(\|..\| items, \|item\| key, \|item\| ..)` | scene | a keyed list |
 | `@each_indexed(\|..\| items, \|item\| ..)` | scene | a list by position |
 | `Source(#Player)` | component | make this subtree read and write another entity's components |
 | `Nearest<D>` | system param | the same lookup from ordinary systems and observers |
 
-- Templates go on an entity in `bsn!`; outside scenes attach them with
-  `commands.entity(e).react(watch(..))`.
-- Control flow is a scene function, included with `@` like any other:
-  `Children [ @when(..) -- @each(..) ]`. The entity that includes it becomes a region
-  (a `GhostNode` with the `ui` feature) whose children are the content, rebuilt only
-  when the chosen branch, key or item changes. `if` is a Rust keyword, so `bsn!`
-  needs `@r#if`; `@if_else` is the same function. Outside scenes, spawn them like any
-  scene: `commands.spawn_scene(when(..))`.
+- Outside scenes, attach templates with `commands.entity(e).react(watch(..))` and
+  spawn regions like any scene: `commands.spawn_scene(when(..))`.
 - For list rows that update in place, list entities and give each row
-  `Source({entity})`; the row's watches then track that entity.
+  `Source({entity})`; `$Todo` in the row then reads that entity's `Todo`.
 - Reactions are entities linked to the entity that declared them (`ReactionOf`), so
   they despawn with it, and replacing a branch despawns everything it declared. Use
   Bevy's `on(|_: On<Despawn>| ..)` for cleanup code.
@@ -461,21 +493,22 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 ### `reactive`
 
 The count is a component on the counter's root, so each counter has its own.
-`handle` writes the nearest `Count`, and `@when` owns the Reset button:
+`$Count` is the nearest one, and the `if` owns the Reset button:
 
 ```rust,ignore
-Count(0)
-// ...
-handle(|_: &Activate, count: &mut Count| count.0 += 1)
-// ...
-Text("0")
-watch(|count: Ref<Count>| Text(count.0.to_string()))
-// ...
-@when(|count: Ref<Count>| count.0 != 0, || bsn! {
-    @FeathersButton
-    handle(|_: &Activate, count: &mut Count| count.0 = 0)
-    Children [ @caption("Reset") ]
-})
+rsn! {
+    Count(0)
+    // ...
+    on(|_: On<Activate>| $Count.0 += 1)
+    // ...
+    Text({ $Count.0.to_string() })
+    // ...
+    if $Count.0 != 0 {
+        @FeathersButton
+        on(|_: On<Activate>| $Count.0 = 0)
+        Children [ @caption("Reset") ]
+    }
+}
 ```
 
 ### `watch`

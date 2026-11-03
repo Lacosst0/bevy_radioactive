@@ -7,6 +7,11 @@
 //! parameters; the parameter types say what it reads, what re-runs it and
 //! what it writes.
 //!
+//! Scenes are usually written with [`rsn!`]: `bsn!` plus Rust control flow
+//! and `$Type`, "the nearest `Type`" (this entity, its [`Source`], its
+//! ancestors, then resource `Type`). Whatever reads a `$Type` re-runs when it
+//! changes.
+//!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};
 //! use bevy_radioactive::reactive::*;
@@ -15,26 +20,54 @@
 //! struct Count(i32);
 //!
 //! fn counter() -> impl Scene {
-//!     bsn! {
+//!     rsn! {
 //!         Node
-//!         Count(0)                     // state, local to this counter
+//!         Count(0)                                 // state, local to this counter
 //!         Children [
 //!             Button
-//!             handle(|_: &Activate, count: &mut Count| count.0 += 1)
+//!             on(|_: On<Activate>| $Count.0 += 1) // writes the nearest Count
 //!             --
-//!             Text("0")
-//!             watch(|count: Ref<Count>| Text(count.0.to_string()))
+//!             Text({ $Count.0.to_string() })       // re-renders when it changes
 //!             --
-//!             @r#if(
-//!                 |count: Ref<Count>| count.0 > 10,
-//!                 || bsn! { Text("That's a lot") },
-//!                 || bsn! { Text("Keep going") },
-//!             )
+//!             if $Count.0 > 10 { Text("That's a lot") } else { Text("Keep going") }
+//!             --
+//!             #[key(todo.id)]
+//!             for todo in $Todos.0.clone() { Text({ todo.title.clone() }) }
 //!         ]
 //!     }
 //! }
 //!
 //! // app.add_plugins(ReactivePlugin)
+//! ```
+//!
+//! # `rsn!`
+//!
+//! | In `rsn!` | Becomes |
+//! | --- | --- |
+//! | `Comp(.. $T ..)` | a [`watch`] that rebuilds `Comp` when `T` changes |
+//! | `Comp { a: .. $T .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
+//! | `on(\|e: On<E>\| .. $T ..)` | a [`handle`]r where `$T` is the nearest `T`, writable |
+//! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
+//! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
+//! | `#[key(expr)] for pat in iter { .. }` | an [`each`] region, keyed |
+//! | `for pat in iter { .. }` | an [`each_indexed`] region |
+//! | anything else | passed to `bsn!` unchanged |
+//!
+//! Without `$`, `if`/`match`/`for` run once. `for` needs owned items that
+//! implement `PartialEq`. Loop and match bindings may be used any number of
+//! times in the body. [`rsn_list!`] is the list form.
+//!
+//! The functions it expands to are public and take closures with ordinary
+//! Bevy system parameters; use them in `bsn!` or plain Rust, and for inputs
+//! `$Type` doesn't cover, such as a `Query`:
+//!
+//! ```ignore
+//! bsn! {
+//!     Text("")
+//!     watch(|enemies: Query<(), With<Enemy>>| Text(format!("{} enemies", enemies.iter().count())))
+//!     --
+//!     @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
+//! }
 //! ```
 //!
 //! # Parameters
@@ -91,6 +124,8 @@
 //! feature) whenever its inputs changed. Outer regions update before the
 //! reactions inside them. A reaction doesn't see its own writes; one that
 //! changes another's input re-runs it in the same frame, for up to 16 rounds.
+
+pub use crate::macros::{rsn, rsn_list};
 
 use std::{
     any::TypeId,
@@ -1691,4 +1726,30 @@ impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
             Found::Resource => self.resources.single_mut().ok(),
         }
     }
+}
+
+#[doc(hidden)]
+pub mod __private {
+    pub use super::{
+        each as __rsn_each, each_indexed as __rsn_each_indexed, handle as __rsn_handle,
+        switch as __rsn_switch, watch as __rsn_watch,
+    };
+    pub use bevy::scene::{bsn, bsn_list};
+}
+
+// `bsn!` checks that its call site's source text starts with `bsn!`. These
+// wrappers give it that call site when invoked from `rsn!` output. `bsn` and
+// `bsn_list` resolve through `__private`, which `rsn!` output glob-imports.
+// The body is passed as one braced group so punctuation keeps its spacing.
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rsn_bsn {
+    ($body:tt) => { bsn! $body };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __rsn_bsn_list {
+    ($body:tt) => { bsn_list! $body };
 }

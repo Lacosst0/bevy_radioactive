@@ -24,13 +24,15 @@ enum Filter {
 struct Label(String);
 
 fn todo_list() -> impl Scene {
-    bsn! {
+    rsn! {
         Children [
-            @switch(|filter: Res<Filter>| *filter, |filter| match filter {
-                Filter::All => bsn! { Label("Showing all") }.into(),
-                Filter::Open => bsn! { Label("Showing open") }.into(),
-            })
+            match *$Filter {
+                Filter::All => Label("Showing all"),
+                Filter::Open => Label("Showing open"),
+            }
             --
+            // Closures with any system parameter work alongside `$`: here a
+            // `Query` that re-runs when todos spawn or despawn.
             @when(|todos: Query<(), With<Todo>>| todos.is_empty(), || bsn! { Label("Nothing to do") })
             --
             @each(
@@ -44,12 +46,10 @@ fn todo_list() -> impl Scene {
                     rows
                 },
                 |&todo| todo,
-                |&todo| bsn! {
+                // `Source` makes `$Todo` this row's todo entity.
+                |&todo| rsn! {
                     Source({todo})
-                    Label
-                    watch(|todo: Ref<Todo>| {
-                        Label(format!("[{}] {}", if todo.done { "x" } else { " " }, todo.title))
-                    })
+                    Label({ format!("[{}] {}", if $Todo.done { "x" } else { " " }, $Todo.title) })
                 },
             )
         ]

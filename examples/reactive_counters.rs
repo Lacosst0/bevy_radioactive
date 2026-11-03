@@ -16,17 +16,16 @@ struct Increment {
 }
 
 fn counter(name: &'static str) -> impl Scene {
-    bsn! {
+    rsn! {
         Count(0)
         Children [
             Name({name})
-            // Writes the nearest `Count`: this counter's, not the other one's.
-            handle(|_: &Increment, count: &mut Count| count.0 += 1)
+            // `$Count` is the nearest `Count`: this counter's, not the other one's.
+            on(|_: On<Increment>| $Count.0 += 1)
             --
-            Label
-            watch(move |count: Ref<Count>| Label(format!("{name} = {}", count.0)))
+            Label({ format!("{name} = {}", $Count.0) })
             --
-            @when(|count: Ref<Count>| count.0 >= 3, || bsn! { Label("  that's a lot") })
+            if $Count.0 >= 3 { Label("  that's a lot") }
         ]
     }
 }
@@ -40,13 +39,14 @@ fn main() {
         ReactivePlugin,
     ));
     app.world_mut()
-        .spawn_scene_list(bsn_list! {
+        .spawn_scene_list(rsn_list! {
             @counter("a")
             --
             @counter("b")
             --
             Label
-            // `Query` parameters re-run when any `Count` changes.
+            // Plain `bsn!` items work too. `Query` parameters re-run when any
+            // `Count` changes.
             watch(|counts: Query<&Count>| {
                 Label(format!("total = {}", counts.iter().map(|c| c.0).sum::<i32>()))
             })

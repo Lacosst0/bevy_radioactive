@@ -38,10 +38,11 @@ glob: `use bevy_radioactive::view::*;`.
 | `Region` | internal |
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
-New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style that
-covers watching, `@when`/`@r#if`/`@switch`/`@each` control flow, `handle` event handlers,
-ancestor context (`Ref<T>` finds the nearest `T`), `Source` and `Nearest`, with
-components as state and despawning as cleanup. Nothing else changes.
+New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style. Its
+`rsn!` macro is `bsn!` plus Rust `if`/`match`/`for` (with `#[key(..)]`) and `$Type` reads
+of the nearest component or resource, expanding to `watch`, `handle`, `when`, `switch`
+and `each`, which also work directly. Components are state and despawning is cleanup.
+Nothing else changes.
 
 New: `watch` takes one closure. `Ref<T>` parameters are tracked and re-run it,
 other system parameters are only read, `&mut C` writes a component of the declaring
