@@ -83,19 +83,19 @@ use std::{
 use bevy::{
     ecs::{
         component::Mutable,
-        entity::EntityHashSet,
         entity_disabling::Disabled,
-        lifecycle::HookContext,
         template::{Template, TemplateContext},
-        world::{CommandQueue, DeferredWorld},
+        world::CommandQueue,
     },
     platform::collections::HashMap,
     prelude::*,
-    scene::{EmptySceneEffect, SceneList, WorldSceneExt},
+    scene::{EmptySceneEffect, SceneList},
 };
 
 mod copy_signal;
 mod store;
+
+use crate::shared::{Hosts, add_host, despawn_all, remove_host, settle, spawn_children};
 
 pub use copy_signal::{
     CopySignal, OwnedSignals, Owns, SignalCell, SignalCommandsExt, SignalOf, copy_signal, owns,
@@ -115,7 +115,7 @@ pub struct ViewPlugin;
 
 impl Plugin for ViewPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Hosts>()
+        app.init_resource::<Hosts<Updates>>()
             .add_systems(PostUpdate, update_all.in_set(ViewSystems));
         #[cfg(feature = "ui")]
         app.configure_sets(PostUpdate, ViewSystems.before(bevy::ui::UiSystems::Prepare));
@@ -497,39 +497,16 @@ struct Slot {
 
 /// View updates attached to an entity.
 #[derive(Component)]
-#[component(on_add = add_host, on_remove = remove_host)]
+#[component(on_add = add_host::<Self>, on_remove = remove_host::<Self>)]
 struct Updates(Vec<Slot>);
 
-#[derive(Resource, Default)]
-struct Hosts(EntityHashSet);
-
-fn add_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
-        hosts.0.insert(context.entity);
-    }
-}
-
-fn remove_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
-        hosts.0.remove(&context.entity);
-    }
-}
-
 fn update_all(world: &mut World) {
-    for _ in 0..MAX_ROUNDS {
-        if update_dirty(world) == 0 {
-            return;
-        }
-    }
-    warn!(
-        "view: signals still changing after {MAX_ROUNDS} rounds; the rest update next frame. \
-         An effect may be setting a signal it reads."
-    );
+    settle(world, MAX_ROUNDS, update_dirty, "view: signals");
 }
 
 /// Runs every update whose signals changed. Returns how many ran.
 fn update_dirty(world: &mut World) -> usize {
-    let hosts: Vec<Entity> = world.resource::<Hosts>().0.iter().copied().collect();
+    let hosts = Hosts::<Updates>::snapshot(world);
     let mut ran = 0;
     for host in hosts {
         let Ok(mut entity) = world.get_entity_mut(host) else {
@@ -575,7 +552,7 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         let installed = context
             .entity
-            .world_scope(|world| world.contains_resource::<Hosts>());
+            .world_scope(|world| world.contains_resource::<Hosts<Updates>>());
         if !installed {
             return Err("reactive views need `ViewPlugin`; add it to the app".into());
         }
@@ -627,55 +604,17 @@ where
     })
 }
 
-#[cfg(feature = "ui")]
-fn strip_ghost_transform(mut world: DeferredWorld, context: HookContext) {
-    // `GhostNode` requires `Transform`, which UI layout doesn't use and Bevy
-    // warns about under a UI parent.
-    world
-        .commands()
-        .entity(context.entity)
-        .remove::<(Transform, GlobalTransform)>();
-}
-
 // ---------------------------------------------------------------------------
 // Template building blocks used by `view!`
 // ---------------------------------------------------------------------------
 
-/// Host entity of a reactive region. With the `ui` feature it is a
-/// `GhostNode`, so its children are laid out as children of its parent.
 #[doc(hidden)]
-#[derive(Component, Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "ui", require(bevy::ui::experimental::GhostNode))]
-#[cfg_attr(feature = "ui", component(on_add = strip_ghost_transform))]
-pub struct Region;
+pub use crate::shared::Region;
 
 type BoxedList = Box<dyn SceneList>;
 
 fn spawn_list(world: &mut World, parent: Entity, list: BoxedList) -> Vec<Entity> {
-    match world.spawn_scene_list(list) {
-        Ok(entities) => {
-            for &entity in &entities {
-                world.entity_mut(entity).insert(ChildOf(parent));
-            }
-            entities
-        }
-        Err(error) => {
-            let handler = world.fallback_error_handler();
-            handler(
-                BevyError::from(error),
-                bevy::ecs::error::ErrorContext::Command {
-                    name: "bevy_radioactive::view::spawn".into(),
-                },
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn despawn_all(world: &mut World, entities: &[Entity]) {
-    for &entity in entities {
-        world.despawn(entity);
-    }
+    spawn_children(world, parent, list, "bevy_radioactive::view")
 }
 
 /// Patches component `C` whenever a signal read by `f` changes.

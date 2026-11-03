@@ -141,11 +141,13 @@
 
 pub use crate::macros::{rsn, rsn_list};
 
+use crate::shared::{self, despawn_all, lock};
+
 use std::{
     any::TypeId,
     hash::Hash,
     marker::PhantomData,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex},
 };
 
 use bevy::{
@@ -162,10 +164,7 @@ use bevy::{
     },
     platform::collections::HashMap,
     prelude::*,
-    scene::{
-        EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneList,
-        WorldSceneExt,
-    },
+    scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneList},
 };
 
 /// Rounds of updates per frame, so chained reactions settle in one frame.
@@ -217,26 +216,7 @@ pub struct ReactiveSystems;
 #[derive(Component, FromTemplate, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Source(pub Entity);
 
-/// Host entity of a [`when`], [`switch`] or [`each`] region. With the `ui`
-/// feature it is a `GhostNode`, so its children are laid out as children of
-/// its parent.
-#[derive(Component, Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "ui", require(bevy::ui::experimental::GhostNode))]
-#[cfg_attr(feature = "ui", component(on_add = strip_ghost_transform))]
-pub struct Region;
-
-#[cfg(feature = "ui")]
-fn strip_ghost_transform(
-    mut world: bevy::ecs::world::DeferredWorld,
-    context: bevy::ecs::lifecycle::HookContext,
-) {
-    // `GhostNode` requires `Transform`, which UI layout doesn't use and Bevy
-    // warns about under a UI parent.
-    world
-        .commands()
-        .entity(context.entity)
-        .remove::<(Transform, GlobalTransform)>();
-}
+pub use crate::shared::Region;
 
 /// Links a reaction entity to the entity that declared it.
 #[derive(Component, Debug)]
@@ -923,45 +903,47 @@ fn run_reaction(world: &mut World, reaction: Entity) {
 }
 
 fn run_reactions(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) {
-    for _ in 0..MAX_ROUNDS {
-        world.flush();
-        run_pending(world);
-        scan_any(world);
-        let now = world.change_tick();
-        let mut due: Vec<(usize, Entity)> = {
-            let world = &*world;
-            let changes = world.resource::<AnyChanges>();
-            reactions
-                .iter(world)
-                .filter(|(_, reaction)| {
-                    reaction.body.is_some()
-                        && !world
-                            .get_entity(reaction.host)
-                            .is_ok_and(|host| host.contains::<Disabled>())
-                        && reaction.is_dirty(world, changes, now)
-                })
-                .map(|(entity, reaction)| {
-                    let depth = ancestors(reaction.host, |entity| {
-                        world.get::<ChildOf>(entity).map(ChildOf::parent)
-                    })
-                    .count();
-                    (depth, entity)
-                })
-                .collect()
-        };
-        if due.is_empty() {
-            return;
-        }
-        // Outer regions first: they may despawn the reactions inside them.
-        due.sort_unstable();
-        for (_, reaction) in due {
-            run_reaction(world, reaction);
-        }
-    }
-    warn!(
-        "reactive: values still changing after {MAX_ROUNDS} rounds; the rest runs next frame. \
-         A reaction may be writing a value it reads."
+    shared::settle(
+        world,
+        MAX_ROUNDS,
+        |world| run_round(world, reactions),
+        "reactive: values",
     );
+}
+
+/// Runs every reaction whose inputs changed. Returns how many ran.
+fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) -> usize {
+    world.flush();
+    run_pending(world);
+    scan_any(world);
+    let now = world.change_tick();
+    let mut due: Vec<(usize, Entity)> = {
+        let world = &*world;
+        let changes = world.resource::<AnyChanges>();
+        reactions
+            .iter(world)
+            .filter(|(_, reaction)| {
+                reaction.body.is_some()
+                    && !world
+                        .get_entity(reaction.host)
+                        .is_ok_and(|host| host.contains::<Disabled>())
+                    && reaction.is_dirty(world, changes, now)
+            })
+            .map(|(entity, reaction)| {
+                let depth = ancestors(reaction.host, |entity| {
+                    world.get::<ChildOf>(entity).map(ChildOf::parent)
+                })
+                .count();
+                (depth, entity)
+            })
+            .collect()
+    };
+    // Outer regions first: they may despawn the reactions inside them.
+    due.sort_unstable();
+    for &(_, reaction) in &due {
+        run_reaction(world, reaction);
+    }
+    due.len()
 }
 
 /// Something [`ReactExt::react`] can attach to an entity: [`watch`] or
@@ -1134,7 +1116,7 @@ where
             let handler = Arc::clone(&handler);
             // Exclusive world access, so handlers can take any parameter.
             commands.queue(move |world: &mut World| {
-                let mut handler = handler.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut handler = lock(&handler);
                 let (reader, inputs) = &mut *handler;
                 let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
                     let mut inputs = Vec::new();
@@ -1227,35 +1209,10 @@ fn spawn_children(world: &mut World, parent: Entity, list: Box<dyn SceneList>) -
     // Hold first runs until the content has its parent, so lookups through
     // ancestors work.
     world.resource_mut::<Pending>().held += 1;
-    let spawned = world.spawn_scene_list(list);
+    let entities = shared::spawn_children(world, parent, list, "bevy_radioactive::reactive");
     world.resource_mut::<Pending>().held -= 1;
-    match spawned {
-        Ok(entities) => {
-            for &entity in &entities {
-                world.entity_mut(entity).insert(ChildOf(parent));
-            }
-            run_pending(world);
-            entities
-        }
-        Err(error) => {
-            let handler = world.fallback_error_handler();
-            handler(
-                BevyError::from(error),
-                bevy::ecs::error::ErrorContext::Command {
-                    name: "bevy_radioactive::reactive::spawn".into(),
-                },
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn despawn_all(world: &mut World, entities: &[Entity]) {
-    for &entity in entities {
-        if let Ok(entity) = world.get_entity_mut(entity) {
-            entity.despawn();
-        }
-    }
+    run_pending(world);
+    entities
 }
 
 /// Shows the content for the current key, rebuilt when the key changes.

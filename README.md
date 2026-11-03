@@ -4,8 +4,8 @@ Reactive UI for Bevy 0.20 BSN scenes. A node declares what it depends on, right
 where it is spawned, instead of a global system querying for it.
 
 There are four styles. Each one is a separate module behind its own Cargo feature,
-with its own plugin and runtime: they share no code, so use any one of them alone
-or several side by side. [`reactive`](#reactive) is the newest and covers what the
+with its own plugin and runtime, so use any one of them alone or several side by
+side. [`reactive`](#reactive) is the newest and covers what the
 others do in one ECS-native API: watching, `if`/`else`, `match`, keyed lists, event
 handlers, context and cleanup.
 
