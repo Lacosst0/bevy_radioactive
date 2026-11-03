@@ -332,15 +332,23 @@ fn untracked_params_do_not_rerun() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn when_otherwise_switches_branches_and_despawns_the_old_one() {
+fn if_and_nested_else_if_switch_branches_and_despawn_the_old_one() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(bsn! {
             Count(0)
             Children [
-                {when(|count: Ref<Count>| count.0 > 0, || bsn! { Label("positive") })
-                    .else_when(|count: Ref<Count>| count.0 < 0, || bsn! { Label("negative") })
-                    .otherwise(|| bsn! { Label("zero") })}
+                @r#if(
+                    |count: Ref<Count>| count.0 > 0,
+                    || bsn! { Label("positive") },
+                    || bsn! {
+                        @if_else(
+                            |count: Ref<Count>| count.0 < 0,
+                            || bsn! { Label("negative") },
+                            || bsn! { Label("zero") },
+                        )
+                    },
+                )
             ]
         })
         .unwrap();
@@ -378,7 +386,7 @@ fn region_is_a_child_with_the_content_as_its_children() {
             Children [
                 Label("before")
                 --
-                {when(|| true, || bsn_list! { Label("a") -- Label("b") })}
+                @when(|| true, || bsn_list! { Label("a") -- Label("b") })
                 --
                 Label("after")
             ]
@@ -405,10 +413,10 @@ fn switch_rebuilds_only_when_the_key_changes() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                {switch(|tab: Res<Tab>| *tab, |tab| match tab {
+                @switch(|tab: Res<Tab>| *tab, |tab| match tab {
                     Tab::Home => bsn! { Label("home") }.into(),
                     Tab::Settings => bsn_list! { Label("settings") -- Label("more") }.into(),
-                })}
+                })
             ]
         })
         .unwrap();
@@ -425,15 +433,15 @@ fn nested_regions_clean_up_with_their_branch() {
         .spawn_scene(bsn! {
             Count(1)
             Children [
-                {when(|count: Ref<Count>| count.0 > 0, || bsn! {
+                @when(|count: Ref<Count>| count.0 > 0, || bsn! {
                     Health(1)
                     Children [
-                        {when(|hp: Ref<Health>| hp.0 > 0, || bsn! {
+                        @when(|hp: Ref<Health>| hp.0 > 0, || bsn! {
                             Label("inner")
                             watch(|score: Res<Score>| Label(format!("inner {}", score.0)))
-                        })}
+                        })
                     ]
-                })}
+                })
             ]
         })
         .unwrap();
@@ -468,11 +476,10 @@ fn keyed_each_keeps_unchanged_rows_and_reorders() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                {each(|todos: Res<Todos>| todos.0.clone(), |todo| {
+                @each(|todos: Res<Todos>| todos.0.clone(), |todo| todo.id, |todo| {
                     let title = todo.title;
                     bsn! { Row Label({title.to_string()}) }
                 })
-                .key(|todo| todo.id)}
             ]
         })
         .unwrap();
@@ -506,10 +513,10 @@ fn unkeyed_each_rebuilds_only_changed_positions() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                {each(|todos: Res<Todos>| todos.0.clone(), |todo| {
+                @each_indexed(|todos: Res<Todos>| todos.0.clone(), |todo| {
                     let title = todo.title;
                     bsn! { Row Label({title.to_string()}) }
-                })}
+                })
             ]
         })
         .unwrap();
@@ -530,12 +537,13 @@ fn each_over_entities_with_source_updates_rows_in_place() {
     app.world_mut()
         .spawn_scene(bsn! {
             Children [
-                {each(
+                @each(
                     |enemies: Query<Entity, With<Enemy>>| {
                         let mut enemies: Vec<Entity> = enemies.iter().collect();
                         enemies.sort();
                         enemies
                     },
+                    |&enemy| enemy,
                     |&enemy| bsn! {
                         Row
                         Source({enemy})
@@ -543,7 +551,6 @@ fn each_over_entities_with_source_updates_rows_in_place() {
                         watch(|hp: Ref<Health>| Label(format!("hp {}", hp.0)))
                     },
                 )
-                .key(|&enemy| enemy)}
             ]
         })
         .unwrap();
@@ -660,10 +667,9 @@ fn regions_spawn_from_commands() {
     app.add_systems(Startup, |mut commands: Commands| {
         commands
             .spawn(Count(0))
-            .queue_spawn_related_scenes::<Children>(when(
-                |count: Ref<Count>| count.0 > 0,
-                || bsn! { Label("shown") },
-            ));
+            .queue_spawn_related_scenes::<Children>(bsn_list! {
+                @when(|count: Ref<Count>| count.0 > 0, || bsn! { Label("shown") })
+            });
     });
     app.update();
     assert!(labels(&mut app).is_empty());

@@ -26,7 +26,7 @@ fn counter(name: &'static str) -> impl Scene {
             Label
             watch(move |count: Ref<Count>| Label(format!("{name} = {}", count.0)))
             --
-            {when(|count: Ref<Count>| count.0 >= 3, || bsn! { Label("  that's a lot") })}
+            @when(|count: Ref<Count>| count.0 >= 3, || bsn! { Label("  that's a lot") })
         ]
     }
 }

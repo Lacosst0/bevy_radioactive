@@ -39,7 +39,7 @@ glob: `use bevy_radioactive::view::*;`.
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
 New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style that
-covers watching, `when`/`switch`/`each` control flow, `handle` event handlers,
+covers watching, `@when`/`@r#if`/`@switch`/`@each` control flow, `handle` event handlers,
 ancestor context (`Ref<T>` finds the nearest `T`), `Source` and `Nearest`, with
 components as state and despawning as cleanup. Nothing else changes.
 

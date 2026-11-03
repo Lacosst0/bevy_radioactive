@@ -70,9 +70,13 @@ fn counter() -> impl Scene {
             Text("0")
             watch(|count: Ref<Count>| Text(count.0.to_string()))     // re-runs when it changes
             --
-            {when(|count: Ref<Count>| count.0 > 0, || bsn! { Text("positive") })
-                .else_when(|count: Ref<Count>| count.0 < 0, || bsn! { Text("negative") })
-                .otherwise(|| bsn! { Text("zero") })}
+            @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
+            --
+            @r#if(
+                |count: Ref<Count>| count.0 >= 0,
+                || bsn! { Text("zero or more") },
+                || bsn! { Text("negative") },
+            )
         ]
     }
 }
@@ -81,8 +85,11 @@ fn todo_list() -> impl Scene {
     bsn! {
         Node
         Children [
-            {each(|todos: Res<Todos>| todos.0.clone(), |todo| bsn! { Text({todo.title.clone()}) })
-                .key(|todo| todo.id)}
+            @each(
+                |todos: Res<Todos>| todos.0.clone(),
+                |todo| todo.id,                                     // key
+                |todo| bsn! { Text({todo.title.clone()}) },
+            )
             --
             Text("")
             watch(|enemies: Query<(), With<Enemy>>| Text(format!("{} enemies", enemies.iter().count())))
@@ -107,18 +114,22 @@ fn todo_list() -> impl Scene {
 | --- | --- | --- |
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
-| `when(cond, \|\| ..)` `.else_when(..)` `.otherwise(..)` | scene list | `if` / `else if` / `else` |
-| `switch(\|..\| key, \|key\| match key { .. })` | scene list | `match`; arms are boxed with `.into()` |
-| `each(\|..\| items, \|item\| ..)` `.key(\|item\| id)` | scene list | a list, keyed by position or by `.key(..)` |
+| `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
+| `@r#if(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else`; nest another in `otherwise` for `else if`. Also named `@if_else` |
+| `@switch(\|..\| key, \|key\| match key { .. })` | scene | `match`; arms are boxed with `.into()` |
+| `@each(\|..\| items, \|item\| key, \|item\| ..)` | scene | a keyed list |
+| `@each_indexed(\|..\| items, \|item\| ..)` | scene | a list by position |
 | `Source(#Player)` | component | make this subtree read and write another entity's components |
 | `Nearest<D>` | system param | the same lookup from ordinary systems and observers |
 
 - Templates go on an entity in `bsn!`; outside scenes attach them with
   `commands.entity(e).react(watch(..))`.
-- Scene lists go in a relationship list with `{..}`, as in `Children [ {each(..)} ]`;
-  outside scenes use Bevy's `queue_spawn_related_scenes::<Children>(when(..))`. Each
-  spawns one region entity (a `GhostNode` with the `ui` feature) whose children are
-  the content. Content is rebuilt only when the chosen branch, key or item changes.
+- Control flow is a scene function, included with `@` like any other:
+  `Children [ @when(..) -- @each(..) ]`. The entity that includes it becomes a region
+  (a `GhostNode` with the `ui` feature) whose children are the content, rebuilt only
+  when the chosen branch, key or item changes. `if` is a Rust keyword, so `bsn!`
+  needs `@r#if`; `@if_else` is the same function. Outside scenes, spawn them like any
+  scene: `commands.spawn_scene(when(..))`.
 - For list rows that update in place, list entities and give each row
   `Source({entity})`; the row's watches then track that entity.
 - Reactions are entities linked to the entity that declared them (`ReactionOf`), so
@@ -450,7 +461,7 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 ### `reactive`
 
 The count is a component on the counter's root, so each counter has its own.
-`handle` writes the nearest `Count`, and `when` owns the Reset button:
+`handle` writes the nearest `Count`, and `@when` owns the Reset button:
 
 ```rust,ignore
 Count(0)
@@ -460,11 +471,11 @@ handle(|_: &Activate, count: &mut Count| count.0 += 1)
 Text("0")
 watch(|count: Ref<Count>| Text(count.0.to_string()))
 // ...
-{when(|count: Ref<Count>| count.0 != 0, || bsn! {
+@when(|count: Ref<Count>| count.0 != 0, || bsn! {
     @FeathersButton
     handle(|_: &Activate, count: &mut Count| count.0 = 0)
     Children [ @caption("Reset") ]
-})}
+})
 ```
 
 ### `watch`

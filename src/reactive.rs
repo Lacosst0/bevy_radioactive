@@ -25,8 +25,11 @@
 //!             Text("0")
 //!             watch(|count: Ref<Count>| Text(count.0.to_string()))
 //!             --
-//!             {when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
-//!                 .otherwise(|| bsn! { Text("Keep going") })}
+//!             @r#if(
+//!                 |count: Ref<Count>| count.0 > 10,
+//!                 || bsn! { Text("That's a lot") },
+//!                 || bsn! { Text("Keep going") },
+//!             )
 //!         ]
 //!     }
 //! }
@@ -57,19 +60,22 @@
 //! | --- | --- |
 //! | [`watch`] | re-run a closure on change; a returned component or bundle is inserted |
 //! | [`handle`] | run a closure when an entity event reaches this entity |
-//! | [`when`] `.else_when()` `.otherwise()` | show entities while a condition holds |
-//! | [`switch`] | show entities for the current value of a key |
-//! | [`each`] `.key()` | show entities per item, keyed by position or by `.key(..)` |
+//! | `@`[`when`]`(cond, then)` | show entities while a condition holds |
+//! | `@`[`r#if`]`(cond, then, otherwise)` | `if`/`else`; also named [`if_else`] |
+//! | `@`[`switch`]`(key, render)` | show entities for the current value of a key (`match`) |
+//! | `@`[`each`]`(items, key, row)` | show entities per item, keyed |
+//! | `@`[`each_indexed`]`(items, row)` | show entities per item, by position |
 //! | [`Source`] | read and write another entity's components from this subtree |
 //! | [`Nearest`] | find the nearest component from ordinary systems and observers |
 //!
 //! [`watch`] and [`handle`] are templates: put them on an entity in `bsn!`,
-//! or attach them in plain code with [`ReactExt::react`]. [`when`], [`switch`]
-//! and [`each`] are scene lists: put them in a relationship list with
-//! `{..}`, as in `Children [ {each(..)} ]`, or spawn them with Bevy's
-//! `queue_spawn_related_scenes::<Children>(..)`. Each spawns one region entity
-//! (a `GhostNode` with the `ui` feature, so layout ignores it) whose children
-//! are the current content.
+//! or attach them in plain code with [`ReactExt::react`]. The control flow
+//! functions are scenes, included with `@` like any scene function:
+//! `Children [ @when(..) -- @each(..) ]`. The entity that includes one
+//! becomes a [`Region`] (a `GhostNode` with the `ui` feature, so layout
+//! ignores it) whose children are the current content. In plain code, spawn
+//! them like any scene: `commands.spawn_scene(when(..))`, or
+//! `queue_spawn_related_scenes::<Children>(bsn_list! { @when(..) })`.
 //!
 //! # Scope and cleanup
 //!
@@ -108,8 +114,8 @@ use bevy::{
     platform::collections::HashMap,
     prelude::*,
     scene::{
-        EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneDependencies,
-        SceneList, WorldSceneExt,
+        EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneList,
+        WorldSceneExt,
     },
 };
 
@@ -123,6 +129,7 @@ pub struct ReactivePlugin;
 impl Plugin for ReactivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AnyChanges>()
+            .init_resource::<Pending>()
             .add_systems(PostUpdate, run_reactions.in_set(ReactiveSystems));
         #[cfg(feature = "ui")]
         app.configure_sets(
@@ -797,10 +804,32 @@ fn attach(world: &mut World, host: Entity, body: Box<dyn Body>) -> Result<Entity
         ))
         .id();
     // After the rest of the scene spawns, so ancestors and `Source`s exist.
-    world.commands().queue(move |world: &mut World| {
-        run_reaction(world, reaction);
-    });
+    world.resource_mut::<Pending>().reactions.push(reaction);
+    world.commands().queue(run_pending);
     Ok(reaction)
+}
+
+/// Reactions waiting for their first run, held back while region content is
+/// being attached to its parent.
+#[derive(Resource, Default)]
+struct Pending {
+    reactions: Vec<Entity>,
+    held: usize,
+}
+
+fn run_pending(world: &mut World) {
+    if world.resource::<Pending>().held > 0 {
+        return;
+    }
+    loop {
+        let reactions = std::mem::take(&mut world.resource_mut::<Pending>().reactions);
+        if reactions.is_empty() {
+            return;
+        }
+        for reaction in reactions {
+            run_reaction(world, reaction);
+        }
+    }
 }
 
 /// Runs a reaction now. Returns whether it ran.
@@ -856,6 +885,7 @@ fn depth(world: &World, mut entity: Entity) -> usize {
 fn run_reactions(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) {
     for _ in 0..MAX_ROUNDS {
         world.flush();
+        run_pending(world);
         scan_any(world);
         let now = world.change_tick();
         let mut due: Vec<(usize, Entity)> = {
@@ -1221,10 +1251,11 @@ where
 // Regions
 // ---------------------------------------------------------------------------
 
-/// A scene list of one region entity running `make`'s reaction.
-struct RegionList(BodyFactory);
-
-struct RegionScene(BodyFactory);
+/// A region: the scene of an entity whose children are reactive content.
+/// Made by [`when`], [`if`](r#if), [`switch`], [`each`] and
+/// [`each_indexed`], and included in `bsn!` with `@`.
+#[must_use = "include it in a scene with `@`, such as `Children [ @when(..) ]`"]
+pub struct RegionScene(BodyFactory);
 
 impl Scene for RegionScene {
     fn resolve(
@@ -1240,27 +1271,18 @@ impl Scene for RegionScene {
     }
 }
 
-impl SceneList for RegionList {
-    fn resolve_list(
-        self,
-        context: &mut ResolveContext,
-        scenes: &mut Vec<ResolvedScene>,
-    ) -> std::result::Result<(), ResolveSceneError> {
-        let mut scene = ResolvedScene::default();
-        RegionScene(self.0).resolve(context, &mut scene)?;
-        scenes.push(scene);
-        Ok(())
-    }
-
-    fn register_dependencies(&self, _: &mut SceneDependencies) {}
-}
-
 fn spawn_children(world: &mut World, parent: Entity, list: Box<dyn SceneList>) -> Vec<Entity> {
-    match world.spawn_scene_list(list) {
+    // Hold first runs until the content has its parent, so lookups through
+    // ancestors work.
+    world.resource_mut::<Pending>().held += 1;
+    let spawned = world.spawn_scene_list(list);
+    world.resource_mut::<Pending>().held -= 1;
+    match spawned {
         Ok(entities) => {
             for &entity in &entities {
                 world.entity_mut(entity).insert(ChildOf(parent));
             }
+            run_pending(world);
             entities
         }
         Err(error) => {
@@ -1313,108 +1335,77 @@ impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
     }
 }
 
-/// Reads several conditions and returns the index of the first that holds.
-struct FirstTrue(Vec<Box<dyn Reader<bool>>>);
-
-impl Reader<Option<usize>> for FirstTrue {
-    fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
-        for condition in &self.0 {
-            condition.inputs(world, inputs);
-        }
-    }
-
-    fn read(&mut self, world: &mut World, cx: &Cx) -> Option<Option<usize>> {
-        for (index, condition) in self.0.iter_mut().enumerate() {
-            if condition.read(world, cx) == Some(true) {
-                return Some(Some(index));
-            }
-        }
-        Some(None)
-    }
-}
-
-/// Shows `then` while `condition` returns `true`. Chain
-/// [`else_when`](When::else_when) and [`otherwise`](When::otherwise) for
-/// `else if` and `else`. Content is rebuilt only when the chosen branch
-/// changes.
+/// Shows `then` while `condition` returns `true`, and nothing otherwise.
+/// The entity that includes it becomes a [`Region`] whose children are the
+/// content; it is rebuilt only when the condition flips.
 ///
 /// ```ignore
 /// Children [
-///     {when(|count: Ref<Count>| count.0 > 0, || bsn! { Text("positive") })
-///         .else_when(|count: Ref<Count>| count.0 < 0, || bsn! { Text("negative") })
-///         .otherwise(|| bsn! { Text("zero") })}
+///     @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
 /// ]
 /// ```
-pub fn when<M, C, L, R>(condition: C, then: R) -> When
+pub fn when<M, C, L, R>(condition: C, then: R) -> RegionScene
 where
     C: IntoReader<M, Output = bool> + Clone,
     L: SceneList,
     R: Fn() -> L + Send + Sync + 'static,
 {
-    When {
-        branches: vec![(factory(condition), render(then))],
-        otherwise: None,
-    }
+    let condition = factory(condition);
+    let then = render(then);
+    RegionScene(Arc::new(move || {
+        let then = Arc::clone(&then);
+        Box::new(BranchBody {
+            key: condition(),
+            render: Arc::new(move |shown: &bool| shown.then(|| then())),
+            current: None,
+        })
+    }))
 }
 
-/// Made by [`when`]: a scene list of one region entity.
-#[must_use = "put it in a relationship list, such as `Children [ {when(..)} ]`"]
-pub struct When {
-    branches: Vec<(ReaderFactory<bool>, Render)>,
-    otherwise: Option<Render>,
+/// Shows `then` while `condition` returns `true`, and `otherwise` while it
+/// returns `false`. `if` is a Rust keyword, so `bsn!` spells it `@r#if`;
+/// [`if_else`] is the same function under a plain name. Nest another one in
+/// `otherwise` for `else if`.
+///
+/// ```ignore
+/// Children [
+///     @r#if(
+///         |count: Ref<Count>| count.0 >= 0,
+///         || bsn! { Text("zero or more") },
+///         || bsn! { Text("negative") },
+///     )
+/// ]
+/// ```
+pub fn r#if<M, C, L1, T, L2, E>(condition: C, then: T, otherwise: E) -> RegionScene
+where
+    C: IntoReader<M, Output = bool> + Clone,
+    L1: SceneList,
+    T: Fn() -> L1 + Send + Sync + 'static,
+    L2: SceneList,
+    E: Fn() -> L2 + Send + Sync + 'static,
+{
+    let condition = factory(condition);
+    let (then, otherwise) = (render(then), render(otherwise));
+    RegionScene(Arc::new(move || {
+        let (then, otherwise) = (Arc::clone(&then), Arc::clone(&otherwise));
+        Box::new(BranchBody {
+            key: condition(),
+            render: Arc::new(move |shown: &bool| Some(if *shown { then() } else { otherwise() })),
+            current: None,
+        })
+    }))
 }
 
-impl When {
-    /// Shows `then` while `condition` holds and earlier conditions don't.
-    pub fn else_when<M, C, L, R>(mut self, condition: C, then: R) -> Self
-    where
-        C: IntoReader<M, Output = bool> + Clone,
-        L: SceneList,
-        R: Fn() -> L + Send + Sync + 'static,
-    {
-        self.branches.push((factory(condition), render(then)));
-        self
-    }
-
-    /// Shows `otherwise` while no condition holds.
-    pub fn otherwise<L, R>(mut self, otherwise: R) -> Self
-    where
-        L: SceneList,
-        R: Fn() -> L + Send + Sync + 'static,
-    {
-        self.otherwise = Some(render(otherwise));
-        self
-    }
-
-    fn into_list(self) -> RegionList {
-        let branches: Arc<Vec<(ReaderFactory<bool>, Render)>> = Arc::new(self.branches);
-        let otherwise = self.otherwise;
-        RegionList(Arc::new(move || {
-            let conditions = FirstTrue(branches.iter().map(|(make, _)| make()).collect());
-            let renders: Vec<Render> = branches.iter().map(|(_, r)| Arc::clone(r)).collect();
-            let otherwise = otherwise.clone();
-            Box::new(BranchBody {
-                key: Box::new(conditions),
-                render: Arc::new(move |index: &Option<usize>| match index {
-                    Some(index) => Some(renders[*index]()),
-                    None => otherwise.as_ref().map(|render| render()),
-                }),
-                current: None,
-            })
-        }))
-    }
-}
-
-impl SceneList for When {
-    fn resolve_list(
-        self,
-        context: &mut ResolveContext,
-        scenes: &mut Vec<ResolvedScene>,
-    ) -> std::result::Result<(), ResolveSceneError> {
-        self.into_list().resolve_list(context, scenes)
-    }
-
-    fn register_dependencies(&self, _: &mut SceneDependencies) {}
+/// [`if`](r#if) under a name that needs no `r#`: `@if_else(cond, then, otherwise)`.
+pub fn if_else<M, C, L1, T, L2, E>(condition: C, then: T, otherwise: E) -> RegionScene
+where
+    C: IntoReader<M, Output = bool> + Clone,
+    L1: SceneList,
+    T: Fn() -> L1 + Send + Sync + 'static,
+    L2: SceneList,
+    E: Fn() -> L2 + Send + Sync + 'static,
+{
+    r#if(condition, then, otherwise)
 }
 
 /// Shows the content `render` returns for the current value of `key`,
@@ -1423,13 +1414,13 @@ impl SceneList for When {
 ///
 /// ```ignore
 /// Children [
-///     {switch(|tab: Res<Tab>| *tab, |tab| match tab {
+///     @switch(|tab: Res<Tab>| *tab, |tab| match tab {
 ///         Tab::Home => bsn! { @home() }.into(),
 ///         Tab::Settings => bsn_list! { @settings() -- @footer() }.into(),
-///     })}
+///     })
 /// ]
 /// ```
-pub fn switch<M, F, R>(key: F, render: R) -> Switch
+pub fn switch<M, F, R>(key: F, render: R) -> RegionScene
 where
     F: IntoReader<M> + Clone,
     F::Output: PartialEq + Send + Sync,
@@ -1437,45 +1428,32 @@ where
 {
     let key = factory(key);
     let render = Arc::new(render);
-    Switch(RegionList(Arc::new(move || {
+    RegionScene(Arc::new(move || {
         let render = Arc::clone(&render);
         Box::new(BranchBody {
             key: key(),
             render: Arc::new(move |value: &F::Output| Some(render(value))),
             current: None,
         })
-    })))
-}
-
-/// Made by [`switch`]: a scene list of one region entity.
-#[must_use = "put it in a relationship list, such as `Children [ {switch(..)} ]`"]
-pub struct Switch(RegionList);
-
-impl SceneList for Switch {
-    fn resolve_list(
-        self,
-        context: &mut ResolveContext,
-        scenes: &mut Vec<ResolvedScene>,
-    ) -> std::result::Result<(), ResolveSceneError> {
-        self.0.resolve_list(context, scenes)
-    }
-
-    fn register_dependencies(&self, _: &mut SceneDependencies) {}
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // each
 // ---------------------------------------------------------------------------
 
-/// Shows the content `row` returns for each item `items` returns. Rows are
-/// identified by position unless [`key`](Each::key) gives them a key. A row
-/// whose key and item are unchanged keeps its entities; a changed item
-/// rebuilds its row; rows are reordered without being rebuilt.
+/// Shows the content `row` returns for each item `items` returns, one row
+/// per `key`. A row whose key and item are unchanged keeps its entities, a
+/// changed item rebuilds its row, and rows are reordered without being
+/// rebuilt.
 ///
 /// ```ignore
 /// Children [
-///     {each(|todos: Res<Todos>| todos.0.clone(), |todo| bsn! { Text({todo.title.clone()}) })
-///         .key(|todo| todo.id)}
+///     @each(
+///         |todos: Res<Todos>| todos.0.clone(),
+///         |todo| todo.id,
+///         |todo| bsn! { Text({todo.title.clone()}) },
+///     )
 /// ]
 /// ```
 ///
@@ -1484,12 +1462,35 @@ impl SceneList for Switch {
 /// entity's components.
 ///
 /// ```ignore
-/// {each(|todos: Query<Entity, With<Todo>>| todos.iter().collect::<Vec<_>>(), |&todo| bsn! {
-///     Source({todo})
-///     Text("") watch(|todo: Ref<Todo>| Text(todo.title.clone()))
-/// }).key(|&todo| todo)}
+/// @each(
+///     |todos: Query<Entity, With<Todo>>| todos.iter().collect::<Vec<_>>(),
+///     |&todo| todo,
+///     |&todo| bsn! {
+///         Source({todo})
+///         Text("") watch(|todo: Ref<Todo>| Text(todo.title.clone()))
+///     },
+/// )
 /// ```
-pub fn each<M, F, V, L, R>(items: F, row: R) -> Each<V, usize>
+pub fn each<M, F, V, K, KF, L, R>(items: F, key: KF, row: R) -> RegionScene
+where
+    F: IntoReader<M> + Clone,
+    F::Output: IntoIterator<Item = V>,
+    V: PartialEq + Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    KF: Fn(&V) -> K + Send + Sync + 'static,
+    L: SceneList,
+    R: Fn(&V) -> L + Send + Sync + 'static,
+{
+    list(items, Arc::new(move |_, item| key(item)), row)
+}
+
+/// Like [`each`], with rows identified by position: a changed item rebuilds
+/// only the row at its position.
+///
+/// ```ignore
+/// @each_indexed(|log: Res<Log>| log.lines.clone(), |line| bsn! { Text({line.clone()}) })
+/// ```
+pub fn each_indexed<M, F, V, L, R>(items: F, row: R) -> RegionScene
 where
     F: IntoReader<M> + Clone,
     F::Output: IntoIterator<Item = V>,
@@ -1497,41 +1498,37 @@ where
     L: SceneList,
     R: Fn(&V) -> L + Send + Sync + 'static,
 {
+    list(items, Arc::new(|index, _| index), row)
+}
+
+fn list<M, F, V, K, L, R>(
+    items: F,
+    key: Arc<dyn Fn(usize, &V) -> K + Send + Sync>,
+    row: R,
+) -> RegionScene
+where
+    F: IntoReader<M> + Clone,
+    F::Output: IntoIterator<Item = V>,
+    V: PartialEq + Send + Sync + 'static,
+    K: Eq + Hash + Send + Sync + 'static,
+    L: SceneList,
+    R: Fn(&V) -> L + Send + Sync + 'static,
+{
     let items = factory(items);
-    Each {
-        items: Arc::new(move || {
-            Box::new(Collect {
+    let row: Arc<dyn Fn(&V) -> Box<dyn SceneList> + Send + Sync> =
+        Arc::new(move |item| Box::new(row(item)) as Box<dyn SceneList>);
+    RegionScene(Arc::new(move || {
+        Box::new(EachBody {
+            items: Box::new(Collect {
                 reader: items(),
                 marker: PhantomData,
-            })
-        }),
-        key: Arc::new(|index, _| index),
-        row: Arc::new(move |item| Box::new(row(item)) as Box<dyn SceneList>),
-    }
-}
-
-/// Made by [`each`]: a scene list of one region entity.
-#[must_use = "put it in a relationship list, such as `Children [ {each(..)} ]`"]
-pub struct Each<V, K> {
-    items: ReaderFactory<Vec<V>>,
-    key: Arc<dyn Fn(usize, &V) -> K + Send + Sync>,
-    row: Arc<dyn Fn(&V) -> Box<dyn SceneList> + Send + Sync>,
-}
-
-impl<V: PartialEq + Send + Sync + 'static, K> Each<V, K> {
-    /// Identifies rows by `key` instead of position, so a row keeps its
-    /// entities when items are inserted, removed or reordered around it.
-    pub fn key<K2, F>(self, key: F) -> Each<V, K2>
-    where
-        K2: Eq + Hash + Send + Sync + 'static,
-        F: Fn(&V) -> K2 + Send + Sync + 'static,
-    {
-        Each {
-            items: self.items,
-            key: Arc::new(move |_, item| key(item)),
-            row: self.row,
-        }
-    }
+            }),
+            key: Arc::clone(&key),
+            row: Arc::clone(&row),
+            rows: HashMap::default(),
+            order: Vec::new(),
+        })
+    }))
 }
 
 struct Collect<I, V> {
@@ -1614,32 +1611,6 @@ where
         }
         self.order = next_order;
     }
-}
-
-impl<V, K> SceneList for Each<V, K>
-where
-    V: PartialEq + Send + Sync + 'static,
-    K: Eq + Hash + Send + Sync + 'static,
-{
-    fn resolve_list(
-        self,
-        context: &mut ResolveContext,
-        scenes: &mut Vec<ResolvedScene>,
-    ) -> std::result::Result<(), ResolveSceneError> {
-        let Each { items, key, row } = self;
-        RegionList(Arc::new(move || {
-            Box::new(EachBody {
-                items: items(),
-                key: Arc::clone(&key),
-                row: Arc::clone(&row),
-                rows: HashMap::default(),
-                order: Vec::new(),
-            })
-        }))
-        .resolve_list(context, scenes)
-    }
-
-    fn register_dependencies(&self, _: &mut SceneDependencies) {}
 }
 
 // ---------------------------------------------------------------------------

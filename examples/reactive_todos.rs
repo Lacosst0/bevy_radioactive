@@ -26,14 +26,14 @@ struct Label(String);
 fn todo_list() -> impl Scene {
     bsn! {
         Children [
-            {switch(|filter: Res<Filter>| *filter, |filter| match filter {
+            @switch(|filter: Res<Filter>| *filter, |filter| match filter {
                 Filter::All => bsn! { Label("Showing all") }.into(),
                 Filter::Open => bsn! { Label("Showing open") }.into(),
-            })}
+            })
             --
-            {when(|todos: Query<(), With<Todo>>| todos.is_empty(), || bsn! { Label("Nothing to do") })}
+            @when(|todos: Query<(), With<Todo>>| todos.is_empty(), || bsn! { Label("Nothing to do") })
             --
-            {each(
+            @each(
                 |todos: Query<(Entity, &Todo)>, filter: Res<Filter>| {
                     let mut rows: Vec<Entity> = todos
                         .iter()
@@ -43,6 +43,7 @@ fn todo_list() -> impl Scene {
                     rows.sort();
                     rows
                 },
+                |&todo| todo,
                 |&todo| bsn! {
                     Source({todo})
                     Label
@@ -51,7 +52,6 @@ fn todo_list() -> impl Scene {
                     })
                 },
             )
-            .key(|&todo| todo)}
         ]
     }
 }

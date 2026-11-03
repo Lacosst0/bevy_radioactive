@@ -69,13 +69,13 @@ fn counter() -> impl Scene {
                 Children [ @caption("+1") ]
             ]
             --
-            {when(|count: Ref<Count>| count.0 != 0, || bsn! {
+            @when(|count: Ref<Count>| count.0 != 0, || bsn! {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
                 handle(|_: &Activate, count: &mut Count| count.0 = 0)
                 Children [ @caption("Reset") ]
-            })}
+            })
         ]
     }
 }
