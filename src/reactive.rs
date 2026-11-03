@@ -108,7 +108,7 @@
 //! | [`watch`] | re-run a closure on change; a returned component or bundle is inserted |
 //! | [`handle`] | run a closure when an entity event reaches this entity |
 //! | `@`[`when`]`(cond, then)` | show entities while a condition holds |
-//! | `@r#if(cond, then, otherwise)` | `if`/`else`; also named [`if_else`] |
+//! | `@`[`if_else`]`(cond, then, otherwise)` | `if`/`else` |
 //! | `@`[`switch`]`(key, render)` | show entities for the current value of a key (`match`) |
 //! | `@`[`each`]`(items, key, row)` | show entities per item, keyed |
 //! | `@`[`each_indexed`]`(items, row)` | show entities per item, by position |
@@ -141,11 +141,13 @@
 
 pub use crate::macros::{rsn, rsn_list};
 
+use crate::shared::{self, despawn_all, lock};
+
 use std::{
     any::TypeId,
     hash::Hash,
     marker::PhantomData,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex},
 };
 
 use bevy::{
@@ -162,10 +164,7 @@ use bevy::{
     },
     platform::collections::HashMap,
     prelude::*,
-    scene::{
-        EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneList,
-        WorldSceneExt,
-    },
+    scene::{EmptySceneEffect, ResolveContext, ResolveSceneError, ResolvedScene, SceneList},
 };
 
 /// Rounds of updates per frame, so chained reactions settle in one frame.
@@ -217,26 +216,7 @@ pub struct ReactiveSystems;
 #[derive(Component, FromTemplate, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Source(pub Entity);
 
-/// Host entity of a [`when`], [`switch`] or [`each`] region. With the `ui`
-/// feature it is a `GhostNode`, so its children are laid out as children of
-/// its parent.
-#[derive(Component, Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "ui", require(bevy::ui::experimental::GhostNode))]
-#[cfg_attr(feature = "ui", component(on_add = strip_ghost_transform))]
-pub struct Region;
-
-#[cfg(feature = "ui")]
-fn strip_ghost_transform(
-    mut world: bevy::ecs::world::DeferredWorld,
-    context: bevy::ecs::lifecycle::HookContext,
-) {
-    // `GhostNode` requires `Transform`, which UI layout doesn't use and Bevy
-    // warns about under a UI parent.
-    world
-        .commands()
-        .entity(context.entity)
-        .remove::<(Transform, GlobalTransform)>();
-}
+pub use crate::shared::Region;
 
 /// Links a reaction entity to the entity that declared it.
 #[derive(Component, Debug)]
@@ -289,41 +269,59 @@ impl Input {
     }
 }
 
+/// Hierarchy walks stop after this many steps, in case of a `ChildOf` cycle.
+const MAX_DEPTH: usize = 4096;
+
+/// `start` and its ancestors, nearest first.
+fn ancestors(
+    start: Entity,
+    parent: impl Fn(Entity) -> Option<Entity>,
+) -> impl Iterator<Item = Entity> {
+    std::iter::successors(Some(start), move |&entity| parent(entity)).take(MAX_DEPTH)
+}
+
+/// The first entity that `matches`, trying `start`, its [`Source`], then
+/// the same for each ancestor. Shared by reactive closures and [`Nearest`].
+fn find_nearest(
+    start: Entity,
+    links: impl Fn(Entity) -> (Option<Entity>, Option<Entity>),
+    matches: impl Fn(Entity) -> bool,
+) -> Option<Entity> {
+    ancestors(start, |entity| links(entity).0).find_map(|entity| {
+        if matches(entity) {
+            return Some(entity);
+        }
+        links(entity).1.filter(|&source| matches(source))
+    })
+}
+
 /// The entity holding component `id` for a reaction declared on `host`.
 fn resolve(world: &World, host: Entity, id: ComponentId, lookup: Lookup) -> Option<Entity> {
     match lookup {
         Lookup::Any => None,
         Lookup::Resource => world.resource_entities().get(id),
-        Lookup::Nearest => nearest(world, host, id),
+        Lookup::Nearest => find_nearest(
+            host,
+            |entity| {
+                (
+                    world.get::<ChildOf>(entity).map(ChildOf::parent),
+                    world.get::<Source>(entity).map(|source| source.0),
+                )
+            },
+            |entity| {
+                world
+                    .get_entity(entity)
+                    .is_ok_and(|entity| entity.contains_id(id))
+            },
+        ),
     }
 }
 
-fn has(world: &World, entity: Entity, id: ComponentId) -> bool {
-    world
-        .get_entity(entity)
-        .is_ok_and(|entity| entity.contains_id(id))
-}
-
-/// `start`, its `Source`, then the same for each ancestor.
-fn nearest(world: &World, start: Entity, id: ComponentId) -> Option<Entity> {
-    let mut current = Some(start);
-    let mut steps = 0;
-    while let Some(entity) = current {
-        if has(world, entity, id) {
-            return Some(entity);
-        }
-        if let Some(&Source(source)) = world.get::<Source>(entity)
-            && has(world, source, id)
-        {
-            return Some(source);
-        }
-        current = world.get::<ChildOf>(entity).map(ChildOf::parent);
-        steps += 1;
-        if steps > 4096 {
-            break;
-        }
-    }
-    None
+fn resolve_all(world: &World, host: Entity, inputs: &[Input]) -> Vec<Option<Entity>> {
+    inputs
+        .iter()
+        .map(|input| resolve(world, host, input.id, input.lookup))
+        .collect()
 }
 
 /// What one run of a closure sees.
@@ -332,6 +330,8 @@ pub struct Cx<'a> {
     host: Entity,
     inputs: &'a [Input],
     resolved: &'a [Option<Entity>],
+    /// The event a [`handle`] closure runs for.
+    event: Option<&'a (dyn std::any::Any + Send + Sync)>,
 }
 
 impl Cx<'_> {
@@ -357,107 +357,84 @@ struct AnyState {
     stamp: Tick,
 }
 
+/// How many entities have component `id`.
+fn count_with(world: &World, id: ComponentId) -> u64 {
+    world
+        .archetypes()
+        .iter()
+        .filter(|archetype| archetype.contains(id))
+        .map(|archetype| u64::from(archetype.len()))
+        .sum()
+}
+
+/// How many entities have component `id`, and the newest change to it after
+/// `since`.
+fn survey(world: &World, id: ComponentId, since: Tick, now: Tick) -> (u64, Tick) {
+    let mut count = 0;
+    let mut newest = since;
+    for archetype in world.archetypes().iter().filter(|a| a.contains(id)) {
+        count += u64::from(archetype.len());
+        for entity in archetype.entities() {
+            if let Some(ticks) = world
+                .get_entity(entity.id())
+                .ok()
+                .and_then(|entity| entity.get_change_ticks_by_id(id))
+                && ticks.changed.is_newer_than(newest, now)
+            {
+                newest = ticks.changed;
+            }
+        }
+    }
+    (count, newest)
+}
+
 fn scan_any(world: &mut World) {
-    let ids: Vec<ComponentId> = world.resource::<AnyChanges>().0.keys().copied().collect();
-    if ids.is_empty() {
-        return;
-    }
-    let now = world.change_tick();
-    let mut updates = Vec::new();
-    for id in ids {
-        let state = &world.resource::<AnyChanges>().0[&id];
-        let (old_count, mut stamp) = (state.count, state.stamp);
-        let mut count = 0;
-        for archetype in world.archetypes().iter() {
-            if !archetype.contains(id) {
-                continue;
-            }
-            count += u64::from(archetype.len());
-            for entity in archetype.entities() {
-                if let Some(ticks) = world
-                    .get_entity(entity.id())
-                    .ok()
-                    .and_then(|entity| entity.get_change_ticks_by_id(id))
-                    && ticks.changed.is_newer_than(stamp, now)
-                {
-                    stamp = ticks.changed;
-                }
-            }
+    world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
+        let now = world.change_tick();
+        for (&id, state) in &mut changes.bypass_change_detection().0 {
+            let (count, newest) = survey(world, id, state.stamp, now);
+            // An entity gaining or losing the component is a change too.
+            state.stamp = if count == state.count { newest } else { now };
+            state.count = count;
         }
-        if count != old_count {
-            // An entity gained or lost the component.
-            stamp = now;
-        }
-        updates.push((id, AnyState { count, stamp }));
-    }
-    let mut changes = world.resource_mut::<AnyChanges>();
-    for (id, state) in updates {
-        changes.0.insert(id, state);
-    }
+    });
 }
 
 fn track_any(world: &mut World, inputs: &[Input]) {
     let now = world.change_tick();
-    let mut missing = Vec::new();
-    {
-        let changes = world.resource::<AnyChanges>();
-        for input in inputs {
-            if input.lookup == Lookup::Any && !changes.0.contains_key(&input.id) {
-                missing.push(input.id);
-            }
+    world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
+        for input in inputs.iter().filter(|input| input.lookup == Lookup::Any) {
+            changes.0.entry(input.id).or_insert_with(|| AnyState {
+                count: count_with(world, input.id),
+                stamp: now,
+            });
         }
-    }
-    for id in missing {
-        let count = world
-            .archetypes()
-            .iter()
-            .filter(|archetype| archetype.contains(id))
-            .map(|archetype| u64::from(archetype.len()))
-            .sum();
-        world
-            .resource_mut::<AnyChanges>()
-            .0
-            .insert(id, AnyState { count, stamp: now });
-    }
+    });
 }
 
 impl Reaction {
-    /// Whether a tracked input changed since the last run.
+    /// Whether a tracked input changed, or now resolves to another entity,
+    /// since the last run.
     fn is_dirty(&self, world: &World, changes: &AnyChanges, now: Tick) -> bool {
         let Some(last_run) = self.last_run else {
             return true;
         };
-        for (index, input) in self.inputs.iter().enumerate() {
-            match input.lookup {
-                Lookup::Any => {
-                    if input.tracked
-                        && changes
-                            .0
-                            .get(&input.id)
-                            .is_some_and(|state| state.stamp.is_newer_than(last_run, now))
-                    {
-                        return true;
-                    }
-                }
-                Lookup::Nearest | Lookup::Resource => {
-                    let entity = resolve(world, self.host, input.id, input.lookup);
-                    if entity != self.resolved.get(index).copied().flatten() {
-                        return true;
-                    }
-                    if input.tracked
-                        && let Some(entity) = entity
-                        && let Some(ticks) = world
-                            .get_entity(entity)
-                            .ok()
-                            .and_then(|entity| entity.get_change_ticks_by_id(input.id))
-                        && ticks.is_changed(last_run, now)
-                    {
-                        return true;
-                    }
-                }
+        self.inputs.iter().enumerate().any(|(index, input)| {
+            if input.lookup == Lookup::Any {
+                return input.tracked
+                    && changes
+                        .0
+                        .get(&input.id)
+                        .is_some_and(|state| state.stamp.is_newer_than(last_run, now));
             }
-        }
-        false
+            let entity = resolve(world, self.host, input.id, input.lookup);
+            entity != self.resolved.get(index).copied().flatten()
+                || (input.tracked
+                    && entity
+                        .and_then(|entity| world.get_entity(entity).ok())
+                        .and_then(|entity| entity.get_change_ticks_by_id(input.id))
+                        .is_some_and(|ticks| ticks.is_changed(last_run, now)))
+        })
     }
 }
 
@@ -482,21 +459,14 @@ pub trait ReactiveParam {
     ) -> Option<Self::Item<'w, 's>>;
 }
 
-fn nearest_input<T: Component>(world: &mut World, tracked: bool) -> Input {
-    Input {
-        type_id: TypeId::of::<T>(),
-        id: world.register_component::<T>(),
-        lookup: Lookup::Nearest,
-        tracked,
-    }
-}
-
-fn resource_input<T: Resource>(world: &mut World) -> Input {
-    Input {
-        type_id: TypeId::of::<T>(),
-        id: world.register_component::<T>(),
-        lookup: Lookup::Resource,
-        tracked: true,
+impl Input {
+    fn new<T: Component>(world: &mut World, lookup: Lookup, tracked: bool) -> Self {
+        Self {
+            type_id: TypeId::of::<T>(),
+            id: world.register_component::<T>(),
+            lookup,
+            tracked,
+        }
     }
 }
 
@@ -507,25 +477,31 @@ fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
 ) {
     let state = QueryState::<D, F>::new(world);
     let access = state.component_access();
-    let mut ids: Vec<ComponentId> = Vec::new();
-    if let Some(reads) = access.access().reads().as_finite_set() {
-        ids.extend(reads.iter());
-    }
-    ids.extend(access.with_filters());
-    ids.extend(access.without_filters());
     let writes = access.access().writes();
     let is_resource = world.register_component::<IsResource>();
-    for id in ids {
-        if writes.contains(id) || id == is_resource {
-            continue;
-        }
-        inputs.push(Input {
-            type_id: TypeId::of::<()>(),
-            id,
-            lookup: Lookup::Any,
-            tracked: true,
-        });
-    }
+    let reads = access
+        .access()
+        .reads()
+        .as_finite_set()
+        .into_iter()
+        .flat_map(bevy::ecs::query::ComponentIdSet::iter);
+    let ids = reads
+        .chain(access.with_filters())
+        .chain(access.without_filters());
+    inputs.extend(
+        ids.filter(|&id| !writes.contains(id) && id != is_resource)
+            .map(|id| Input {
+                type_id: TypeId::of::<()>(),
+                id,
+                lookup: Lookup::Any,
+                tracked: true,
+            }),
+    );
+}
+
+/// The entity a `Ref<T>` or `&mut C` parameter reads.
+fn nearest_of<T: 'static>(cx: &Cx) -> Option<Entity> {
+    cx.entity_of::<T>(Lookup::Nearest)
 }
 
 impl<T: Component> ReactiveParam for Ref<'_, T> {
@@ -533,14 +509,14 @@ impl<T: Component> ReactiveParam for Ref<'_, T> {
     type Item<'w, 's> = Ref<'w, T>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(nearest_input::<T>(world, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
     }
 
     fn fetch<'w, 's>(
         param: SystemParamItem<'w, 's, Self::Param>,
         cx: &Cx,
     ) -> Option<Self::Item<'w, 's>> {
-        param.get_inner(cx.entity_of::<T>(Lookup::Nearest)?).ok()
+        param.get_inner(nearest_of::<T>(cx)?).ok()
     }
 }
 
@@ -549,17 +525,14 @@ impl<T: Component> ReactiveParam for Option<Ref<'_, T>> {
     type Item<'w, 's> = Option<Ref<'w, T>>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(nearest_input::<T>(world, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
     }
 
     fn fetch<'w, 's>(
         param: SystemParamItem<'w, 's, Self::Param>,
         cx: &Cx,
     ) -> Option<Self::Item<'w, 's>> {
-        Some(
-            cx.entity_of::<T>(Lookup::Nearest)
-                .and_then(|entity| param.get_inner(entity).ok()),
-        )
+        Some(nearest_of::<T>(cx).and_then(|entity| param.get_inner(entity).ok()))
     }
 }
 
@@ -568,7 +541,7 @@ impl<C: Component<Mutability = Mutable>> ReactiveParam for &mut C {
     type Item<'w, 's> = &'w mut C;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(nearest_input::<C>(world, false));
+        inputs.push(Input::new::<C>(world, Lookup::Nearest, false));
     }
 
     fn fetch<'w, 's>(
@@ -576,7 +549,7 @@ impl<C: Component<Mutability = Mutable>> ReactiveParam for &mut C {
         cx: &Cx,
     ) -> Option<Self::Item<'w, 's>> {
         param
-            .get_inner(cx.entity_of::<C>(Lookup::Nearest)?)
+            .get_inner(nearest_of::<C>(cx)?)
             .ok()
             .map(Mut::into_inner)
     }
@@ -591,47 +564,16 @@ impl ReactiveParam for Entity {
     }
 }
 
-impl<T: Resource> ReactiveParam for Res<'_, T> {
-    type Param = Res<'static, T>;
-    type Item<'w, 's> = Res<'w, T>;
-
-    fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(resource_input::<T>(world));
-    }
-
-    fn fetch<'w, 's>(
-        param: SystemParamItem<'w, 's, Self::Param>,
-        _: &Cx,
-    ) -> Option<Self::Item<'w, 's>> {
-        Some(param)
-    }
-}
-
-impl<T: Resource> ReactiveParam for Option<Res<'_, T>> {
-    type Param = Option<Res<'static, T>>;
-    type Item<'w, 's> = Option<Res<'w, T>>;
-
-    fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(resource_input::<T>(world));
-    }
-
-    fn fetch<'w, 's>(
-        param: SystemParamItem<'w, 's, Self::Param>,
-        _: &Cx,
-    ) -> Option<Self::Item<'w, 's>> {
-        Some(param)
-    }
-}
-
-/// Implements [`ReactiveParam`] for tracked Bevy queries.
-macro_rules! tracked_queries {
-    ($([$($generics:tt)*] $ty:ty => $param:ty, $item:ty;)*) => {$(
+/// Implements [`ReactiveParam`] for Bevy system parameters passed through
+/// as they are, tracking what `inputs` adds (nothing when left out).
+macro_rules! system_params {
+    ($([$($generics:tt)*] $ty:ty => $param:ty, $item:ty $(, $inputs:expr)?;)*) => {$(
         impl<$($generics)*> ReactiveParam for $ty {
             type Param = $param;
             type Item<'w, 's> = $item;
 
-            fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-                query_inputs::<D, F>(world, inputs);
+            fn inputs(_world: &mut World, _inputs: &mut Vec<Input>) {
+                $(($inputs)(_world, _inputs);)?
             }
 
             fn fetch<'w, 's>(
@@ -644,35 +586,21 @@ macro_rules! tracked_queries {
     )*};
 }
 
-tracked_queries! {
+system_params! {
+    // Tracked.
+    ['a, T: Resource] Res<'a, T> => Res<'static, T>, Res<'w, T>,
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
+    ['a, T: Resource] Option<Res<'a, T>> => Option<Res<'static, T>>, Option<Res<'w, T>>,
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
     ['a, 'b, D: QueryData + 'static, F: QueryFilter + 'static] Query<'a, 'b, D, F>
-        => Query<'static, 'static, D, F>, Query<'w, 's, D, F>;
+        => Query<'static, 'static, D, F>, Query<'w, 's, D, F>, query_inputs::<D, F>;
     ['a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static] Single<'a, 'b, D, F>
-        => Single<'static, 'static, D, F>, Single<'w, 's, D, F>;
+        => Single<'static, 'static, D, F>, Single<'w, 's, D, F>, query_inputs::<D, F>;
     ['a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static] Option<Single<'a, 'b, D, F>>
-        => Option<Single<'static, 'static, D, F>>, Option<Single<'w, 's, D, F>>;
+        => Option<Single<'static, 'static, D, F>>, Option<Single<'w, 's, D, F>>, query_inputs::<D, F>;
     ['a, 'b, D: QueryData + 'static, F: QueryFilter + 'static] Populated<'a, 'b, D, F>
-        => Populated<'static, 'static, D, F>, Populated<'w, 's, D, F>;
-}
-
-/// Implements [`ReactiveParam`] for untracked Bevy system parameters.
-macro_rules! untracked_params {
-    ($([$($generics:tt)*] $ty:ty => $param:ty, $item:ty;)*) => {$(
-        impl<$($generics)*> ReactiveParam for $ty {
-            type Param = $param;
-            type Item<'w, 's> = $item;
-
-            fn fetch<'w, 's>(
-                param: SystemParamItem<'w, 's, Self::Param>,
-                _: &Cx,
-            ) -> Option<Self::Item<'w, 's>> {
-                Some(param)
-            }
-        }
-    )*};
-}
-
-untracked_params! {
+        => Populated<'static, 'static, D, F>, Populated<'w, 's, D, F>, query_inputs::<D, F>;
+    // Untracked.
     ['a, T: Resource + Component<Mutability = Mutable>] ResMut<'a, T> => ResMut<'static, T>, ResMut<'w, T>;
     ['a, T: Resource + Component<Mutability = Mutable>] Option<ResMut<'a, T>> => Option<ResMut<'static, T>>, Option<ResMut<'w, T>>;
     ['a, 'b] Commands<'a, 'b> => Commands<'static, 'static>, Commands<'w, 's>;
@@ -730,14 +658,43 @@ pub trait IntoReader<M>: Send + Sync + 'static {
     fn into_reader(self) -> Box<dyn Reader<Self::Output>>;
 }
 
+/// A closure that [`handle`] runs: its first parameter is `&E`, the rest are
+/// [`ReactiveParam`]s.
+pub trait IntoHandler<E, M>: Send + Sync + 'static {
+    #[doc(hidden)]
+    fn into_handler(self) -> Box<dyn Reader<()>>;
+}
+
+/// A closure with the system state of its parameters. `M` tells reader
+/// closures (`fn(P..) -> V`) from handlers (`Handles<fn(&E, P..)>`).
 struct FnReader<W, M, P: SystemParam + 'static> {
     f: W,
     state: Option<SystemState<P>>,
     marker: PhantomData<fn() -> M>,
 }
 
-macro_rules! impl_reader {
-    ($($param:ident),*) => {
+impl<W, M, P: SystemParam + 'static> FnReader<W, M, P> {
+    fn boxed(f: W) -> Box<Self> {
+        Box::new(Self {
+            f,
+            state: None,
+            marker: PhantomData,
+        })
+    }
+}
+
+#[doc(hidden)]
+pub struct Handles<F>(PhantomData<F>);
+
+/// Implements [`IntoReader`] and [`IntoHandler`] for closures of `$param`s,
+/// then recurses with one parameter fewer.
+macro_rules! impl_closures {
+    () => { impl_closures!(@impl); };
+    ($head:ident $(, $tail:ident)*) => {
+        impl_closures!(@impl $head $(, $tail)*);
+        impl_closures!($($tail),*);
+    };
+    (@impl $($param:ident),*) => {
         #[allow(non_snake_case, reason = "the parameter names are type names")]
         impl<W, V, $($param: ReactiveParam + 'static),*> IntoReader<fn($($param,)*) -> V> for W
         where
@@ -747,11 +704,7 @@ macro_rules! impl_reader {
             type Output = V;
 
             fn into_reader(self) -> Box<dyn Reader<V>> {
-                Box::new(FnReader::<W, fn($($param,)*) -> V, ($($param::Param,)*)> {
-                    f: self,
-                    state: None,
-                    marker: PhantomData,
-                })
+                FnReader::<W, fn($($param,)*) -> V, ($($param::Param,)*)>::boxed(self)
             }
         }
 
@@ -784,18 +737,51 @@ macro_rules! impl_reader {
                 Some(output)
             }
         }
+
+        #[allow(non_snake_case, reason = "the parameter names are type names")]
+        impl<W, E, $($param: ReactiveParam + 'static),*> IntoHandler<E, Handles<fn(&E, $($param,)*)>> for W
+        where
+            E: Send + Sync + 'static,
+            W: Fn(&E, $($param),*) + Fn(&E, $($param::Item<'_, '_>),*) + Send + Sync + 'static,
+        {
+            fn into_handler(self) -> Box<dyn Reader<()>> {
+                FnReader::<W, Handles<fn(&E, $($param,)*)>, ($($param::Param,)*)>::boxed(self)
+            }
+        }
+
+        #[allow(non_snake_case, reason = "the parameter names are type names")]
+        impl<W, E, $($param: ReactiveParam + 'static),*> Reader<()>
+            for FnReader<W, Handles<fn(&E, $($param,)*)>, ($($param::Param,)*)>
+        where
+            E: Send + Sync + 'static,
+            W: Fn(&E, $($param),*) + Fn(&E, $($param::Item<'_, '_>),*) + Send + Sync + 'static,
+        {
+            fn inputs(&self, _world: &mut World, _inputs: &mut Vec<Input>) {
+                $($param::inputs(_world, _inputs);)*
+            }
+
+            fn read(&mut self, world: &mut World, cx: &Cx) -> Option<()> {
+                #[allow(clippy::too_many_arguments, reason = "one per closure parameter")]
+                fn call<E, $($param),*>(f: impl Fn(&E, $($param),*), event: &E, $($param: $param),*) {
+                    f(event, $($param),*);
+                }
+                let event = cx.event?.downcast_ref::<E>()?;
+                let state = self.state.get_or_insert_with(|| SystemState::new(world));
+                {
+                    let Ok(($($param,)*)) = state.get_mut(world) else {
+                        return None;
+                    };
+                    $(let $param = $param::fetch($param, cx)?;)*
+                    call(&self.f, event, $($param),*);
+                }
+                state.apply(world);
+                Some(())
+            }
+        }
     };
 }
 
-impl_reader!();
-impl_reader!(P0);
-impl_reader!(P0, P1);
-impl_reader!(P0, P1, P2);
-impl_reader!(P0, P1, P2, P3);
-impl_reader!(P0, P1, P2, P3, P4);
-impl_reader!(P0, P1, P2, P3, P4, P5);
-impl_reader!(P0, P1, P2, P3, P4, P5, P6);
-impl_reader!(P0, P1, P2, P3, P4, P5, P6, P7);
+impl_closures!(P0, P1, P2, P3, P4, P5, P6, P7);
 
 /// Makes fresh readers of one closure.
 type ReaderFactory<V> = Arc<dyn Fn() -> Box<dyn Reader<V>> + Send + Sync>;
@@ -804,11 +790,11 @@ fn factory<M, F: IntoReader<M> + Clone>(f: F) -> ReaderFactory<F::Output> {
     Arc::new(move || f.clone().into_reader())
 }
 
-/// Content of a region branch.
-type Render = Arc<dyn Fn() -> Box<dyn SceneList> + Send + Sync>;
+/// Content of a region branch or row.
+type Render<V> = Arc<dyn Fn(&V) -> Box<dyn SceneList> + Send + Sync>;
 
-fn render<L: SceneList, R: Fn() -> L + Send + Sync + 'static>(render: R) -> Render {
-    Arc::new(move || Box::new(render()) as Box<dyn SceneList>)
+fn boxed<L: SceneList>(list: L) -> Box<dyn SceneList> {
+    Box::new(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +817,7 @@ fn attach(world: &mut World, host: Entity, body: Box<dyn Body>) -> Result<Entity
     }
     let mut inputs = Vec::new();
     body.inputs(world, &mut inputs);
-    let mut unique: Vec<Input> = Vec::new();
+    let mut unique: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
         if let Some(existing) = unique.iter_mut().find(|other| other.same_target(&input)) {
             existing.tracked |= input.tracked;
@@ -881,126 +867,102 @@ fn run_pending(world: &mut World) {
     }
 }
 
-/// Runs a reaction now. Returns whether it ran.
-fn run_reaction(world: &mut World, reaction: Entity) -> bool {
+/// Runs a reaction now.
+fn run_reaction(world: &mut World, reaction: Entity) {
     let Some(mut state) = world.get_mut::<Reaction>(reaction) else {
-        return false;
+        return;
     };
     let state = state.bypass_change_detection();
-    let Some(mut body) = state.body.take() else {
-        return false;
-    };
     let host = state.host;
-    let inputs = state.inputs.clone();
-    if world.get_entity(host).is_err() {
-        return false;
+    let Some(mut body) = state.body.take() else {
+        return;
+    };
+    let inputs = std::mem::take(&mut state.inputs);
+    let resolved = resolve_all(world, host, &inputs);
+    if world.get_entity(host).is_ok() {
+        body.run(
+            world,
+            &Cx {
+                host,
+                inputs: &inputs,
+                resolved: &resolved,
+                event: None,
+            },
+        );
     }
-    let resolved: Vec<Option<Entity>> = inputs
-        .iter()
-        .map(|input| resolve(world, host, input.id, input.lookup))
-        .collect();
-    body.run(
-        world,
-        &Cx {
-            host,
-            inputs: &inputs,
-            resolved: &resolved,
-        },
-    );
     // Its own writes are older than `last_run`; later ones are newer.
     let last_run = world.increment_change_tick();
     if let Some(mut state) = world.get_mut::<Reaction>(reaction) {
         let state = state.bypass_change_detection();
         state.body = Some(body);
+        state.inputs = inputs;
         state.resolved = resolved;
         state.last_run = Some(last_run);
     }
     world.flush();
-    true
-}
-
-fn depth(world: &World, mut entity: Entity) -> usize {
-    let mut depth = 0;
-    while let Some(parent) = world.get::<ChildOf>(entity) {
-        entity = parent.parent();
-        depth += 1;
-        if depth > 4096 {
-            break;
-        }
-    }
-    depth
 }
 
 fn run_reactions(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) {
-    for _ in 0..MAX_ROUNDS {
-        world.flush();
-        run_pending(world);
-        scan_any(world);
-        let now = world.change_tick();
-        let mut due: Vec<(usize, Entity)> = {
-            let world = &*world;
-            let changes = world.resource::<AnyChanges>();
-            reactions
-                .iter(world)
-                .filter(|(_, reaction)| {
-                    reaction.body.is_some()
-                        && !world
-                            .get_entity(reaction.host)
-                            .is_ok_and(|host| host.contains::<Disabled>())
-                        && reaction.is_dirty(world, changes, now)
-                })
-                .map(|(entity, reaction)| (depth(world, reaction.host), entity))
-                .collect()
-        };
-        if due.is_empty() {
-            return;
-        }
-        // Outer regions first: they may despawn the reactions inside them.
-        due.sort_by_key(|&(depth, entity)| (depth, entity));
-        for (_, reaction) in due {
-            run_reaction(world, reaction);
-        }
-    }
-    warn!(
-        "reactive: values still changing after {MAX_ROUNDS} rounds; the rest runs next frame. \
-         A reaction may be writing a value it reads."
+    shared::settle(
+        world,
+        MAX_ROUNDS,
+        |world| run_round(world, reactions),
+        "reactive: values",
     );
 }
 
-/// A template that attaches one reaction to its entity.
-struct ReactionTemplate {
-    make: BodyFactory,
-    region: bool,
-}
-
-impl Template for ReactionTemplate {
-    type Output = EmptySceneEffect;
-
-    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
-        if self.region {
-            context.entity.insert(Region);
-        }
-        let host = context.entity.id();
-        let body = (self.make)();
-        context
-            .entity
-            .world_scope(|world| attach(world, host, body))?;
-        Ok(EmptySceneEffect)
+/// Runs every reaction whose inputs changed. Returns how many ran.
+fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) -> usize {
+    world.flush();
+    run_pending(world);
+    scan_any(world);
+    let now = world.change_tick();
+    let mut due: Vec<(usize, Entity)> = {
+        let world = &*world;
+        let changes = world.resource::<AnyChanges>();
+        reactions
+            .iter(world)
+            .filter(|(_, reaction)| {
+                reaction.body.is_some()
+                    && !world
+                        .get_entity(reaction.host)
+                        .is_ok_and(|host| host.contains::<Disabled>())
+                    && reaction.is_dirty(world, changes, now)
+            })
+            .map(|(entity, reaction)| {
+                let depth = ancestors(reaction.host, |entity| {
+                    world.get::<ChildOf>(entity).map(ChildOf::parent)
+                })
+                .count();
+                (depth, entity)
+            })
+            .collect()
+    };
+    // Outer regions first: they may despawn the reactions inside them.
+    due.sort_unstable();
+    for &(_, reaction) in &due {
+        run_reaction(world, reaction);
     }
-
-    fn clone_template(&self) -> Self {
-        Self {
-            make: Arc::clone(&self.make),
-            region: self.region,
-        }
-    }
+    due.len()
 }
 
 /// Something [`ReactExt::react`] can attach to an entity: [`watch`] or
-/// [`handle`].
-pub trait Reactive: Send + 'static {
+/// [`handle`]. Both are also templates, for use in `bsn!`.
+pub trait Reactive: Send + Sync + 'static {
     #[doc(hidden)]
-    fn attach_to(self, world: &mut World, host: Entity) -> Result<()>;
+    fn attach_to(&self, world: &mut World, host: Entity) -> Result<()>;
+}
+
+/// The [`Template::build_template`] of a [`Reactive`].
+fn build_reactive(
+    reactive: &impl Reactive,
+    context: &mut TemplateContext,
+) -> Result<EmptySceneEffect> {
+    let host = context.entity.id();
+    context
+        .entity
+        .world_scope(|world| reactive.attach_to(world, host))?;
+    Ok(EmptySceneEffect)
 }
 
 /// Attaches [`watch`] and [`handle`] to entities outside of scenes.
@@ -1072,17 +1034,15 @@ where
 /// Made by [`watch`].
 pub struct Watch<F, M>(F, PhantomData<fn() -> M>);
 
-struct WatchBody<R> {
-    reader: Box<dyn Reader<R>>,
-}
+struct WatchBody<R>(Box<dyn Reader<R>>);
 
 impl<R: Bundle> Body for WatchBody<R> {
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
-        self.reader.inputs(world, inputs);
+        self.0.inputs(world, inputs);
     }
 
     fn run(&mut self, world: &mut World, cx: &Cx) {
-        let Some(output) = self.reader.read(world, cx) else {
+        let Some(output) = self.0.read(world, cx) else {
             return;
         };
         if TypeId::of::<R>() != TypeId::of::<()>()
@@ -1093,15 +1053,14 @@ impl<R: Bundle> Body for WatchBody<R> {
     }
 }
 
-impl<M: 'static, F> Watch<F, M>
+impl<M: 'static, F> Reactive for Watch<F, M>
 where
     F: IntoReader<M> + Clone,
     F::Output: Bundle,
 {
-    fn body(&self) -> Box<dyn Body> {
-        Box::new(WatchBody {
-            reader: self.0.clone().into_reader(),
-        })
+    fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
+        let body = Box::new(WatchBody(self.0.clone().into_reader()));
+        attach(world, host, body).map(|_| ())
     }
 }
 
@@ -1113,12 +1072,7 @@ where
     type Output = EmptySceneEffect;
 
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
-        let host = context.entity.id();
-        let body = self.body();
-        context
-            .entity
-            .world_scope(|world| attach(world, host, body))?;
-        Ok(EmptySceneEffect)
+        build_reactive(self, context)
     }
 
     fn clone_template(&self) -> Self {
@@ -1126,107 +1080,14 @@ where
     }
 }
 
-impl<M: 'static, F> Reactive for Watch<F, M>
-where
-    F: IntoReader<M> + Clone,
-    F::Output: Bundle,
-{
-    fn attach_to(self, world: &mut World, host: Entity) -> Result<()> {
-        attach(world, host, self.body()).map(|_| ())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // handle
 // ---------------------------------------------------------------------------
 
-/// A closure that [`handle`] runs: its first parameter is `&E`, the rest are
-/// [`ReactiveParam`]s.
-pub trait IntoHandler<E, M>: Send + Sync + 'static {
-    #[doc(hidden)]
-    fn into_runner(self) -> Box<dyn HandlerRunner<E>>;
-}
-
-/// A [`handle`] closure with its system state.
-#[doc(hidden)]
-pub trait HandlerRunner<E>: Send + Sync {
-    fn run(&mut self, world: &mut World, host: Entity, event: &E);
-}
-
-struct FnHandler<W, M, P: SystemParam + 'static> {
-    f: W,
-    state: Option<(SystemState<P>, Vec<Input>)>,
-    marker: PhantomData<fn() -> M>,
-}
-
-macro_rules! impl_handler {
-    ($($param:ident),*) => {
-        #[allow(non_snake_case, reason = "the parameter names are type names")]
-        impl<W, E, $($param: ReactiveParam + 'static),*> IntoHandler<E, fn(&E, $($param,)*)> for W
-        where
-            E: 'static,
-            W: Fn(&E, $($param),*) + Fn(&E, $($param::Item<'_, '_>),*) + Send + Sync + 'static,
-        {
-            fn into_runner(self) -> Box<dyn HandlerRunner<E>> {
-                Box::new(FnHandler::<W, fn(&E, $($param,)*), ($($param::Param,)*)> {
-                    f: self,
-                    state: None,
-                    marker: PhantomData,
-                })
-            }
-        }
-
-        #[allow(non_snake_case, reason = "the parameter names are type names")]
-        impl<W, E, $($param: ReactiveParam + 'static),*> HandlerRunner<E>
-            for FnHandler<W, fn(&E, $($param,)*), ($($param::Param,)*)>
-        where
-            E: 'static,
-            W: Fn(&E, $($param),*) + Fn(&E, $($param::Item<'_, '_>),*) + Send + Sync + 'static,
-        {
-            fn run(&mut self, world: &mut World, host: Entity, event: &E) {
-                #[allow(clippy::too_many_arguments, reason = "one per closure parameter")]
-                fn call<E, $($param),*>(f: impl Fn(&E, $($param),*), event: &E, $($param: $param),*) {
-                    f(event, $($param),*);
-                }
-                let (state, inputs) = self.state.get_or_insert_with(|| {
-                    #[allow(unused_mut, reason = "empty for handlers without parameters")]
-                    let mut inputs = Vec::new();
-                    $($param::inputs(world, &mut inputs);)*
-                    (SystemState::new(world), inputs)
-                });
-                let resolved: Vec<Option<Entity>> = inputs
-                    .iter()
-                    .map(|input| resolve(world, host, input.id, input.lookup))
-                    .collect();
-                let _cx = Cx { host, inputs, resolved: &resolved };
-                {
-                    let Ok(($($param,)*)) = state.get_mut(world) else {
-                        return;
-                    };
-                    $(let Some($param) = $param::fetch($param, &_cx) else {
-                        return;
-                    };)*
-                    call(&self.f, event, $($param),*);
-                }
-                state.apply(world);
-            }
-        }
-    };
-}
-
-impl_handler!();
-impl_handler!(P0);
-impl_handler!(P0, P1);
-impl_handler!(P0, P1, P2);
-impl_handler!(P0, P1, P2, P3);
-impl_handler!(P0, P1, P2, P3, P4);
-impl_handler!(P0, P1, P2, P3, P4, P5);
-impl_handler!(P0, P1, P2, P3, P4, P5, P6);
-
 /// Runs `f` whenever entity event `E` reaches this entity, including events
 /// that bubble up from its descendants. The other parameters work as in
-/// [`watch`], so `&mut C` writes the nearest `C`: this entity's, an
-/// ancestor's, or the resource.
+/// [`watch`], so `&mut C` writes the nearest `C`: this entity's, its
+/// [`Source`]'s or an ancestor's.
 ///
 /// ```ignore
 /// Button
@@ -1243,23 +1104,42 @@ where
 /// Made by [`handle`].
 pub struct Handler<E, F, M>(F, PhantomData<fn() -> (E, M)>);
 
-impl<E, F, M: 'static> Handler<E, F, M>
+impl<E, F, M: 'static> Reactive for Handler<E, F, M>
 where
     E: EntityEvent + Clone,
     F: IntoHandler<E, M> + Clone,
 {
-    fn observer(&self, host: Entity) -> impl FnMut(On<E>, Commands) + Send + Sync + 'static {
-        let runner = Arc::new(Mutex::new(self.0.clone().into_runner()));
-        move |event: On<E>, mut commands: Commands| {
+    fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
+        let handler = Arc::new(Mutex::new((self.0.clone().into_handler(), None)));
+        let observer = move |event: On<E>, mut commands: Commands| {
             let event = event.event().clone();
-            let runner = Arc::clone(&runner);
+            let handler = Arc::clone(&handler);
+            // Exclusive world access, so handlers can take any parameter.
             commands.queue(move |world: &mut World| {
-                runner
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .run(world, host, &event);
+                let mut handler = lock(&handler);
+                let (reader, inputs) = &mut *handler;
+                let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
+                    let mut inputs = Vec::new();
+                    reader.inputs(world, &mut inputs);
+                    inputs
+                });
+                let resolved = resolve_all(world, host, inputs);
+                reader.read(
+                    world,
+                    &Cx {
+                        host,
+                        inputs,
+                        resolved: &resolved,
+                        event: Some(&event),
+                    },
+                );
             });
-        }
+        };
+        world
+            .get_entity_mut(host)
+            .map_err(|_| "react: the entity doesn't exist")?
+            .observe(observer);
+        Ok(())
     }
 }
 
@@ -1271,28 +1151,11 @@ where
     type Output = EmptySceneEffect;
 
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
-        let host = context.entity.id();
-        context.entity.observe(self.observer(host));
-        Ok(EmptySceneEffect)
+        build_reactive(self, context)
     }
 
     fn clone_template(&self) -> Self {
         Self(self.0.clone(), PhantomData)
-    }
-}
-
-impl<E, F, M: 'static> Reactive for Handler<E, F, M>
-where
-    E: EntityEvent + Clone,
-    F: IntoHandler<E, M> + Clone,
-{
-    fn attach_to(self, world: &mut World, host: Entity) -> Result<()> {
-        let observer = self.observer(host);
-        world
-            .get_entity_mut(host)
-            .map_err(|_| "react: the entity doesn't exist")?
-            .observe(observer);
-        Ok(())
     }
 }
 
@@ -1301,8 +1164,8 @@ where
 // ---------------------------------------------------------------------------
 
 /// A region: the scene of an entity whose children are reactive content.
-/// Made by [`when`], `r#if`, [`if_else`], [`switch`], [`each`] and
-/// [`each_indexed`], and included in `bsn!` with `@`.
+/// Made by [`when`], [`if_else`], [`switch`], [`each`] and [`each_indexed`],
+/// and included in `bsn!` with `@`.
 #[must_use = "include it in a scene with `@`, such as `Children [ @when(..) ]`"]
 pub struct RegionScene(BodyFactory);
 
@@ -1312,53 +1175,50 @@ impl Scene for RegionScene {
         _: &mut ResolveContext,
         scene: &mut ResolvedScene,
     ) -> std::result::Result<(), ResolveSceneError> {
-        scene.push_template(ReactionTemplate {
-            make: self.0,
-            region: true,
-        });
+        scene.push_template(RegionTemplate(self.0));
         Ok(())
     }
+}
+
+/// Makes its entity a [`Region`] and attaches the region's reaction.
+struct RegionTemplate(BodyFactory);
+
+impl Template for RegionTemplate {
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        context.entity.insert(Region);
+        let host = context.entity.id();
+        let body = (self.0)();
+        context
+            .entity
+            .world_scope(|world| attach(world, host, body))?;
+        Ok(EmptySceneEffect)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+fn region<B: Body + 'static>(make: impl Fn() -> B + Send + Sync + 'static) -> RegionScene {
+    RegionScene(Arc::new(move || Box::new(make()) as Box<dyn Body>))
 }
 
 fn spawn_children(world: &mut World, parent: Entity, list: Box<dyn SceneList>) -> Vec<Entity> {
     // Hold first runs until the content has its parent, so lookups through
     // ancestors work.
     world.resource_mut::<Pending>().held += 1;
-    let spawned = world.spawn_scene_list(list);
+    let entities = shared::spawn_children(world, parent, list, "bevy_radioactive::reactive");
     world.resource_mut::<Pending>().held -= 1;
-    match spawned {
-        Ok(entities) => {
-            for &entity in &entities {
-                world.entity_mut(entity).insert(ChildOf(parent));
-            }
-            run_pending(world);
-            entities
-        }
-        Err(error) => {
-            let handler = world.fallback_error_handler();
-            handler(
-                BevyError::from(error),
-                bevy::ecs::error::ErrorContext::Command {
-                    name: "bevy_radioactive::reactive::spawn".into(),
-                },
-            );
-            Vec::new()
-        }
-    }
+    run_pending(world);
+    entities
 }
 
-fn despawn_all(world: &mut World, entities: &[Entity]) {
-    for &entity in entities {
-        if let Ok(entity) = world.get_entity_mut(entity) {
-            entity.despawn();
-        }
-    }
-}
-
-/// Shows one branch at a time, rebuilt when the chosen branch changes.
+/// Shows the content for the current key, rebuilt when the key changes.
 struct BranchBody<K> {
     key: Box<dyn Reader<K>>,
-    render: Arc<dyn Fn(&K) -> Option<Box<dyn SceneList>> + Send + Sync>,
+    render: Render<K>,
     current: Option<(K, Vec<Entity>)>,
 }
 
@@ -1377,11 +1237,21 @@ impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
         if let Some((_, children)) = self.current.take() {
             despawn_all(world, &children);
         }
-        let children = (self.render)(&next)
-            .map(|list| spawn_children(world, cx.host, list))
-            .unwrap_or_default();
+        let children = spawn_children(world, cx.host, (self.render)(&next));
         self.current = Some((next, children));
     }
+}
+
+/// The region behind [`when`], [`if_else`] and [`switch`].
+fn branch<K: PartialEq + Send + Sync + 'static>(
+    key: ReaderFactory<K>,
+    render: Render<K>,
+) -> RegionScene {
+    region(move || BranchBody {
+        key: key(),
+        render: Arc::clone(&render),
+        current: None,
+    })
 }
 
 /// Shows `then` while `condition` returns `true`, and nothing otherwise.
@@ -1399,53 +1269,24 @@ where
     L: SceneList,
     R: Fn() -> L + Send + Sync + 'static,
 {
-    let condition = factory(condition);
-    let then = render(then);
-    RegionScene(Arc::new(move || {
-        let then = Arc::clone(&then);
-        Box::new(BranchBody {
-            key: condition(),
-            render: Arc::new(move |shown: &bool| shown.then(|| then())),
-            current: None,
-        })
-    }))
+    branch(
+        factory(condition),
+        Arc::new(move |&shown: &bool| if shown { boxed(then()) } else { boxed(()) }),
+    )
 }
 
 /// Shows `then` while `condition` returns `true`, and `otherwise` while it
-/// returns `false`. `if` is a Rust keyword, so `bsn!` spells it `@r#if`;
-/// [`if_else`] is the same function under a plain name. Nest another one in
-/// `otherwise` for `else if`.
+/// returns `false`. Nest another one in `otherwise` for `else if`.
 ///
 /// ```ignore
 /// Children [
-///     @r#if(
+///     @if_else(
 ///         |count: Ref<Count>| count.0 >= 0,
 ///         || bsn! { Text("zero or more") },
 ///         || bsn! { Text("negative") },
 ///     )
 /// ]
 /// ```
-pub fn r#if<M, C, L1, T, L2, E>(condition: C, then: T, otherwise: E) -> RegionScene
-where
-    C: IntoReader<M, Output = bool> + Clone,
-    L1: SceneList,
-    T: Fn() -> L1 + Send + Sync + 'static,
-    L2: SceneList,
-    E: Fn() -> L2 + Send + Sync + 'static,
-{
-    let condition = factory(condition);
-    let (then, otherwise) = (render(then), render(otherwise));
-    RegionScene(Arc::new(move || {
-        let (then, otherwise) = (Arc::clone(&then), Arc::clone(&otherwise));
-        Box::new(BranchBody {
-            key: condition(),
-            render: Arc::new(move |shown: &bool| Some(if *shown { then() } else { otherwise() })),
-            current: None,
-        })
-    }))
-}
-
-/// `r#if` under a name that needs no `r#`: `@if_else(cond, then, otherwise)`.
 pub fn if_else<M, C, L1, T, L2, E>(condition: C, then: T, otherwise: E) -> RegionScene
 where
     C: IntoReader<M, Output = bool> + Clone,
@@ -1454,7 +1295,16 @@ where
     L2: SceneList,
     E: Fn() -> L2 + Send + Sync + 'static,
 {
-    r#if(condition, then, otherwise)
+    branch(
+        factory(condition),
+        Arc::new(move |&shown: &bool| {
+            if shown {
+                boxed(then())
+            } else {
+                boxed(otherwise())
+            }
+        }),
+    )
 }
 
 /// Shows the content `render` returns for the current value of `key`,
@@ -1475,16 +1325,7 @@ where
     F::Output: PartialEq + Send + Sync,
     R: Fn(&F::Output) -> Box<dyn SceneList> + Send + Sync + 'static,
 {
-    let key = factory(key);
-    let render = Arc::new(render);
-    RegionScene(Arc::new(move || {
-        let render = Arc::clone(&render);
-        Box::new(BranchBody {
-            key: key(),
-            render: Arc::new(move |value: &F::Output| Some(render(value))),
-            current: None,
-        })
-    }))
+    branch(factory(key), Arc::new(render))
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,7 +1371,11 @@ where
     L: SceneList,
     R: Fn(&V) -> L + Send + Sync + 'static,
 {
-    list(items, Arc::new(move |_, item| key(item)), row)
+    list(
+        items,
+        Arc::new(move |_, item| key(item)),
+        Arc::new(move |item| boxed(row(item))),
+    )
 }
 
 /// Like [`each`], with rows identified by position: a changed item rebuilds
@@ -1547,66 +1392,44 @@ where
     L: SceneList,
     R: Fn(&V) -> L + Send + Sync + 'static,
 {
-    list(items, Arc::new(|index, _| index), row)
+    list(
+        items,
+        Arc::new(|index, _| index),
+        Arc::new(move |item| boxed(row(item))),
+    )
 }
 
-fn list<M, F, V, K, L, R>(
-    items: F,
-    key: Arc<dyn Fn(usize, &V) -> K + Send + Sync>,
-    row: R,
-) -> RegionScene
+type Key<V, K> = Arc<dyn Fn(usize, &V) -> K + Send + Sync>;
+
+/// The region behind [`each`] and [`each_indexed`].
+fn list<M, F, V, K>(items: F, key: Key<V, K>, row: Render<V>) -> RegionScene
 where
     F: IntoReader<M> + Clone,
     F::Output: IntoIterator<Item = V>,
     V: PartialEq + Send + Sync + 'static,
     K: Eq + Hash + Send + Sync + 'static,
-    L: SceneList,
-    R: Fn(&V) -> L + Send + Sync + 'static,
 {
     let items = factory(items);
-    let row: Arc<dyn Fn(&V) -> Box<dyn SceneList> + Send + Sync> =
-        Arc::new(move |item| Box::new(row(item)) as Box<dyn SceneList>);
-    RegionScene(Arc::new(move || {
-        Box::new(EachBody {
-            items: Box::new(Collect {
-                reader: items(),
-                marker: PhantomData,
-            }),
-            key: Arc::clone(&key),
-            row: Arc::clone(&row),
-            rows: HashMap::default(),
-            order: Vec::new(),
-        })
-    }))
+    region(move || EachBody {
+        items: items(),
+        key: Arc::clone(&key),
+        row: Arc::clone(&row),
+        rows: HashMap::default(),
+        order: Vec::new(),
+    })
 }
 
-struct Collect<I, V> {
-    reader: Box<dyn Reader<I>>,
-    marker: PhantomData<fn() -> V>,
-}
-
-impl<I: IntoIterator<Item = V> + 'static, V: 'static> Reader<Vec<V>> for Collect<I, V> {
-    fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
-        self.reader.inputs(world, inputs);
-    }
-
-    fn read(&mut self, world: &mut World, cx: &Cx) -> Option<Vec<V>> {
-        self.reader
-            .read(world, cx)
-            .map(|items| items.into_iter().collect())
-    }
-}
-
-struct EachBody<V, K> {
-    items: Box<dyn Reader<Vec<V>>>,
-    key: Arc<dyn Fn(usize, &V) -> K + Send + Sync>,
-    row: Arc<dyn Fn(&V) -> Box<dyn SceneList> + Send + Sync>,
+struct EachBody<I, V, K> {
+    items: Box<dyn Reader<I>>,
+    key: Key<V, K>,
+    row: Render<V>,
     rows: HashMap<K, (V, Vec<Entity>)>,
     order: Vec<Entity>,
 }
 
-impl<V, K> Body for EachBody<V, K>
+impl<I, V, K> Body for EachBody<I, V, K>
 where
+    I: IntoIterator<Item = V> + 'static,
     V: PartialEq + Send + Sync + 'static,
     K: Eq + Hash + Send + Sync + 'static,
 {
@@ -1619,23 +1442,21 @@ where
             return;
         };
         let mut next_rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
-        let mut next_order = Vec::new();
+        let mut next_order = Vec::with_capacity(self.order.len());
         let mut duplicates = 0;
         for (index, item) in items.into_iter().enumerate() {
             let key = (self.key)(index, &item);
             let row = match self.rows.remove(&key) {
                 Some((old, children)) if old == item => (old, children),
-                Some((_, children)) => {
-                    despawn_all(world, &children);
-                    let children = spawn_children(world, cx.host, (self.row)(&item));
-                    (item, children)
-                }
-                None => {
+                old => {
+                    if let Some((_, children)) = old {
+                        despawn_all(world, &children);
+                    }
                     let children = spawn_children(world, cx.host, (self.row)(&item));
                     (item, children)
                 }
             };
-            next_order.extend(row.1.iter().copied());
+            next_order.extend_from_slice(&row.1);
             if let Some((_, displaced)) = next_rows.insert(key, row) {
                 // A duplicate key: the later item wins.
                 duplicates += 1;
@@ -1684,45 +1505,31 @@ pub struct Nearest<'w, 's, D: QueryData + 'static> {
 }
 
 impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
-    fn find(&self, start: Entity) -> Option<Entity> {
-        let mut current = Some(start);
-        let mut steps = 0;
-        while let Some(entity) = current {
-            if self.entities.contains(entity) {
-                return Some(entity);
-            }
-            let Ok((parent, source)) = self.links.get(entity) else {
-                break;
-            };
-            if let Some(&Source(source)) = source
-                && self.entities.contains(source)
-            {
-                return Some(source);
-            }
-            current = parent.map(ChildOf::parent);
-            steps += 1;
-            if steps > 4096 {
-                break;
-            }
-        }
-        None
-    }
-
     /// The nearest entity matching `D`.
     #[must_use]
     pub fn entity(&self, start: Entity) -> Option<Entity> {
-        self.find(start)
+        find_nearest(
+            start,
+            |entity| {
+                self.links
+                    .get(entity)
+                    .map_or((None, None), |(parent, source)| {
+                        (parent.map(ChildOf::parent), source.map(|source| source.0))
+                    })
+            },
+            |entity| self.entities.contains(entity),
+        )
     }
 
     /// The nearest match for `start`, read-only.
     #[must_use]
     pub fn get(&self, start: Entity) -> Option<bevy::ecs::query::ROQueryItem<'_, 's, D>> {
-        self.entities.get(self.find(start)?).ok()
+        self.entities.get(self.entity(start)?).ok()
     }
 
     /// The nearest match for `start`.
     pub fn get_mut(&mut self, start: Entity) -> Option<D::Item<'_, 's>> {
-        let entity = self.find(start)?;
+        let entity = self.entity(start)?;
         self.entities.get_mut(entity).ok()
     }
 }

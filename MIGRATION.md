@@ -1,3 +1,21 @@
+# Migrating from 0.5 to 0.6
+
+The `watch` module and Cargo feature are removed: `reactive` does the same with
+the same `watch(closure)` shape. Add `ReactivePlugin` and import
+`bevy_radioactive::reactive::*`.
+
+| 0.5 | 0.6 |
+| --- | --- |
+| `watch` feature, `WatchPlugin`, `WatchSystems` | `reactive` feature, `ReactivePlugin`, `ReactiveSystems` |
+| `watch::watch(\|c: Ref<T>\| ..)` on a component | `reactive::watch(\|c: Ref<T>\| ..)`; `Ref<T>` now also looks at the entity's `Source` and ancestors |
+| `watch::watch(\|c: Ref<R>\| ..)` on a resource | `reactive::watch(\|c: Res<R>\| ..)`; `Res<T>` is tracked |
+| `watch_from(#Player, \|hp: Ref<Health>\| ..)` | `Source(#Player)` on the entity, then `watch(\|hp: Ref<Health>\| ..)`; or `$Ref<Health>(#Player)` in `rsn!` |
+| `watch_from(any_with::<C>(), \|e: Entity, v: Ref<T>\| ..)` | a Bevy system with `Query<(Entity, &T), (Changed<T>, With<C>)>`, or `watch(\|q: Query<&T, With<C>>\| ..)` for the whole set |
+| `app.watch(f)` | `world.spawn_empty().react(watch(f))` |
+| `Param<P>` | `Untracked<P>` |
+| `&mut C` (the declaring entity only) | `&mut C` (the nearest `C`, found like `Ref<T>`) |
+| `reactive::r#if(..)` | `reactive::if_else(..)` |
+
 # Migrating from 0.4 to 0.5
 
 The four styles are now independent modules, each behind its own Cargo feature

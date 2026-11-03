@@ -1,6 +1,6 @@
 [package]
 name = "bevy_radioactive"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Source-specific reactive state and event routing for Bevy 0.20 BSN scenes"
@@ -10,11 +10,9 @@ keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [features]
-default = ["reactive", "watch", "subscribe", "hooks", "view", "ui"]
+default = ["reactive", "subscribe", "hooks", "view", "ui"]
 ## `watch`, `handle`, `when`, `switch`, `each`: one ECS-native API for reactivity and control flow.
 reactive = []
-## `watch`, `watch_from`: re-run a closure when the components and resources it reads change.
-watch = []
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
 subscribe = []
 ## `#[component]`: React-style function components with hooks.
@@ -30,7 +28,7 @@ comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
 members = ["macros"]
 
 [dependencies]
-bevy_radioactive_macros = { path = "macros", version = "0.5.0" }
+bevy_radioactive_macros = { path = "macros", version = "0.6.0" }
 bevy = { version = "0.20", default-features = false, features = ["bevy_scene", "bevy_log"] }
 
 [dev-dependencies]
@@ -56,16 +54,6 @@ required-features = ["reactive"]
 name = "reactive_todos"
 path = "examples/reactive_todos.rs"
 required-features = ["reactive"]
-
-[[example]]
-name = "watch_component"
-path = "examples/watch_component.rs"
-required-features = ["watch"]
-
-[[example]]
-name = "watch_resource"
-path = "examples/watch_resource.rs"
-required-features = ["watch"]
 
 [[example]]
 name = "subscribe"
@@ -101,11 +89,6 @@ required-features = ["comparison"]
 name = "comparison_reactive"
 path = "examples/comparison/reactive.rs"
 required-features = ["comparison", "reactive"]
-
-[[example]]
-name = "comparison_watch"
-path = "examples/comparison/watch.rs"
-required-features = ["comparison", "watch"]
 
 [[example]]
 name = "comparison_subscribe"

@@ -75,7 +75,7 @@ use std::{
     hash::{BuildHasher, Hash},
     panic::Location,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -84,11 +84,9 @@ use bevy::{
     ecs::{
         change_detection::Tick,
         component::ComponentId,
-        entity::EntityHashSet,
         entity_disabling::Disabled,
-        lifecycle::HookContext,
         template::{EntityTemplate, Template, TemplateContext},
-        world::{CommandQueue, DeferredWorld},
+        world::CommandQueue,
     },
     platform::{collections::HashMap, hash::FixedState},
     prelude::*,
@@ -99,6 +97,8 @@ use bevy::{
 };
 
 pub use crate::macros::component;
+
+use crate::shared::{Hosts, add_host, lock, make_layout_transparent, remove_host, report, settle};
 
 /// Rounds of rendering per frame, so state set during a render settles in
 /// one frame.
@@ -111,7 +111,7 @@ pub struct HooksPlugin;
 
 impl Plugin for HooksPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Hosts>()
+        app.init_resource::<Hosts<Renderers>>()
             .add_systems(PostUpdate, render_all.in_set(HooksSystems));
         #[cfg(feature = "ui")]
         app.configure_sets(
@@ -124,10 +124,6 @@ impl Plugin for HooksPlugin {
 /// System set in `PostUpdate` that renders components.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HooksSystems;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 // ---------------------------------------------------------------------------
 // Component instances
@@ -719,7 +715,7 @@ where
     fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
         let installed = context
             .entity
-            .world_scope(|world| world.contains_resource::<Hosts>());
+            .world_scope(|world| world.contains_resource::<Hosts<Renderers>>());
         if !installed {
             return Err("components need `HooksPlugin`; add it to the app".into());
         }
@@ -819,39 +815,16 @@ struct Renderer {
 
 /// Components mounted on an entity.
 #[derive(Component)]
-#[component(on_add = add_host, on_remove = remove_host)]
+#[component(on_add = add_host::<Self>, on_remove = remove_host::<Self>)]
 struct Renderers(Vec<Renderer>);
 
-#[derive(Resource, Default)]
-struct Hosts(EntityHashSet);
-
-fn add_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
-        hosts.0.insert(context.entity);
-    }
-}
-
-fn remove_host(mut world: DeferredWorld, context: HookContext) {
-    if let Some(mut hosts) = world.get_resource_mut::<Hosts>() {
-        hosts.0.remove(&context.entity);
-    }
-}
-
 fn render_all(world: &mut World) {
-    for _ in 0..MAX_ROUNDS {
-        if render_dirty(world) == 0 {
-            return;
-        }
-    }
-    warn!(
-        "hooks: components still re-rendering after {MAX_ROUNDS} rounds; the rest render next \
-         frame. A render may be setting its own state."
-    );
+    settle(world, MAX_ROUNDS, render_dirty, "hooks: components");
 }
 
 /// Re-renders every component whose reads changed. Returns how many ran.
 fn render_dirty(world: &mut World) -> usize {
-    let hosts: Vec<Entity> = world.resource::<Hosts>().0.iter().copied().collect();
+    let hosts = Hosts::<Renderers>::snapshot(world);
     let mut rendered = 0;
     for host in hosts {
         let Ok(mut entity) = world.get_entity_mut(host) else {
@@ -957,32 +930,8 @@ fn spawn_child<S: Scene>(world: &mut World, parent: Entity, scene: S) -> Option<
     match world.spawn_scene(scene) {
         Ok(mut child) => Some(child.insert(ChildOf(parent)).id()),
         Err(error) => {
-            let handler = world.fallback_error_handler();
-            handler(
-                BevyError::from(error),
-                bevy::ecs::error::ErrorContext::Command {
-                    name: "bevy_radioactive::hooks::render".into(),
-                },
-            );
+            report(world, error, "bevy_radioactive::hooks");
             None
         }
     }
 }
-
-/// Makes a host without a UI `Node` a `GhostNode`. `GhostNode` requires
-/// `Transform`, which UI layout doesn't use and Bevy warns about under a UI
-/// parent, so it is removed.
-#[cfg(feature = "ui")]
-fn make_layout_transparent(world: &mut World, host: Entity) {
-    use bevy::ui::{Node, experimental::GhostNode};
-    if let Ok(mut entity) = world.get_entity_mut(host)
-        && !entity.contains::<Node>()
-        && !entity.contains::<GhostNode>()
-    {
-        entity.insert(GhostNode);
-        entity.remove::<(Transform, GlobalTransform)>();
-    }
-}
-
-#[cfg(not(feature = "ui"))]
-fn make_layout_transparent(_: &mut World, _: Entity) {}
