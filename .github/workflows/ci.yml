@@ -33,10 +33,12 @@ jobs:
       matrix:
         features:
           - default
+          - reactive
           - watch
           - subscribe
           - hooks
           - view
+          - reactive,ui
           - watch,ui
           - hooks,ui
           - view,ui

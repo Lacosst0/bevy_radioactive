@@ -38,6 +38,11 @@ glob: `use bevy_radioactive::view::*;`.
 | `Region` | internal |
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
+New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style that
+covers watching, `when`/`switch`/`each` control flow, `handle` event handlers,
+ancestor context (`Ref<T>` finds the nearest `T`), `Source` and `Nearest`, with
+components as state and despawning as cleanup. Nothing else changes.
+
 New: `watch` takes one closure. `Ref<T>` parameters are tracked and re-run it,
 other system parameters are only read, `&mut C` writes a component of the declaring
 entity and a returned component is inserted on it. It runs on spawn, and

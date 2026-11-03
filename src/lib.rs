@@ -6,6 +6,8 @@ extern crate self as bevy_radioactive;
 
 #[cfg(feature = "hooks")]
 pub mod hooks;
+#[cfg(feature = "reactive")]
+pub mod reactive;
 #[cfg(feature = "subscribe")]
 pub mod subscribe;
 #[cfg(feature = "view")]

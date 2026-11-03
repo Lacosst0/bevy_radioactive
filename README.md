@@ -3,12 +3,15 @@
 Reactive UI for Bevy 0.20 BSN scenes. A node declares what it depends on, right
 where it is spawned, instead of a global system querying for it.
 
-There are four styles. Each one is a separate module behind its own Cargo feature,
+There are five styles. Each one is a separate module behind its own Cargo feature,
 with its own plugin and runtime: they share no code, so use any one of them alone
-or several side by side.
+or several side by side. [`reactive`](#reactive) is the newest and covers what the
+others do in one ECS-native API: watching, `if`/`else`, `match`, keyed lists, event
+handlers, context and cleanup.
 
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
+| [`reactive`](#reactive) | `reactive` | `ReactivePlugin` | do all of the below with components as state and entities as scope |
 | [`watch`](#watch) | `watch` | `WatchPlugin` | re-run a closure when the components and resources it reads change |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
@@ -23,7 +26,7 @@ or several side by side.
 ```toml
 [dependencies]
 bevy = "0.20"
-# All four styles:
+# All five styles:
 bevy_radioactive = { path = "../bevy_radioactive" }
 # Or only the ones you use:
 # bevy_radioactive = { path = "../bevy_radioactive", default-features = false, features = ["view", "ui"] }
@@ -32,6 +35,100 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
 affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
+
+## `reactive`
+
+One API for reactivity and control flow where the ECS is the reactive graph:
+state is a component or resource, context is an ancestor's component, a branch
+is an entity, and cleanup is despawning. Every closure takes ordinary Bevy system
+parameters, so there is nothing new to learn about reading data.
+
+```rust,ignore
+use bevy::{prelude::*, ui_widgets::Activate};
+use bevy_radioactive::reactive::*;
+
+#[derive(Component, Clone, Default)]
+struct Count(i32);
+
+#[derive(Clone, PartialEq)]
+struct Todo { id: u32, title: String }
+
+#[derive(Resource, Clone, Default)]
+struct Todos(Vec<Todo>);
+
+#[derive(Component, Clone, Default)]
+struct Enemy;
+
+fn counter() -> impl Scene {
+    bsn! {
+        Node
+        Count(0)                          // state; every @counter() has its own
+        Children [
+            Button
+            handle(|_: &Activate, count: &mut Count| count.0 += 1)   // writes the nearest Count
+            --
+            Text("0")
+            watch(|count: Ref<Count>| Text(count.0.to_string()))     // re-runs when it changes
+            --
+            {when(|count: Ref<Count>| count.0 > 0, || bsn! { Text("positive") })
+                .else_when(|count: Ref<Count>| count.0 < 0, || bsn! { Text("negative") })
+                .otherwise(|| bsn! { Text("zero") })}
+        ]
+    }
+}
+
+fn todo_list() -> impl Scene {
+    bsn! {
+        Node
+        Children [
+            {each(|todos: Res<Todos>| todos.0.clone(), |todo| bsn! { Text({todo.title.clone()}) })
+                .key(|todo| todo.id)}
+            --
+            Text("")
+            watch(|enemies: Query<(), With<Enemy>>| Text(format!("{} enemies", enemies.iter().count())))
+        ]
+    }
+}
+
+// app.add_plugins(ReactivePlugin)
+```
+
+| In a closure | Re-runs it? | Meaning |
+| --- | --- | --- |
+| `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest `T`: this entity, its `Source`, its ancestors, then resource `T` |
+| `Res<T>` / `Option<Res<T>>` | yes | resource `T` |
+| `Query`, `Single`, `Populated` | yes | when a component they read or filter on changes, is added or removed |
+| `c: &mut C` | no | the nearest `C`, written in place |
+| `e: Entity` | no | the entity that declared the closure |
+| `ResMut`, `Commands`, `Local`, messages | no | ordinary system parameters |
+| `Untracked<P>` | no | any system parameter, without re-running; also for custom `SystemParam`s |
+
+| Item | Kind | Use it to |
+| --- | --- | --- |
+| `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
+| `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
+| `when(cond, \|\| ..)` `.else_when(..)` `.otherwise(..)` | scene list | `if` / `else if` / `else` |
+| `switch(\|..\| key, \|key\| match key { .. })` | scene list | `match`; arms are boxed with `.into()` |
+| `each(\|..\| items, \|item\| ..)` `.key(\|item\| id)` | scene list | a list, keyed by position or by `.key(..)` |
+| `Source(#Player)` | component | make this subtree read and write another entity's components |
+| `Nearest<D>` | system param | the same lookup from ordinary systems and observers |
+
+- Templates go on an entity in `bsn!`; outside scenes attach them with
+  `commands.entity(e).react(watch(..))`.
+- Scene lists go in a relationship list with `{..}`, as in `Children [ {each(..)} ]`;
+  outside scenes use Bevy's `queue_spawn_related_scenes::<Children>(when(..))`. Each
+  spawns one region entity (a `GhostNode` with the `ui` feature) whose children are
+  the content. Content is rebuilt only when the chosen branch, key or item changes.
+- For list rows that update in place, list entities and give each row
+  `Source({entity})`; the row's watches then track that entity.
+- Reactions are entities linked to the entity that declared them (`ReactionOf`), so
+  they despawn with it, and replacing a branch despawns everything it declared. Use
+  Bevy's `on(|_: On<Despawn>| ..)` for cleanup code.
+- Content exists right after its scene spawns. Later updates run in
+  `ReactiveSystems` in `PostUpdate`; outer regions run before the reactions inside
+  them, and chained reactions settle in the same frame.
+
+Examples: `reactive_counters`, `reactive_todos`, `comparison_reactive`.
 
 ## `watch`
 
@@ -306,12 +403,13 @@ Examples: `view_todos`, `view_tabs`.
 ## Comparison with plain Bevy
 
 `examples/comparison` builds the same Feathers counter (−1, count, +1, and a Reset
-button shown while the count is not zero) five times: once in plain Bevy and once per
+button shown while the count is not zero) six times: once in plain Bevy and once per
 style. Each file stands alone; none shares code with another.
 
 | Example | Built with |
 | --- | --- |
 | `comparison_bevy` | plain Bevy |
+| `comparison_reactive` | `reactive` |
 | `comparison_watch` | `watch` |
 | `comparison_subscribe` | `subscribe` |
 | `comparison_hooks` | `hooks` |
@@ -347,6 +445,26 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
         node.display = if count.0 != 0 { Display::Flex } else { Display::None };
     }
 }
+```
+
+### `reactive`
+
+The count is a component on the counter's root, so each counter has its own.
+`handle` writes the nearest `Count`, and `when` owns the Reset button:
+
+```rust,ignore
+Count(0)
+// ...
+handle(|_: &Activate, count: &mut Count| count.0 += 1)
+// ...
+Text("0")
+watch(|count: Ref<Count>| Text(count.0.to_string()))
+// ...
+{when(|count: Ref<Count>| count.0 != 0, || bsn! {
+    @FeathersButton
+    handle(|_: &Activate, count: &mut Count| count.0 = 0)
+    Children [ @caption("Reset") ]
+})}
 ```
 
 ### `watch`
@@ -425,12 +543,17 @@ view! {
 
 ## Scheduling and performance
 
-Each plugin runs in its own system set in `PostUpdate` — `WatchSystems`,
-`HooksSystems` and `ViewSystems` — before UI layout with the `ui` feature. Order
-systems that write watched values `.before(...)` the set to show them the same frame.
-Each runtime repeats until nothing changes, up to 8 rounds per frame; if changes are
-still pending after that, it logs a warning and continues next frame.
+Each plugin runs in its own system set in `PostUpdate` — `ReactiveSystems`,
+`WatchSystems`, `HooksSystems` and `ViewSystems` — before UI layout with the `ui`
+feature. Order systems that write watched values `.before(...)` the set to show them
+the same frame. Each runtime repeats until nothing changes, up to 8 rounds per frame
+(16 for `reactive`); if changes are still pending after that, it logs a warning and
+continues next frame.
 
+- `reactive` checks each reaction's inputs once per round by change tick (a few
+  lookups each) and runs only those that changed. `Query` parameters scan the
+  entities with the components they read once per round, so prefer `Ref<T>` and
+  `Res<T>` on hot paths.
 - `watch` adds one change detector per watched type using Bevy's `Changed<T>`
   filter, and runs only the watches that read the changed entity. Nothing is cloned.
 - `subscribe` adds one observer per event type and one small entity per
