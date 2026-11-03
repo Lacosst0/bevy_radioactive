@@ -3,7 +3,7 @@
 Reactive UI for Bevy 0.20 BSN scenes. A node declares what it depends on, right
 where it is spawned, instead of a global system querying for it.
 
-There are five styles. Each one is a separate module behind its own Cargo feature,
+There are four styles. Each one is a separate module behind its own Cargo feature,
 with its own plugin and runtime: they share no code, so use any one of them alone
 or several side by side. [`reactive`](#reactive) is the newest and covers what the
 others do in one ECS-native API: watching, `if`/`else`, `match`, keyed lists, event
@@ -12,7 +12,6 @@ handlers, context and cleanup.
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
 | [`reactive`](#reactive) | `reactive` | `ReactivePlugin` | do all of the below with components as state and entities as scope |
-| [`watch`](#watch) | `watch` | `WatchPlugin` | re-run a closure when the components and resources it reads change |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
 | [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
@@ -21,12 +20,12 @@ handlers, context and cleanup.
 
 | `bevy_radioactive` | Bevy | Rust |
 | --- | --- | --- |
-| 0.5 | 0.20 | 1.97.1 or newer |
+| 0.6 | 0.20 | 1.97.1 or newer |
 
 ```toml
 [dependencies]
 bevy = "0.20"
-# All five styles:
+# All four styles:
 bevy_radioactive = { path = "../bevy_radioactive" }
 # Or only the ones you use:
 # bevy_radioactive = { path = "../bevy_radioactive", default-features = false, features = ["view", "ui"] }
@@ -34,7 +33,7 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
-affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.4.
+affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
 
 ## `reactive`
 
@@ -189,97 +188,6 @@ bsn! {
   them, and chained reactions settle in the same frame.
 
 Examples: `reactive_counters`, `reactive_todos`, `comparison_reactive`.
-
-## `watch`
-
-`watch` takes one closure. Its parameter types say what it reacts to, what it
-only reads, and what it writes. It runs once on spawn and again whenever one of
-its `Ref<T>` inputs changes.
-
-```rust,ignore
-use bevy::{prelude::*, scene::CommandsSceneExt};
-use bevy_radioactive::watch::*;
-
-#[derive(Resource, Clone, Default)]
-struct Score(u32);
-
-#[derive(Component, Clone, Default)]
-struct Health(u32);
-
-#[derive(Component, Clone, Default)]
-struct Enemy;
-
-fn main() {
-    App::new()
-        .add_plugins((DefaultPlugins, WatchPlugin))
-        .init_resource::<Score>()
-        .add_systems(Startup, |mut commands: Commands| {
-            commands.spawn(Camera2d);
-            commands.spawn_scene(hud());
-        })
-        .run();
-}
-
-fn hud() -> impl Scene {
-    bsn! {
-        Node
-        Children [
-            #Player Health(100)
-            --
-            // Returns a new `Text` whenever `Score` changes.
-            Text("0")
-            watch(|score: Ref<Score>| Text(score.0.to_string()))
-            --
-            // Reads `Health` from `#Player` and edits this entity's `Node`.
-            Node
-            watch_from(#Player, |hp: Ref<Health>, node: &mut Node| {
-                node.display = if hp.0 > 0 { Display::Flex } else { Display::None };
-            })
-            --
-            // Runs once per enemy whose `Health` changes. `ResMut` is a plain system param.
-            watch_from(any_with::<Enemy>(), |e: Entity, hp: Ref<Health>, mut score: ResMut<Score>| {
-                if hp.0 == 0 { score.0 += 1; info!("{e} died"); }
-            })
-            --
-            // `Option<Ref<T>>` also runs when `T` is removed or its entity despawns.
-            watch_from(#Player, |hp: Option<Ref<Health>>| {
-                if hp.is_none() { info!("the player is gone"); }
-            })
-        ]
-    }
-}
-```
-
-| In the closure | Re-runs it? | Meaning |
-| --- | --- | --- |
-| `c: Ref<T>` | yes | `T` on the source entity, or resource `T` |
-| `c: Option<Ref<T>>` | yes | the same, and `None` once `T` is removed or missing |
-| `Res`, `ResMut`, `Query`, `Single`, `Commands`, `Local`, `MessageReader`, .. | no | ordinary Bevy system parameters; wrap a custom one in `Param<..>` |
-| `c: &mut C` | no | component `C` of the entity that declared the watch |
-| `e: Entity` | no | the source entity |
-| returns a component or bundle | no | inserted on the entity that declared the watch |
-
-`Ref` is Bevy's own change-aware reference, so with several inputs `is_changed()`
-tells you which one triggered the run. Any `Component` or `Resource` can be an input;
-nothing needs to be derived.
-
-- `watch(..)` reads `Ref<T>` from the entity that declares it if that entity has a
-  `T`, otherwise from resource `T`.
-- `watch_from(source, ..)` reads them from `source` instead: a `#Name`, an `Entity`,
-  `any()`, `any_with::<C>()` or `any_matching::<F>()`. With the `any` sources it runs
-  once per matching entity whose inputs change, and default query filters apply, so
-  disabled entities are skipped unless `F` allows them.
-- A run is skipped while a plain `Ref<T>` or `&mut C` input is missing.
-- Insertion and mutable access count as changes; use `set_if_neq` to skip no-op
-  writes. Several writes in one frame cause one run, with the latest value.
-- A watch that changes another watched value re-runs it in the same frame.
-- Watches despawn with the entity that declared them. `app.watch(..)` and
-  `app.watch_from(..)` add watches that aren't tied to a scene.
-
-For add, insert and removal of a component on the entity itself, use Bevy's own
-observers: `on(|_: On<Add<Health>>| ..)`, `On<Insert<Health>>`, `On<Remove<Health>>`.
-
-Examples: `watch_component`, `watch_resource`.
 
 ## `subscribe`
 
@@ -463,14 +371,13 @@ Examples: `view_todos`, `view_tabs`.
 ## Comparison with plain Bevy
 
 `examples/comparison` builds the same Feathers counter (−1, count, +1, and a Reset
-button shown while the count is not zero) six times: once in plain Bevy and once per
+button shown while the count is not zero) five times: once in plain Bevy and once per
 style. Each file stands alone; none shares code with another.
 
 | Example | Built with |
 | --- | --- |
 | `comparison_bevy` | plain Bevy |
 | `comparison_reactive` | `reactive` |
-| `comparison_watch` | `watch` |
 | `comparison_subscribe` | `subscribe` |
 | `comparison_hooks` | `hooks` |
 | `comparison_view` | `view` |
@@ -527,20 +434,6 @@ rsn! {
         Children [ @caption("Reset") ]
     }
 }
-```
-
-### `watch`
-
-Same resource and buttons, but each node watches the resource itself:
-
-```rust,ignore
-Text("0")
-watch(|count: Ref<Count>| Text(count.0.to_string()))
---
-@FeathersButton
-watch(|count: Ref<Count>, node: &mut Node| {
-    node.display = if count.0 != 0 { Display::Flex } else { Display::None };
-})
 ```
 
 ### `subscribe`
@@ -606,7 +499,7 @@ view! {
 ## Scheduling and performance
 
 Each plugin runs in its own system set in `PostUpdate` — `ReactiveSystems`,
-`WatchSystems`, `HooksSystems` and `ViewSystems` — before UI layout with the `ui`
+`HooksSystems` and `ViewSystems` — before UI layout with the `ui`
 feature. Order systems that write watched values `.before(...)` the set to show them
 the same frame. Each runtime repeats until nothing changes, up to 8 rounds per frame
 (16 for `reactive`); if changes are still pending after that, it logs a warning and
@@ -616,12 +509,10 @@ continues next frame.
   lookups each) and runs only those that changed. `Query` parameters scan the
   entities with the components they read once per round, so prefer `Ref<T>` and
   `Res<T>` on hot paths.
-- `watch` adds one change detector per watched type using Bevy's `Changed<T>`
-  filter, and runs only the watches that read the changed entity. Nothing is cloned.
 - `subscribe` adds one observer per event type and one small entity per
   subscription.
 - `hooks` components and `view` regions check what they read each round and do
-  nothing when it didn't change. Prefer `view` regions or `watch` for hot paths, and
+  nothing when it didn't change. Prefer `reactive` or `view` regions for hot paths, and
   plain systems for thousands of entities changing every frame.
 
 ## Official Bevy references

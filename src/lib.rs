@@ -12,8 +12,6 @@ pub mod reactive;
 pub mod subscribe;
 #[cfg(feature = "view")]
 pub mod view;
-#[cfg(feature = "watch")]
-pub mod watch;
 
 #[doc(hidden)]
 pub mod macros {
