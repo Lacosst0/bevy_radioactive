@@ -19,16 +19,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use proc_macro2::{Delimiter, Group, Ident, Literal, Span, TokenStream, TokenTree};
 use quote::{ToTokens, format_ident, quote};
 
-use super::{
-    Tokens, dashes, error, is_ident, is_punct, split_commas, split_items, stream, tokens_of,
-    until_block,
-};
+use super::{Tokens, dashes, is_ident, is_punct, split_commas, stream, tokens_of, until_block};
 
 static HOISTED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// The `#Name`s declared in the `rsn!` being expanded.
     static DECLARED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Errors found while expanding. They are reported on their own, without
+    /// the `bsn!` call, so `bsn!` doesn't add parse errors around them.
+    static ERRORS: std::cell::RefCell<Vec<TokenStream>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records an error at `span`; returns nothing to put in its place.
+fn error(span: Span, message: &str) -> TokenStream {
+    let error = quote::quote_spanned!(span=> ::core::compile_error!(#message););
+    ERRORS.with(|errors| errors.borrow_mut().push(error));
+    TokenStream::new()
 }
 
 /// Every `#Name` in `tokens`, deeply, except `$Ref<T>(#Name)` targets.
@@ -59,6 +66,7 @@ pub(crate) fn expand(input: TokenStream, list: bool) -> TokenStream {
     let mut names = Vec::new();
     declared(&tokens, &mut names);
     let previous = DECLARED.with(|declared| declared.replace(names));
+    let previous_errors = ERRORS.with(|errors| errors.replace(Vec::new()));
     let mut scope = Scope::default();
     let bsn = if list {
         invoke(
@@ -70,6 +78,10 @@ pub(crate) fn expand(input: TokenStream, list: bool) -> TokenStream {
         invoke("bsn", Span::call_site(), list_item(&tokens, &mut scope))
     };
     DECLARED.with(|declared| declared.replace(previous));
+    let errors = ERRORS.with(|errors| errors.replace(previous_errors));
+    if !errors.is_empty() {
+        return quote!({ #(#errors)* loop {} });
+    }
     let prelude = scope.prelude;
     let output = quote! {{
         #[allow(unused_imports)]
@@ -469,11 +481,7 @@ fn reads(tokens: &[TokenTree], params: &mut Params) -> TokenStream {
                     name.to_tokens(&mut out);
                     i = next;
                 }
-                Err((span, message)) => {
-                    // The whole group becomes the error, so it is the only
-                    // one reported.
-                    return quote::quote_spanned!(span=> ::core::compile_error!(#message));
-                }
+                Err((span, message)) => return error(span, message),
             },
             TokenTree::Group(g) if !nested_rsn(tokens, i) => {
                 let mut group = Group::new(g.delimiter(), reads(&tokens_of(g), params));
@@ -526,12 +534,10 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
         }
 
         let start = i;
-        let mut last = None;
         if is_punct(tokens.get(i), ':') {
             i += 2;
         }
-        while let Some(TokenTree::Ident(ident)) = tokens.get(i) {
-            last = Some(ident.clone());
+        while let Some(TokenTree::Ident(_)) = tokens.get(i) {
             i += 1;
             if is_punct(tokens.get(i), ':') && is_punct(tokens.get(i + 1), ':') {
                 i += 2;
@@ -540,41 +546,109 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
             }
         }
         let path = &tokens[start..i];
-        let is_component = last
-            .as_ref()
-            .is_some_and(|ident| ident.to_string().starts_with(char::is_uppercase));
+        let idents: Vec<String> = path
+            .iter()
+            .filter_map(|t| match t {
+                TokenTree::Ident(ident) => Some(ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        let upper = |s: &String| s.starts_with(char::is_uppercase);
+        // `Type`, `Type { .. }`, `Type(..)` or `Enum::Variant`, as in `bsn!`.
+        let is_component = idents.last().is_some_and(upper);
         let is_on = path.len() == 1 && is_ident(path.first(), "on");
 
-        match tokens.get(i) {
-            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket => {
-                stream(path).to_tokens(&mut out);
-                Group::new(Delimiter::Bracket, list_tokens(&tokens_of(g), scope))
-                    .to_tokens(&mut out);
-                i += 1;
-            }
-            Some(TokenTree::Group(g)) if g.delimiter() != Delimiter::None => {
-                let content = tokens_of(g);
-                if has_dollar(&content) {
-                    if is_component {
-                        reactive_component(path, g, scope).to_tokens(&mut out);
-                    } else if is_on {
-                        handler(g, scope).to_tokens(&mut out);
-                    } else {
-                        error(g.span(), MISPLACED_DOLLAR).to_tokens(&mut out);
-                    }
-                } else if scope.mentions(&content) {
-                    stream(path).to_tokens(&mut out);
-                    captured_args(g, is_component, scope).to_tokens(&mut out);
-                } else {
-                    stream(path).to_tokens(&mut out);
-                    g.to_tokens(&mut out);
-                }
-                i += 1;
-            }
-            _ => stream(path).to_tokens(&mut out),
+        if let Some(TokenTree::Group(g)) = tokens.get(i)
+            && g.delimiter() == Delimiter::Bracket
+        {
+            stream(path).to_tokens(&mut out);
+            Group::new(Delimiter::Bracket, list_tokens(&tokens_of(g), scope)).to_tokens(&mut out);
+            i += 1;
+            continue;
         }
+        let group = match tokens.get(i) {
+            Some(TokenTree::Group(g)) if g.delimiter() != Delimiter::None => {
+                i += 1;
+                Some(g.clone())
+            }
+            _ => None,
+        };
+        // `.method(..)` / `.field` chained on the value, as `bsn!` allows.
+        let chain_start = i;
+        while is_punct(tokens.get(i), '.') && !is_punct(tokens.get(i + 1), '.') {
+            i += 1;
+            if matches!(
+                tokens.get(i),
+                Some(TokenTree::Ident(_) | TokenTree::Literal(_))
+            ) {
+                i += 1;
+            }
+            if matches!(tokens.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+            {
+                i += 1;
+            }
+        }
+        let chain = &tokens[chain_start..i];
+        let content = group.as_ref().map(tokens_of).unwrap_or_default();
+
+        if has_dollar(&content) || has_dollar(chain) {
+            if start > 0
+                && (is_punct(tokens.get(start - 1), '@') || is_punct(tokens.get(start - 1), ':'))
+            {
+                error(
+                    tokens[start].span(),
+                    "a scene's arguments are read once; read `$` inside the scene function's own \
+                     `rsn!`, or pick the scene with `if`/`match`",
+                );
+                continue;
+            }
+            match &group {
+                Some(g) if is_on && chain.is_empty() => handler(g, scope).to_tokens(&mut out),
+                Some(g) if is_component && chain.is_empty() => {
+                    reactive_component(path, g, scope).to_tokens(&mut out);
+                }
+                // `Type::new(.. $X ..)`, `function(..)`, `Type(..).with(..)`:
+                // a watch that rebuilds the value.
+                _ => watched_expression(&tokens[start..i], scope).to_tokens(&mut out),
+            }
+            continue;
+        }
+        stream(path).to_tokens(&mut out);
+        if let Some(g) = group {
+            if scope.mentions(&content) {
+                captured_args(&g, is_component, scope).to_tokens(&mut out);
+            } else {
+                g.to_tokens(&mut out);
+            }
+        }
+        stream(chain).to_tokens(&mut out);
     }
     out
+}
+
+/// `Type::new(.. $X ..)` (or any value expression with `$` reads) →
+/// `watch(|x: Ref<X>| Type::new(..))`, writing the component it returns.
+fn watched_expression(expression: &[TokenTree], scope: &mut Scope) -> TokenStream {
+    let site = scope.site(expression);
+    let mut params = Params::default();
+    let expression: Tokens = expression
+        .iter()
+        .map(|token| match token {
+            // `f({ value })`: BSN's braced value is a plain argument in Rust.
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
+                let args = split_commas(&tokens_of(g));
+                let args = args.iter().map(|arg| unbrace(arg));
+                let mut group = Group::new(Delimiter::Parenthesis, quote!(#(#args),*));
+                group.set_span(g.span());
+                TokenTree::Group(group)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let body = reads(&expression, &mut params);
+    let reader = params.reader(TokenStream::new(), None, body);
+    let watch = private("watch");
+    quote!(#watch({ #site #reader }))
 }
 
 /// Arguments or fields that read bound names through their own clones.
@@ -649,14 +723,7 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
     if group.delimiter() == Delimiter::Parenthesis {
         let args = split_commas(&content)
             .iter()
-            .map(|arg| {
-                if has_dollar(arg) {
-                    let arg = reads(&unbrace(arg).into_iter().collect::<Tokens>(), &mut params);
-                    quote!(::core::convert::Into::into(#arg))
-                } else {
-                    stream(arg)
-                }
-            })
+            .map(|arg| converted(arg, &mut params))
             .collect::<Vec<_>>();
         let reader = params.reader(TokenStream::new(), None, quote!(#ty(#(#args),*)));
         return quote! {
@@ -676,8 +743,7 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
         let Some((name, value)) = field_split(&field, Delimiter::Brace) else {
             return error(group.span(), "expected `field: value` around a `$` read");
         };
-        let value = reads(&unbrace(value).into_iter().collect::<Tokens>(), &mut params);
-        quote!(__rsn_c.#name = ::core::convert::Into::into(#value);).to_tokens(&mut assignments);
+        assign(quote!(__rsn_c.#name), value, &mut params).to_tokens(&mut assignments);
     }
     let kept = if kept.is_empty() {
         TokenStream::new()
@@ -693,6 +759,69 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
     quote! {
         #ty #kept
         #watch({ #site #reader })
+    }
+}
+
+/// `place = value;`. A nested struct value, `UiRect { left: .. }`, patches
+/// only the fields it names, as in `bsn!`.
+fn assign(place: TokenStream, value: &[TokenTree], params: &mut Params) -> TokenStream {
+    if let [path @ .., TokenTree::Group(fields)] = value
+        && fields.delimiter() == Delimiter::Brace
+        && is_struct_path(path)
+    {
+        let fields = split_commas(&tokens_of(fields));
+        let named: Option<Vec<_>> = fields
+            .iter()
+            .map(|field| match field.as_slice() {
+                [TokenTree::Ident(name)] => Some((name.clone(), vec![field[0].clone()])),
+                _ => {
+                    field_split(field, Delimiter::Brace).map(|(name, value)| (name, value.to_vec()))
+                }
+            })
+            .collect();
+        if let Some(named) = named {
+            return named
+                .iter()
+                .map(|(name, value)| assign(quote!(#place.#name), value, params))
+                .collect();
+        }
+    }
+    let value = converted(value, params);
+    quote!(#place = #value;)
+}
+
+/// A BSN value as Rust, converted with `Into` like `bsn!` does; unsuffixed
+/// number literals stay as they are, so they infer the field's type.
+fn converted(value: &[TokenTree], params: &mut Params) -> TokenStream {
+    let number = |t: &TokenTree| matches!(t, TokenTree::Literal(l) if !l.to_string().starts_with(['"', '\'', 'b', 'c', 'r']));
+    match value {
+        [literal] | [TokenTree::Punct(_), literal]
+            if number(literal) && (value.len() == 1 || is_punct(value.first(), '-')) =>
+        {
+            stream(value)
+        }
+        _ => {
+            let value = reads(&unbrace(value).into_iter().collect::<Tokens>(), params);
+            quote!(::core::convert::Into::into(#value))
+        }
+    }
+}
+
+/// `Struct` or `path::to::Struct`, but not `Enum::Variant`.
+fn is_struct_path(path: &[TokenTree]) -> bool {
+    let idents: Vec<String> = path
+        .iter()
+        .filter_map(|t| match t {
+            TokenTree::Ident(ident) => Some(ident.to_string()),
+            TokenTree::Punct(p) if p.as_char() == ':' => None,
+            _ => Some(String::new()),
+        })
+        .collect();
+    let upper = |s: &String| s.starts_with(char::is_uppercase);
+    match idents.as_slice() {
+        [.., parent, last] => upper(last) && !upper(parent),
+        [last] => upper(last),
+        [] => false,
     }
 }
 
@@ -783,13 +912,65 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
 
 fn list_tokens(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
     let mut joined = TokenStream::new();
-    for (index, item) in split_items(tokens).iter().enumerate() {
+    for (index, item) in split_list(tokens).iter().enumerate() {
         if index > 0 {
             dashes().to_tokens(&mut joined);
         }
         list_item(item, scope).to_tokens(&mut joined);
     }
     joined
+}
+
+/// Splits a scene list into items, like `bsn_list!`: items are separated by
+/// `,` or `--`. An `if`/`match`/`for` item ends after its last block, so
+/// commas in its header (`$Query<A, B>`) stay in it.
+fn split_list(tokens: &[TokenTree]) -> Vec<Tokens> {
+    let separator = |i: usize| {
+        is_punct(tokens.get(i), ',')
+            || (is_punct(tokens.get(i), '-') && is_punct(tokens.get(i + 1), '-'))
+    };
+    let skip_separator = |i: usize| {
+        if is_punct(tokens.get(i), ',') {
+            i + 1
+        } else if separator(i) {
+            i + 2
+        } else {
+            i
+        }
+    };
+    let block_after =
+        |from: usize| until_block(tokens, from).map_or(tokens.len(), |(.., next)| next);
+    let mut items = Vec::new();
+    let mut i = skip_separator(0);
+    while i < tokens.len() {
+        let start = i;
+        let mut j = i;
+        if is_punct(tokens.get(j), '#')
+            && matches!(tokens.get(j + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+        {
+            j += 2;
+        }
+        if is_ident(tokens.get(j), "if") {
+            j = block_after(j + 1);
+            while is_ident(tokens.get(j), "else") {
+                if is_ident(tokens.get(j + 1), "if") {
+                    j = block_after(j + 2);
+                } else {
+                    j = (j + 2).min(tokens.len());
+                    break;
+                }
+            }
+        } else if is_ident(tokens.get(j), "match") || is_ident(tokens.get(j), "for") {
+            j = block_after(j + 1);
+        } else {
+            while j < tokens.len() && !separator(j) {
+                j += 1;
+            }
+        }
+        items.push(tokens[start..j].to_vec());
+        i = skip_separator(j);
+    }
+    items
 }
 
 fn list_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {

@@ -562,3 +562,104 @@ fn named_reads_find_the_nearest_entity_with_that_name() {
     app.update();
     assert_eq!(labels(&mut app), ["wings 4", "1", "7"]);
 }
+
+impl Label {
+    fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    fn suffixed(mut self, suffix: &str) -> Self {
+        self.0.push_str(suffix);
+        self
+    }
+}
+
+fn label(text: String) -> Label {
+    Label(text)
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+struct Edges {
+    left: f32,
+    right: f32,
+}
+
+#[derive(Component, Clone, Default, Debug, PartialEq)]
+struct Boxed {
+    edges: Edges,
+    width: f32,
+}
+
+#[test]
+fn dollar_in_constructors_functions_and_method_chains() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            #Root
+            Count(1)
+            Children [
+                Label::new({ format!("new {}", $Res<Score>.0) }) Row,
+                Label::new($Ref<Count>(#Root).0.to_string()).suffixed("!"),
+                Label::new("chain").suffixed(if $Res<Score>.0 > 0 { "+" } else { "0" }),
+                label(format!("fn {}", $Res<Score>.0))
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["new 0", "1!", "chain0", "fn 0"]);
+
+    set_count(&mut app, 4);
+    app.world_mut().resource_mut::<Score>().0 = 2;
+    app.update();
+    assert_eq!(labels(&mut app), ["new 2", "4!", "chain+", "fn 2"]);
+}
+
+#[test]
+fn nested_struct_values_patch_only_the_fields_they_name() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Boxed { edges: Edges { left: $Res<Score>.0 as f32, right: 2.0 }, width: 1.0 }
+        })
+        .unwrap();
+    let boxed = entities_with::<Boxed>(&mut app)[0];
+    let expected = |left| Boxed {
+        edges: Edges { left, right: 2.0 },
+        width: 1.0,
+    };
+    assert_eq!(app.world().get::<Boxed>(boxed), Some(&expected(0.0)));
+    app.world_mut().resource_mut::<Score>().0 = 5;
+    app.update();
+    assert_eq!(app.world().get::<Boxed>(boxed), Some(&expected(5.0)));
+}
+
+#[test]
+fn comma_separated_lists_with_control_flow() {
+    let mut app = app();
+    app.world_mut().spawn(Task {
+        title: "a".into(),
+        done: false,
+    });
+    app.world_mut().spawn((
+        Task {
+            title: "hidden".into(),
+            done: false,
+        },
+        Row,
+    ));
+    app.world_mut()
+        .spawn_scene(rsn! {
+            #Root
+            Count(0)
+            Children [
+                Label("first"),
+                if $Ref<Count>(#Root).0 > 0 { Label("on") } else { Label("off") },
+                for task in $Query<&Task, Without<Row>> { Label({ task.title.clone() }) },
+                match $Ref<Count>(#Root).0 { 0 => Label("zero"), _ => Label("some") }
+                Label("last")
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["first", "off", "a", "zero", "last"]);
+    set_count(&mut app, 1);
+    assert_eq!(labels(&mut app), ["first", "on", "a", "some", "last"]);
+}

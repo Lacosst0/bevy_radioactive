@@ -58,6 +58,8 @@
 //! | --- | --- |
 //! | `Comp(.. $ ..)` | a [`watch`] that rebuilds `Comp` |
 //! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
+//! | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a [`watch`] that rebuilds the component the expression returns |
+//! | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
 //! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; write with `$Mut<Type>(..)` or `$ResMut<T>` |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
