@@ -26,8 +26,39 @@ use super::{
 
 static HOISTED: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// The `#Name`s declared in the `rsn!` being expanded.
+    static DECLARED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every `#Name` in `tokens`, deeply, except `$Ref<T>(#Name)` targets.
+fn declared(tokens: &[TokenTree], out: &mut Vec<String>) {
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Punct(p) if p.as_char() == '#' => {
+                if let Some(TokenTree::Ident(name)) = tokens.get(i + 1) {
+                    out.push(name.to_string());
+                }
+            }
+            TokenTree::Group(g) => {
+                let inner = tokens_of(g);
+                let target = g.delimiter() == Delimiter::Parenthesis
+                    && is_punct(tokens.get(i.wrapping_sub(1)), '>')
+                    && matches!(inner.as_slice(), [hash, TokenTree::Ident(_)] if is_punct(Some(hash), '#'));
+                if !target {
+                    declared(&inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn expand(input: TokenStream, list: bool) -> TokenStream {
     let tokens: Tokens = input.into_iter().collect();
+    let mut names = Vec::new();
+    declared(&tokens, &mut names);
+    let previous = DECLARED.with(|declared| declared.replace(names));
     let mut scope = Scope::default();
     let bsn = if list {
         invoke(
@@ -38,6 +69,7 @@ pub(crate) fn expand(input: TokenStream, list: bool) -> TokenStream {
     } else {
         invoke("bsn", Span::call_site(), list_item(&tokens, &mut scope))
     };
+    DECLARED.with(|declared| declared.replace(previous));
     let prelude = scope.prelude;
     let output = quote! {{
         #[allow(unused_imports)]
@@ -230,7 +262,7 @@ impl Params {
         if self.named() {
             quote! {
                 __rsn_host: ::bevy::prelude::Entity,
-                __rsn_names: ::bevy_radioactive::reactive::Untracked<__rsn_Names>,
+                mut __rsn_names: ::bevy_radioactive::reactive::Untracked<__rsn_Names>,
             }
             .to_tokens(&mut out);
         }
@@ -242,13 +274,33 @@ impl Params {
     fn lookups(&self, write: bool) -> TokenStream {
         let mut out = TokenStream::new();
         for (index, param) in self.0.iter().enumerate() {
-            let entity = match &param.kind {
-                Kind::Entity(entity) => entity.clone(),
-                Kind::Named(entity) => quote!(__rsn_names.find(__rsn_host, #entity)),
-                Kind::Exact => continue,
-            };
             let name = &param.name;
             let query = format_ident!("__rsn_q{index}");
+            let ty = &param.ty;
+            let entity = match &param.kind {
+                Kind::Entity(entity) => entity.clone(),
+                Kind::Named(entity) => {
+                    // Warns once in debug builds when nothing matches.
+                    let get = if write {
+                        quote!(#query.get_mut(__rsn_e).ok())
+                    } else {
+                        quote!(#query.get(__rsn_e).ok())
+                    };
+                    let found = quote! {{
+                        let __rsn_e = __rsn_names.find(__rsn_host, #entity);
+                        let __rsn_found = #get;
+                        __rsn_names.check::<#ty, _>(__rsn_found, #entity)
+                    }};
+                    if write {
+                        quote!(let ::core::option::Option::Some(mut #name) = (#found) else { return; };)
+                    } else {
+                        quote!(let #name = #found?;)
+                    }
+                    .to_tokens(&mut out);
+                    continue;
+                }
+                Kind::Exact => continue,
+            };
             if write {
                 quote!(let ::core::result::Result::Ok(mut #name) = #query.get_mut(#entity) else { return; };)
             } else {
@@ -363,7 +415,19 @@ fn dollar(
     let inside = tokens_of(target);
     let kind = match inside.as_slice() {
         [hash, TokenTree::Ident(name)] if is_punct(Some(hash), '#') => {
-            Kind::Named(name.to_string())
+            let name = name.to_string();
+            if !DECLARED.with(|declared| declared.borrow().contains(&name)) {
+                return Err((
+                    target.span(),
+                    "this `#Name` isn't declared in this `rsn!`; check the spelling, or, for an \
+                     entity named in another scene, look it up at runtime with `$Ref<T>(\"Name\")`",
+                ));
+            }
+            Kind::Named(name)
+        }
+        [TokenTree::Literal(literal)] if literal.to_string().starts_with('"') => {
+            let text = literal.to_string();
+            Kind::Named(text[1..text.len() - 1].to_string())
         }
         _ => Kind::Entity(target.stream()),
     };

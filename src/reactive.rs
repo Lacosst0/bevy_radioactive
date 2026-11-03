@@ -16,6 +16,12 @@
 //! | `$Ref<Type>(#Name)` | component `Type` on the nearest entity named `#Name`: this entity and its subtree, then each ancestor and its subtree |
 //! | `$Ref<Type>(entity)` | `Type` on that entity; skipped while it has none |
 //! | `$Mut<Type>(#Name)`, `$Mut<Type>(entity)` | the same, writable; only in `on(..)` |
+//! | `$Ref<Type>("Name")` | like `#Name`, for an entity named in another scene: not checked at compile time |
+//!
+//! A `#Name` must be declared in the same `rsn!`, or it is a compile error.
+//! In debug builds, a closure whose `#Name` or `"Name"` matches nothing (or
+//! whose entity lacks the component) logs one warning; it is skipped either
+//! way.
 //! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as in a Bevy system |
 //!
 //! ```ignore
@@ -1780,9 +1786,27 @@ pub mod __private {
         names: Query<'w, 's, &'static Name, Allow<Disabled>>,
         parents: Query<'w, 's, &'static ChildOf, Allow<Disabled>>,
         children: Query<'w, 's, &'static Children, Allow<Disabled>>,
+        warned: Local<'s, bool>,
     }
 
     impl __rsn_Names<'_, '_> {
+        /// `found`, warning once per closure in debug builds when it is
+        /// `None`: the name matched no entity, or the entity lacks `T`.
+        pub fn check<T, V>(&mut self, found: Option<V>, name: &str) -> Option<V> {
+            #[cfg(debug_assertions)]
+            if found.is_none() && !*self.warned {
+                *self.warned = true;
+                warn!(
+                    "rsn!: found no entity named `{name}` with a `{}` near this one; the \
+                     closure is skipped until one appears",
+                    std::any::type_name::<T>(),
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = (name, &self.warned);
+            found
+        }
+
         /// The nearest entity named `name`, or `Entity::PLACEHOLDER`.
         pub fn find(&self, start: Entity, name: &str) -> Entity {
             let mut current = Some(start);

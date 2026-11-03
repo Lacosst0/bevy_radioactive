@@ -51,7 +51,12 @@ changes; everything else runs once, when the scene spawns.**
 | `$Ref<Type>(#Name)` | component `Type` on the nearest entity named `#Name` (this entity and its subtree, then each ancestor and its subtree) | `$Ref<Count>(#Counter).0` |
 | `$Ref<Type>(entity)` | `Type` on that entity (skipped while it has none) | `$Ref<Health>(player).0` |
 | `$Mut<Type>(#Name)`, `$Mut<Type>(entity)` | the same, writable; only in `on(..)` | `$Mut<Count>(#Counter).0 += 1` |
+| `$Ref<Type>("Name")` | like `#Name`, for an entity named in another scene (not checked at compile time) | `$Ref<Theme>("App").0` |
 | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()` |
+
+A `#Name` must be declared in the same `rsn!`, so a typo is a compile error. In debug
+builds, a closure whose name matches nothing (or whose entity lacks the component) logs
+one warning; it is skipped either way.
 
 ```rust,ignore
 use bevy::{prelude::*, ui_widgets::Activate};

@@ -322,7 +322,8 @@ fn rsn_list_and_plain_bsn_items_mix() {
         .queue_spawn_related_scenes::<Children>(rsn_list! {
             Label("plain")
             --
-            if $Ref<Count>(#Root).0 == 1 { Label("one") } else { Label("other") }
+            // `Root` is named outside this `rsn!`: looked up by name at runtime.
+            if $Ref<Count>("Root").0 == 1 { Label("one") } else { Label("other") }
         });
     app.update();
     assert_eq!(labels(&mut app), ["plain", "one"]);
@@ -331,7 +332,7 @@ fn rsn_list_and_plain_bsn_items_mix() {
 }
 
 fn badge(text: &'static str) -> impl Scene {
-    rsn! { Label({ format!("{text} {}", $Ref<Count>(#Root).0) }) }
+    rsn! { Label({ format!("{text} {}", $Ref<Count>("Root").0) }) }
 }
 
 #[test]
