@@ -10,7 +10,9 @@ keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [features]
-default = ["watch", "subscribe", "hooks", "view", "ui"]
+default = ["reactive", "watch", "subscribe", "hooks", "view", "ui"]
+## `watch`, `handle`, `when`, `switch`, `each`: one ECS-native API for reactivity and control flow.
+reactive = []
 ## `watch`, `watch_from`: re-run a closure when the components and resources it reads change.
 watch = []
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
@@ -44,6 +46,16 @@ module_name_repetitions = "allow"
 type_complexity = "allow"
 ## Each style is meant to be glob-imported: `use bevy_radioactive::view::*`.
 wildcard_imports = "allow"
+
+[[example]]
+name = "reactive_counters"
+path = "examples/reactive_counters.rs"
+required-features = ["reactive"]
+
+[[example]]
+name = "reactive_todos"
+path = "examples/reactive_todos.rs"
+required-features = ["reactive"]
 
 [[example]]
 name = "watch_component"
@@ -84,6 +96,11 @@ required-features = ["view"]
 name = "comparison_bevy"
 path = "examples/comparison/bevy.rs"
 required-features = ["comparison"]
+
+[[example]]
+name = "comparison_reactive"
+path = "examples/comparison/reactive.rs"
+required-features = ["comparison", "reactive"]
 
 [[example]]
 name = "comparison_watch"

@@ -38,6 +38,14 @@ glob: `use bevy_radioactive::view::*;`.
 | `Region` | internal |
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
+New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style. Its
+`rsn!` macro is `bsn!` plus Rust `if`/`match`/`for` and `$` reads (`$Ref<Type>(#Name)` for a component on
+the nearest entity named `#Name`, `$Ref<Type>(entity)`, or a Bevy system parameter such as `$Res<T>`, `$Local<T>` or
+`$Query<..>`),
+expanding to `watch`, `handle`, `when`, `switch`
+and `each`, which also work directly. Components are state and despawning is cleanup.
+Nothing else changes.
+
 New: `watch` takes one closure. `Ref<T>` parameters are tracked and re-run it,
 other system parameters are only read, `&mut C` writes a component of the declaring
 entity and a returned component is inserted on it. It runs on spawn, and

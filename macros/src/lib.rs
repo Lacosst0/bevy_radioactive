@@ -56,6 +56,23 @@ pub fn view_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     output.into()
 }
 
+/// `bsn!` with Rust control flow and `$Type` reads of the nearest component
+/// or resource, for `bevy_radioactive::reactive`.
+///
+/// See `bevy_radioactive::reactive` for the full syntax.
+#[proc_macro]
+pub fn rsn(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    rsn::expand(input.into(), false).into()
+}
+
+/// Like `rsn!`, producing a scene list (`--` separated entities).
+#[proc_macro]
+pub fn rsn_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    rsn::expand(input.into(), true).into()
+}
+
+mod rsn;
+
 fn debug(output: &TokenStream) {
     if std::env::var_os("VIEW_DEBUG").is_some() {
         eprintln!("{output}");
