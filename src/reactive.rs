@@ -13,8 +13,9 @@
 //!
 //! | `$` read | Reads |
 //! | --- | --- |
-//! | `#Name$Type` | component `Type` on the nearest entity named `#Name`: this entity and its subtree, then each ancestor and its subtree |
-//! | `$(entity).Type` | `Type` on that entity; skipped while it has none |
+//! | `$Ref<Type>(#Name)` | component `Type` on the nearest entity named `#Name`: this entity and its subtree, then each ancestor and its subtree |
+//! | `$Ref<Type>(entity)` | `Type` on that entity; skipped while it has none |
+//! | `$Mut<Type>(#Name)`, `$Mut<Type>(entity)` | the same, writable; only in `on(..)` |
 //! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as in a Bevy system |
 //!
 //! ```ignore
@@ -31,11 +32,11 @@
 //!         Count(0)                                         // state, local to this counter
 //!         Children [
 //!             Button
-//!             on(|_: On<Activate>| #Counter$Count.0 += 1) // writes it
+//!             on(|_: On<Activate>| $Mut<Count>(#Counter).0 += 1) // writes it
 //!             --
-//!             Text({ #Counter$Count.0.to_string() })       // re-renders when it changes
+//!             Text({ $Ref<Count>(#Counter).0.to_string() })       // re-renders when it changes
 //!             --
-//!             if #Counter$Count.0 > 10 { Text("That's a lot") } else { Text("Keep going") }
+//!             if $Ref<Count>(#Counter).0 > 10 { Text("That's a lot") } else { Text("Keep going") }
 //!             --
 //!             for todo in $Query<&Todo> { Text({ todo.title.clone() }) }
 //!         ]
@@ -51,7 +52,7 @@
 //! | --- | --- |
 //! | `Comp(.. $ ..)` | a [`watch`] that rebuilds `Comp` |
 //! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
-//! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; `#Name$Type`, `$(e).Type` and `$ResMut<T>` are writable |
+//! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; write with `$Mut<Type>(..)` or `$ResMut<T>` |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
 //! | `for pat in $Query<D, F> { .. }` | an [`each`] region with one row per entity |
@@ -61,7 +62,7 @@
 //!
 //! A `$Query` loop binds an owned copy of each item (`&T` becomes `T`, which
 //! needs `Clone + PartialEq`) and rebuilds a row when it changes. Loop over
-//! `$Query<Entity, With<T>>` and read `$(entity).T` to update rows in place.
+//! `$Query<Entity, With<T>>` and read `$Ref<T>(entity)` to update rows in place.
 //! Other loops need owned items that implement `PartialEq`. Loop and match
 //! bindings may be used any number of times. [`rsn_list!`] is the list form.
 //!
@@ -1733,7 +1734,7 @@ pub mod __private {
     use std::marker::PhantomData;
 
     /// A reader closure returning `Option<V>`, read as one returning `V`
-    /// that skips its run on `None`. Used for `$(entity).Type`.
+    /// that skips its run on `None`. Used for `$Ref<Type>(entity)`.
     pub struct Skip<F, M>(F, PhantomData<fn() -> M>);
 
     impl<F: Clone, M> Clone for Skip<F, M> {
@@ -1771,7 +1772,7 @@ pub mod __private {
         }
     }
 
-    /// Finds `#Name`d entities for `#Name$Type`: the start entity and its
+    /// Finds `#Name`d entities for `$Ref<Type>(#Name)`: the start entity and its
     /// subtree, then each ancestor and its subtree.
     #[allow(non_camel_case_types)]
     #[derive(bevy::ecs::system::SystemParam)]

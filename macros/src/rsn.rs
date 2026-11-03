@@ -1,10 +1,10 @@
 //! `rsn!`: `bsn!` with Rust control flow and `$` reads, expanding to
 //! `bevy_radioactive::reactive`.
 //!
-//! - `#Name$Type` reads `Type` on the nearest entity named `#Name`,
-//!   `$(entity).Type` on that entity, and `$Res<T>`, `$Query<..>`, .. are
+//! - `$Ref<Type>(#Name)` reads `Type` on the nearest entity named `#Name`,
+//!   `$Ref<Type>(entity)` on that entity, and `$Res<T>`, `$Query<..>`, .. are
 //!   system parameters as written. Whatever contains a `$` is a tracked
-//!   reader; in `on(..)` component reads are writable.
+//!   reader; in `on(..)`, `$Mut<Type>(..)` writes.
 //! - `if`/`else if`/`else`, `match` and `for` (with `#[key(..)]`) in a scene
 //!   list become regions (`switch`, `each`, `each_indexed`).
 //! - `Comp(.. $X ..)` becomes `watch(..)` returning `Comp`;
@@ -177,7 +177,7 @@ struct Param {
 
 /// The `$` reads of one closure, one parameter per distinct read.
 #[derive(Default)]
-struct Params(Vec<Param>);
+struct Params(Vec<Param>, bool);
 
 impl Params {
     fn param(&mut self, ty: &[TokenTree], kind: Kind) -> Ident {
@@ -284,27 +284,19 @@ impl Params {
     }
 }
 
+const DOLLAR_HELP: &str = "expected a Bevy system parameter: `$Ref<T>(#Name)` or \
+     `$Ref<T>(entity)` for a component on an entity (`$Mut<T>(..)` to write it in `on(..)`), \
+     or `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`";
+
 /// Parses a `$` read at `tokens[i]` (the `$`): returns the parameter name
 /// and the index after the read.
 fn dollar(
     tokens: &[TokenTree],
     i: usize,
-    named: Option<String>,
     params: &mut Params,
-) -> Result<(Ident, usize), Span> {
+) -> Result<(Ident, usize), (Span, &'static str)> {
     let span = tokens[i].span();
     let mut j = i + 1;
-    // `$(entity).Type`
-    let entity = match tokens.get(j) {
-        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
-            if !is_punct(tokens.get(j + 1), '.') {
-                return Err(g.span());
-            }
-            j += 2;
-            Some(g.stream())
-        }
-        _ => None,
-    };
     let start = j;
     if is_punct(tokens.get(j), ':') && is_punct(tokens.get(j + 1), ':') {
         j += 2;
@@ -323,38 +315,59 @@ fn dollar(
             break;
         }
     }
-    if j == start || !matches!(tokens.get(j - 1), Some(TokenTree::Ident(_))) {
-        return Err(span);
+    if j == start || !is_punct(tokens.get(j), '<') {
+        return Err((span, DOLLAR_HELP));
     }
-    // `$Query<..>`: a system parameter as written.
-    let mut exact = false;
-    if entity.is_none() && is_punct(tokens.get(j), '<') {
-        let mut depth = 0usize;
-        while j < tokens.len() {
-            if is_punct(tokens.get(j), '<') {
-                depth += 1;
-            } else if is_punct(tokens.get(j), '>') && !is_punct(tokens.get(j - 1), '-') {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
+    let path_end = j;
+    let mut depth = 0usize;
+    while j < tokens.len() {
+        if is_punct(tokens.get(j), '<') {
+            depth += 1;
+        } else if is_punct(tokens.get(j), '>') && !is_punct(tokens.get(j - 1), '-') {
+            depth -= 1;
+            if depth == 0 {
+                break;
             }
-            j += 1;
-        }
-        if depth != 0 {
-            return Err(span);
         }
         j += 1;
-        exact = true;
     }
-    let kind = match (named, entity) {
-        (Some(_), Some(_)) => return Err(span),
-        (Some(named), None) if !exact => Kind::Named(named),
-        (None, Some(entity)) => Kind::Entity(entity),
-        (None, None) if exact => Kind::Exact,
-        _ => return Err(span),
+    if depth != 0 {
+        return Err((span, DOLLAR_HELP));
+    }
+    j += 1;
+    // `$Ref<T>(target)` / `$Mut<T>(target)`: a component on one entity.
+    let path = &tokens[start..path_end];
+    let (is_ref, is_mut) = (
+        path.len() == 1 && is_ident(path.first(), "Ref"),
+        path.len() == 1 && is_ident(path.first(), "Mut"),
+    );
+    if !is_ref && !is_mut {
+        return Ok((params.param(&tokens[start..j], Kind::Exact), j));
+    }
+    if is_mut && !params.1 {
+        return Err((
+            span,
+            "`$Mut<T>(..)` writes, so it only works in `on(..)`; read with `$Ref<T>(..)`",
+        ));
+    }
+    let Some(TokenTree::Group(target)) = tokens.get(j) else {
+        return Err((
+            span,
+            "write the entity: `$Ref<T>(#Name)` for the nearest entity named `#Name`, or `$Ref<T>(entity)`",
+        ));
     };
-    Ok((params.param(&tokens[start..j], kind), j))
+    if target.delimiter() != Delimiter::Parenthesis {
+        return Err((target.span(), DOLLAR_HELP));
+    }
+    let ty = &tokens[path_end + 1..j - 1];
+    let inside = tokens_of(target);
+    let kind = match inside.as_slice() {
+        [hash, TokenTree::Ident(name)] if is_punct(Some(hash), '#') => {
+            Kind::Named(name.to_string())
+        }
+        _ => Kind::Entity(target.stream()),
+    };
+    Ok((params.param(ty, kind), j + 1))
 }
 
 fn has_dollar(tokens: &[TokenTree]) -> bool {
@@ -379,34 +392,17 @@ fn reads(tokens: &[TokenTree], params: &mut Params) -> TokenStream {
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
-            TokenTree::Punct(p)
-                if (p.as_char() == '$')
-                    || (p.as_char() == '#'
-                        && matches!(tokens.get(i + 1), Some(TokenTree::Ident(_)))
-                        && is_punct(tokens.get(i + 2), '$')) =>
-            {
-                let (named, at) = match tokens.get(i + 1) {
-                    Some(TokenTree::Ident(name)) if p.as_char() == '#' => {
-                        (Some(name.to_string()), i + 2)
-                    }
-                    _ => (None, i),
-                };
-                match dollar(tokens, at, named, params) {
-                    Ok((name, next)) => {
-                        name.to_tokens(&mut out);
-                        i = next;
-                    }
-                    Err(span) => {
-                        error(
-                            span,
-                            "expected `#Name$Type` (the nearest entity named `#Name`), \
-                             `$(entity).Type`, or a Bevy system parameter such as `$Res<T>` or `$Query<..>`",
-                        )
-                        .to_tokens(&mut out);
-                        i = at + 1;
-                    }
+            TokenTree::Punct(p) if p.as_char() == '$' => match dollar(tokens, i, params) {
+                Ok((name, next)) => {
+                    name.to_tokens(&mut out);
+                    i = next;
                 }
-            }
+                Err((span, message)) => {
+                    // The whole group becomes the error, so it is the only
+                    // one reported.
+                    return quote::quote_spanned!(span=> ::core::compile_error!(#message));
+                }
+            },
             TokenTree::Group(g) if !nested_rsn(tokens, i) => {
                 let mut group = Group::new(g.delimiter(), reads(&tokens_of(g), params));
                 group.set_span(g.span());
@@ -705,7 +701,7 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
         }
     };
     let site = scope.site(&content);
-    let mut params = Params::default();
+    let mut params = Params(Vec::new(), true);
     let body = reads(body, &mut params);
     let rest = closure_params.iter().map(|p| stream(p));
     let writers = params.closure_params(true);

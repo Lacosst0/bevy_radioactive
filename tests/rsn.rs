@@ -108,7 +108,7 @@ fn dollar_in_a_component_value_watches_it() {
             #Root
             Count(1)
             Children [
-                Label({ format!("count {}", #Root$Count.0) })
+                Label({ format!("count {}", $Ref<Count>(#Root).0) })
                 --
                 Label({ format!("score {}", $Res<Score>.0) })
             ]
@@ -129,7 +129,7 @@ fn braced_components_patch_only_reactive_fields() {
         .spawn_scene(rsn! {
             #Root
             Count(3)
-            Children [ Style { width: #Root$Count.0 as f32 * 2.0, title: "fixed" } ]
+            Children [ Style { width: $Ref<Count>(#Root).0 as f32 * 2.0, title: "fixed" } ]
         })
         .unwrap();
     let style = entities_with::<Style>(&mut app)[0];
@@ -160,15 +160,15 @@ fn if_else_if_else_switches_branches() {
             Children [
                 Label("before")
                 --
-                if #Root$Count.0 > 0 {
+                if $Ref<Count>(#Root).0 > 0 {
                     Label("positive")
-                } else if #Root$Count.0 < 0 {
+                } else if $Ref<Count>(#Root).0 < 0 {
                     Label("negative") -- Label("really")
                 } else {
                     Label("zero")
                 }
                 --
-                if #Root$Count.0 > 100 { Label("huge") }
+                if $Ref<Count>(#Root).0 > 100 { Label("huge") }
                 --
                 Label("after")
             ]
@@ -234,7 +234,7 @@ fn keyed_for_keeps_rows_and_uses_the_item_more_than_once() {
                     Children [
                         Label({ format!("#{} {}", todo.id, todo.title) })
                         --
-                        if i64::from(#Root$Count.0) > i64::from(todo.id) { Label({ format!("done {}", todo.title) }) }
+                        if i64::from($Ref<Count>(#Root).0) > i64::from(todo.id) { Label({ format!("done {}", todo.title) }) }
                     ]
                 }
             ]
@@ -264,7 +264,7 @@ fn unkeyed_and_plain_for_loops() {
             #Root
             Count(2)
             Children [
-                for i in 0..#Root$Count.0 { Label({ format!("row {i}") }) }
+                for i in 0..$Ref<Count>(#Root).0 { Label({ format!("row {i}") }) }
                 --
                 for name in ["x", "y"] { Label({ name.to_string() }) Row }
             ]
@@ -284,9 +284,9 @@ fn on_writes_the_nearest_component() {
             Count(0)
             Children [
                 #Button
-                on(|poke: On<Poke>| #Root$Count.0 += poke.by)
+                on(|poke: On<Poke>| $Mut<Count>(#Root).0 += poke.by)
                 --
-                Label({ #Root$Count.0.to_string() })
+                Label({ $Ref<Count>(#Root).0.to_string() })
             ]
         })
         .unwrap();
@@ -322,7 +322,7 @@ fn rsn_list_and_plain_bsn_items_mix() {
         .queue_spawn_related_scenes::<Children>(rsn_list! {
             Label("plain")
             --
-            if #Root$Count.0 == 1 { Label("one") } else { Label("other") }
+            if $Ref<Count>(#Root).0 == 1 { Label("one") } else { Label("other") }
         });
     app.update();
     assert_eq!(labels(&mut app), ["plain", "one"]);
@@ -331,7 +331,7 @@ fn rsn_list_and_plain_bsn_items_mix() {
 }
 
 fn badge(text: &'static str) -> impl Scene {
-    rsn! { Label({ format!("{text} {}", #Root$Count.0) }) }
+    rsn! { Label({ format!("{text} {}", $Ref<Count>(#Root).0) }) }
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn scene_functions_in_arms_and_nested_rsn_in_rows() {
                 }
                 --
                 @each(move || vec![target], |&e| e, |&e| rsn! {
-                    Label({ format!("source {}", $(e).Count.0) })
+                    Label({ format!("source {}", $Ref<Count>(e).0) })
                 })
             ]
         })
@@ -426,9 +426,9 @@ fn query_rows_read_their_entity_with_dollar() {
             #Root
             Count(0)
             Children [
-                // Entity rows: the row is never rebuilt, `$(task).Task` reads its entity.
+                // Entity rows: the row is never rebuilt, `$Ref<Task>(task)` reads its entity.
                 for task in $Query<Entity, With<Task>> {
-                    Label({ $(task).Task.title.clone() })
+                    Label({ $Ref<Task>(task).title.clone() })
                 }
             ]
         })
@@ -449,12 +449,12 @@ fn explicit_sources_entity_and_resource() {
             #Root
             Count(1)
             Children [
-                Label({ format!("{} {} {}", #Root$Count.0, $(player).Count.0, $Res<Score>.0) })
+                Label({ format!("{} {} {}", $Ref<Count>(#Root).0, $Ref<Count>(player).0, $Res<Score>.0) })
                 --
                 Label({ format!("single {}", $Single<&Count, With<Player>>.0) })
                 --
                 #Button
-                on(|poke: On<Poke>| $(player).Count.0 += poke.by)
+                on(|poke: On<Poke>| $Mut<Count>(player).0 += poke.by)
             ]
         })
         .unwrap();
@@ -490,10 +490,10 @@ fn bevy_style_params_res_res_mut_and_local() {
                 on(|poke: On<Poke>| {
                     $ResMut<Score>.0 += 1;
                     *$Local<i32> += poke.by;
-                    #Root$Count.0 = *$Local<i32>;
+                    $Mut<Count>(#Root).0 = *$Local<i32>;
                 })
                 --
-                Label({ format!("{} {}", $Res<Score>.0, #Root$Count.0) })
+                Label({ format!("{} {}", $Res<Score>.0, $Ref<Count>(#Root).0) })
             ]
         })
         .unwrap();
@@ -524,7 +524,7 @@ fn bird_counter(start: i32) -> impl Scene {
     rsn! {
         #Counter
         Count({start})
-        Children [ Label({ format!("{}", #Counter$Count.0) }) ]
+        Children [ Label({ format!("{}", $Ref<Count>(#Counter).0) }) ]
     }
 }
 
@@ -538,7 +538,7 @@ fn named_reads_find_the_nearest_entity_with_that_name() {
                 Wings(2)
                 --
                 // A sibling's subtree, not an ancestor: still found.
-                Label({ format!("wings {}", #Bird$Wings.0) })
+                Label({ format!("wings {}", $Ref<Wings>(#Bird).0) })
                 --
                 @bird_counter(1)
                 --

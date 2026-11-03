@@ -1,7 +1,7 @@
 //! A keyed list of todo entities, a filter switch, and an empty state.
 //!
 //! Each todo is an entity. `for _ in $Query<..>` keeps one row per todo
-//! entity, and `$(todo).Todo` inside a row reads that entity, so editing a todo
+//! entity, and `$Ref<Todo>(todo)` inside a row reads that entity, so editing a todo
 //! patches its row instead of rebuilding it.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
@@ -33,11 +33,11 @@ fn todo_list() -> impl Scene {
             --
             if $Query<(), With<Todo>>.is_empty() { Label("Nothing to do") }
             --
-            // One row per todo entity, kept while it matches. `$(todo).Todo` in a row
+            // One row per todo entity, kept while it matches. `$Ref<Todo>(todo)` in a row
             // reads that row's entity, so edits update the row in place.
             for todo in $Query<Entity, With<Todo>> {
-                if *$Res<Filter> == Filter::All || !$(todo).Todo.done {
-                    Label({ format!("[{}] {}", if $(todo).Todo.done { "x" } else { " " }, $(todo).Todo.title) })
+                if *$Res<Filter> == Filter::All || !$Ref<Todo>(todo).done {
+                    Label({ format!("[{}] {}", if $Ref<Todo>(todo).done { "x" } else { " " }, $Ref<Todo>(todo).title) })
                 }
             }
         ]

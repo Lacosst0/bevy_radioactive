@@ -48,8 +48,9 @@ changes; everything else runs once, when the scene spawns.**
 
 | `$` read | Reads | Example |
 | --- | --- | --- |
-| `#Name$Type` | component `Type` on the nearest entity named `#Name` (this entity and its subtree, then each ancestor and its subtree) | `#Counter$Count.0` |
-| `$(entity).Type` | `Type` on that entity (skipped while it has none) | `$(player).Health.0` |
+| `$Ref<Type>(#Name)` | component `Type` on the nearest entity named `#Name` (this entity and its subtree, then each ancestor and its subtree) | `$Ref<Count>(#Counter).0` |
+| `$Ref<Type>(entity)` | `Type` on that entity (skipped while it has none) | `$Ref<Health>(player).0` |
+| `$Mut<Type>(#Name)`, `$Mut<Type>(entity)` | the same, writable; only in `on(..)` | `$Mut<Count>(#Counter).0 += 1` |
 | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()` |
 
 ```rust,ignore
@@ -72,15 +73,15 @@ fn counter() -> impl Scene {
         Count(0)                                          // state; every @counter() has its own
         Children [
             Button
-            on(|_: On<Activate>| #Counter$Count.0 += 1)  // writes this counter's Count
+            on(|_: On<Activate>| $Mut<Count>(#Counter).0 += 1)  // writes this counter's Count
             --
-            Text({ #Counter$Count.0.to_string() })        // re-renders when it changes
+            Text({ $Ref<Count>(#Counter).0.to_string() })        // re-renders when it changes
             --
             Text({ format!("{} enemies", $Query<(), With<Enemy>>.iter().count()) })
             --
-            if #Counter$Count.0 > 10 {
+            if $Ref<Count>(#Counter).0 > 10 {
                 Text("That's a lot")
-            } else if #Counter$Count.0 < 0 {
+            } else if $Ref<Count>(#Counter).0 < 0 {
                 Text("Negative")
             }
         ]
@@ -114,7 +115,7 @@ fn app_body() -> impl Scene {
 | --- | --- |
 | `Comp(.. $ ..)` | a `watch` that rebuilds `Comp` |
 | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
-| `on(\|e: On<E>\| .. $ ..)` | a handler; `#Name$Type`, `$(e).Type` and `$ResMut<T>` are writable (`#Counter$Count.0 += 1`) |
+| `on(\|e: On<E>\| .. $ ..)` | a handler; write with `$Mut<Type>(#Name)`, `$Mut<Type>(e)` or `$ResMut<T>` (`$Mut<Count>(#Counter).0 += 1`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
 | `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
@@ -125,7 +126,7 @@ fn app_body() -> impl Scene {
 - `for pat in $Query<D, F>` keeps one row per entity. `pat` binds an owned copy of
   the item (`&T` becomes `T`), and the row is rebuilt when it changes, so `T` needs
   `Clone + PartialEq`. To update rows in place instead, loop over entities and read
-  them: `for e in $Query<Entity, With<Todo>> { Text({ $(e).Todo.title.clone() }) }`.
+  them: `for e in $Query<Entity, With<Todo>> { Text({ $Ref<Todo>(e).title.clone() }) }`.
 - Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
@@ -504,20 +505,20 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 ### `reactive`
 
 The count is a component on the counter's root, so each counter has its own.
-`#Counter$Count` reads it, and the `if` owns the Reset button:
+`$Ref<Count>(#Counter)` reads it, and the `if` owns the Reset button:
 
 ```rust,ignore
 rsn! {
     #Counter
     Count(0)
     // ...
-    on(|_: On<Activate>| #Counter$Count.0 += 1)
+    on(|_: On<Activate>| $Mut<Count>(#Counter).0 += 1)
     // ...
-    Text({ #Counter$Count.0.to_string() })
+    Text({ $Ref<Count>(#Counter).0.to_string() })
     // ...
-    if #Counter$Count.0 != 0 {
+    if $Ref<Count>(#Counter).0 != 0 {
         @FeathersButton
-        on(|_: On<Activate>| #Counter$Count.0 = 0)
+        on(|_: On<Activate>| $Mut<Count>(#Counter).0 = 0)
         Children [ @caption("Reset") ]
     }
 }

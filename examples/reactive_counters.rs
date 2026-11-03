@@ -21,12 +21,12 @@ fn counter(name: &'static str) -> impl Scene {
         Count(0)
         Children [
             Name({name})
-            // `#Counter#Counter$Count` is on the nearest `#Counter`: this one, not the other.
-            on(|_: On<Increment>| #Counter$Count.0 += 1)
+            // `$Ref<Count>(#Counter)` reads the nearest `#Counter`: this one, not the other.
+            on(|_: On<Increment>| $Mut<Count>(#Counter).0 += 1)
             --
-            Label({ format!("{name} = {}", #Counter$Count.0) })
+            Label({ format!("{name} = {}", $Ref<Count>(#Counter).0) })
             --
-            if #Counter$Count.0 >= 3 { Label("  that's a lot") }
+            if $Ref<Count>(#Counter).0 >= 3 { Label("  that's a lot") }
         ]
     }
 }
