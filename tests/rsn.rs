@@ -1,5 +1,5 @@
 #![cfg(feature = "reactive")]
-//! `rsn!`: `bsn!` with Rust control flow and `$Type` reads.
+//! `rsn!`: `bsn!` with Rust control flow and `$` reads.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::reactive::*;
@@ -105,9 +105,10 @@ fn dollar_in_a_component_value_watches_it() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(1)
             Children [
-                Label({ format!("count {}", $Count.0) })
+                Label({ format!("count {}", #Root$Count.0) })
                 --
                 Label({ format!("score {}", $Res<Score>.0) })
             ]
@@ -126,8 +127,9 @@ fn braced_components_patch_only_reactive_fields() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(3)
-            Children [ Style { width: $Count.0 as f32 * 2.0, title: "fixed" } ]
+            Children [ Style { width: #Root$Count.0 as f32 * 2.0, title: "fixed" } ]
         })
         .unwrap();
     let style = entities_with::<Style>(&mut app)[0];
@@ -153,19 +155,20 @@ fn if_else_if_else_switches_branches() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 Label("before")
                 --
-                if $Count.0 > 0 {
+                if #Root$Count.0 > 0 {
                     Label("positive")
-                } else if $Count.0 < 0 {
+                } else if #Root$Count.0 < 0 {
                     Label("negative") -- Label("really")
                 } else {
                     Label("zero")
                 }
                 --
-                if $Count.0 > 100 { Label("huge") }
+                if #Root$Count.0 > 100 { Label("huge") }
                 --
                 Label("after")
             ]
@@ -186,6 +189,7 @@ fn match_on_a_resource_with_bindings() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 match *$Res<Tab> {
@@ -220,6 +224,7 @@ fn keyed_for_keeps_rows_and_uses_the_item_more_than_once() {
     app.world_mut().resource_mut::<Todos>().0 = vec![todo(1, "a"), todo(2, "b")];
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 #[key(todo.id)]
@@ -229,7 +234,7 @@ fn keyed_for_keeps_rows_and_uses_the_item_more_than_once() {
                     Children [
                         Label({ format!("#{} {}", todo.id, todo.title) })
                         --
-                        if i64::from($Count.0) > i64::from(todo.id) { Label({ format!("done {}", todo.title) }) }
+                        if i64::from(#Root$Count.0) > i64::from(todo.id) { Label({ format!("done {}", todo.title) }) }
                     ]
                 }
             ]
@@ -256,9 +261,10 @@ fn unkeyed_and_plain_for_loops() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(2)
             Children [
-                for i in 0..$Count.0 { Label({ format!("row {i}") }) }
+                for i in 0..#Root$Count.0 { Label({ format!("row {i}") }) }
                 --
                 for name in ["x", "y"] { Label({ name.to_string() }) Row }
             ]
@@ -274,12 +280,13 @@ fn on_writes_the_nearest_component() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 #Button
-                on(|poke: On<Poke>| $Count.0 += poke.by)
+                on(|poke: On<Poke>| #Root$Count.0 += poke.by)
                 --
-                Label({ $Count.0.to_string() })
+                Label({ #Root$Count.0.to_string() })
             ]
         })
         .unwrap();
@@ -309,13 +316,13 @@ fn on_writes_the_nearest_component() {
 #[test]
 fn rsn_list_and_plain_bsn_items_mix() {
     let mut app = app();
-    let root = app.world_mut().spawn(Count(1)).id();
+    let root = app.world_mut().spawn((Name::new("Root"), Count(1))).id();
     app.world_mut()
         .entity_mut(root)
         .queue_spawn_related_scenes::<Children>(rsn_list! {
             Label("plain")
             --
-            if $Count.0 == 1 { Label("one") } else { Label("other") }
+            if #Root$Count.0 == 1 { Label("one") } else { Label("other") }
         });
     app.update();
     assert_eq!(labels(&mut app), ["plain", "one"]);
@@ -324,7 +331,7 @@ fn rsn_list_and_plain_bsn_items_mix() {
 }
 
 fn badge(text: &'static str) -> impl Scene {
-    rsn! { Label({ format!("{text} {}", $Count.0) }) }
+    rsn! { Label({ format!("{text} {}", #Root$Count.0) }) }
 }
 
 #[test]
@@ -333,6 +340,7 @@ fn scene_functions_in_arms_and_nested_rsn_in_rows() {
     let target = app.world_mut().spawn(Count(42)).id();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(1)
             Children [
                 match *$Res<Tab> {
@@ -341,8 +349,7 @@ fn scene_functions_in_arms_and_nested_rsn_in_rows() {
                 }
                 --
                 @each(move || vec![target], |&e| e, |&e| rsn! {
-                    Source({e})
-                    Label({ format!("source {}", $Count.0) })
+                    Label({ format!("source {}", $(e).Count.0) })
                 })
             ]
         })
@@ -374,6 +381,7 @@ fn for_over_a_query_tracks_membership_and_values() {
         .id();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 for task in $Query<&Task> {
@@ -415,11 +423,12 @@ fn query_rows_read_their_entity_with_dollar() {
         .id();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
-                // Entity rows: the row is never rebuilt, `$Task` reads its entity.
-                for _entity in $Query<Entity, With<Task>> {
-                    Label({ $Task.title.clone() })
+                // Entity rows: the row is never rebuilt, `$(task).Task` reads its entity.
+                for task in $Query<Entity, With<Task>> {
+                    Label({ $(task).Task.title.clone() })
                 }
             ]
         })
@@ -437,9 +446,10 @@ fn explicit_sources_entity_and_resource() {
     let player = app.world_mut().spawn((Player, Count(10))).id();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(1)
             Children [
-                Label({ format!("{} {} {}", $Count.0, $(player).Count.0, $Res<Score>.0) })
+                Label({ format!("{} {} {}", #Root$Count.0, $(player).Count.0, $Res<Score>.0) })
                 --
                 Label({ format!("single {}", $Single<&Count, With<Player>>.0) })
                 --
@@ -473,16 +483,17 @@ fn bevy_style_params_res_res_mut_and_local() {
     let mut app = app();
     app.world_mut()
         .spawn_scene(rsn! {
+            #Root
             Count(0)
             Children [
                 #Button
                 on(|poke: On<Poke>| {
                     $ResMut<Score>.0 += 1;
                     *$Local<i32> += poke.by;
-                    $Count.0 = *$Local<i32>;
+                    #Root$Count.0 = *$Local<i32>;
                 })
                 --
-                Label({ format!("{} {}", $Res<Score>.0, $Count.0) })
+                Label({ format!("{} {}", $Res<Score>.0, #Root$Count.0) })
             ]
         })
         .unwrap();
@@ -504,4 +515,49 @@ fn bevy_style_params_res_res_mut_and_local() {
         ["2 5"],
         "Local keeps its value between runs"
     );
+}
+
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Wings(u32);
+
+fn bird_counter(start: i32) -> impl Scene {
+    rsn! {
+        #Counter
+        Count({start})
+        Children [ Label({ format!("{}", #Counter$Count.0) }) ]
+    }
+}
+
+#[test]
+fn named_reads_find_the_nearest_entity_with_that_name() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                #Bird
+                Wings(2)
+                --
+                // A sibling's subtree, not an ancestor: still found.
+                Label({ format!("wings {}", #Bird$Wings.0) })
+                --
+                @bird_counter(1)
+                --
+                @bird_counter(7)
+            ]
+        })
+        .unwrap();
+    assert_eq!(
+        labels(&mut app),
+        ["wings 2", "1", "7"],
+        "each counter reads its own"
+    );
+
+    let bird = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<Wings>>();
+        query.single(world).unwrap()
+    };
+    app.world_mut().get_mut::<Wings>(bird).unwrap().0 = 4;
+    app.update();
+    assert_eq!(labels(&mut app), ["wings 4", "1", "7"]);
 }

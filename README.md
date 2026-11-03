@@ -48,7 +48,7 @@ changes; everything else runs once, when the scene spawns.**
 
 | `$` read | Reads | Example |
 | --- | --- | --- |
-| `$Type` | the nearest component `Type`: this entity, its `Source`, then its ancestors | `$Count.0` |
+| `#Name$Type` | component `Type` on the nearest entity named `#Name` (this entity and its subtree, then each ancestor and its subtree) | `#Counter$Count.0` |
 | `$(entity).Type` | `Type` on that entity (skipped while it has none) | `$(player).Health.0` |
 | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()` |
 
@@ -67,19 +67,20 @@ enum Tab { #[default] Home, Settings }
 
 fn counter() -> impl Scene {
     rsn! {
+        #Counter
         Node
-        Count(0)                                  // state; every @counter() has its own
+        Count(0)                                          // state; every @counter() has its own
         Children [
             Button
-            on(|_: On<Activate>| $Count.0 += 1)  // writes the nearest Count
+            on(|_: On<Activate>| #Counter$Count.0 += 1)  // writes this counter's Count
             --
-            Text({ $Count.0.to_string() })        // re-renders when it changes
+            Text({ #Counter$Count.0.to_string() })        // re-renders when it changes
             --
             Text({ format!("{} enemies", $Query<(), With<Enemy>>.iter().count()) })
             --
-            if $Count.0 > 10 {
+            if #Counter$Count.0 > 10 {
                 Text("That's a lot")
-            } else if $Count.0 < 0 {
+            } else if #Counter$Count.0 < 0 {
                 Text("Negative")
             }
         ]
@@ -113,7 +114,7 @@ fn app_body() -> impl Scene {
 | --- | --- |
 | `Comp(.. $ ..)` | a `watch` that rebuilds `Comp` |
 | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
-| `on(\|e: On<E>\| .. $ ..)` | a handler; `$Type` and `$(e).Type` are writable (`$Count.0 += 1`) |
+| `on(\|e: On<E>\| .. $ ..)` | a handler; `#Name$Type`, `$(e).Type` and `$ResMut<T>` are writable (`#Counter$Count.0 += 1`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
 | `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
@@ -123,9 +124,8 @@ fn app_body() -> impl Scene {
 
 - `for pat in $Query<D, F>` keeps one row per entity. `pat` binds an owned copy of
   the item (`&T` becomes `T`), and the row is rebuilt when it changes, so `T` needs
-  `Clone + PartialEq`. Each row also gets `Source(entity)`, so `$Type` inside it reads
-  the row's entity: loop over `$Query<Entity, With<T>>` and read `$T` to update rows
-  in place instead.
+  `Clone + PartialEq`. To update rows in place instead, loop over entities and read
+  them: `for e in $Query<Entity, With<Todo>> { Text({ $(e).Todo.title.clone() }) }`.
 - Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
@@ -174,7 +174,7 @@ bsn! {
 - Outside scenes, attach templates with `commands.entity(e).react(watch(..))` and
   spawn regions like any scene: `commands.spawn_scene(when(..))`.
 - For list rows that update in place, list entities and give each row
-  `Source({entity})`; `$Todo` in the row then reads that entity's `Todo`.
+  `Source({entity})`; `Ref<Todo>` in the row then reads that entity's `Todo`.
 - Reactions are entities linked to the entity that declared them (`ReactionOf`), so
   they despawn with it, and replacing a branch despawns everything it declared. Use
   Bevy's `on(|_: On<Despawn>| ..)` for cleanup code.
@@ -504,19 +504,20 @@ fn sync_reset_button(count: Res<Count>, mut buttons: Query<&mut Node, With<Reset
 ### `reactive`
 
 The count is a component on the counter's root, so each counter has its own.
-`$Count` is the nearest one, and the `if` owns the Reset button:
+`#Counter$Count` reads it, and the `if` owns the Reset button:
 
 ```rust,ignore
 rsn! {
+    #Counter
     Count(0)
     // ...
-    on(|_: On<Activate>| $Count.0 += 1)
+    on(|_: On<Activate>| #Counter$Count.0 += 1)
     // ...
-    Text({ $Count.0.to_string() })
+    Text({ #Counter$Count.0.to_string() })
     // ...
-    if $Count.0 != 0 {
+    if #Counter$Count.0 != 0 {
         @FeathersButton
-        on(|_: On<Activate>| $Count.0 = 0)
+        on(|_: On<Activate>| #Counter$Count.0 = 0)
         Children [ @caption("Reset") ]
     }
 }

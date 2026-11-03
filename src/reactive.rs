@@ -13,7 +13,7 @@
 //!
 //! | `$` read | Reads |
 //! | --- | --- |
-//! | `$Type` | the nearest component `Type`: this entity, its [`Source`], then its ancestors |
+//! | `#Name$Type` | component `Type` on the nearest entity named `#Name`: this entity and its subtree, then each ancestor and its subtree |
 //! | `$(entity).Type` | `Type` on that entity; skipped while it has none |
 //! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as in a Bevy system |
 //!
@@ -26,15 +26,16 @@
 //!
 //! fn counter() -> impl Scene {
 //!     rsn! {
+//!         #Counter
 //!         Node
-//!         Count(0)                                 // state, local to this counter
+//!         Count(0)                                         // state, local to this counter
 //!         Children [
 //!             Button
-//!             on(|_: On<Activate>| $Count.0 += 1) // writes the nearest Count
+//!             on(|_: On<Activate>| #Counter$Count.0 += 1) // writes it
 //!             --
-//!             Text({ $Count.0.to_string() })       // re-renders when it changes
+//!             Text({ #Counter$Count.0.to_string() })       // re-renders when it changes
 //!             --
-//!             if $Count.0 > 10 { Text("That's a lot") } else { Text("Keep going") }
+//!             if #Counter$Count.0 > 10 { Text("That's a lot") } else { Text("Keep going") }
 //!             --
 //!             for todo in $Query<&Todo> { Text({ todo.title.clone() }) }
 //!         ]
@@ -50,7 +51,7 @@
 //! | --- | --- |
 //! | `Comp(.. $ ..)` | a [`watch`] that rebuilds `Comp` |
 //! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
-//! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; `$Type` and `$(e).Type` are writable |
+//! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; `#Name$Type`, `$(e).Type` and `$ResMut<T>` are writable |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
 //! | `for pat in $Query<D, F> { .. }` | an [`each`] region with one row per entity |
@@ -59,9 +60,8 @@
 //! | anything else | passed to `bsn!` unchanged |
 //!
 //! A `$Query` loop binds an owned copy of each item (`&T` becomes `T`, which
-//! needs `Clone + PartialEq`) and rebuilds a row when it changes. Each row
-//! gets `Source(entity)`, so `$Type` inside it reads the row's entity; loop
-//! over `$Query<Entity, With<T>>` and read `$T` to update rows in place.
+//! needs `Clone + PartialEq`) and rebuilds a row when it changes. Loop over
+//! `$Query<Entity, With<T>>` and read `$(entity).T` to update rows in place.
 //! Other loops need owned items that implement `PartialEq`. Loop and match
 //! bindings may be used any number of times. [`rsn_list!`] is the list form.
 //!
@@ -1728,7 +1728,7 @@ pub mod __private {
     };
     pub use bevy::scene::{bsn, bsn_list};
 
-    use super::{Cx, Input, IntoReader, Reader};
+    use super::{Cx, Disabled, Input, IntoReader, Reader};
     use bevy::prelude::*;
     use std::marker::PhantomData;
 
@@ -1768,6 +1768,38 @@ pub mod __private {
 
         fn read(&mut self, world: &mut World, cx: &Cx) -> Option<V> {
             self.0.read(world, cx).flatten()
+        }
+    }
+
+    /// Finds `#Name`d entities for `#Name$Type`: the start entity and its
+    /// subtree, then each ancestor and its subtree.
+    #[allow(non_camel_case_types)]
+    #[derive(bevy::ecs::system::SystemParam)]
+    pub struct __rsn_Names<'w, 's> {
+        names: Query<'w, 's, &'static Name, Allow<Disabled>>,
+        parents: Query<'w, 's, &'static ChildOf, Allow<Disabled>>,
+        children: Query<'w, 's, &'static Children, Allow<Disabled>>,
+    }
+
+    impl __rsn_Names<'_, '_> {
+        /// The nearest entity named `name`, or `Entity::PLACEHOLDER`.
+        pub fn find(&self, start: Entity, name: &str) -> Entity {
+            let mut current = Some(start);
+            let mut skip = None;
+            while let Some(entity) = current {
+                let mut queue = std::collections::VecDeque::from([entity]);
+                while let Some(next) = queue.pop_front() {
+                    if self.names.get(next).is_ok_and(|n| n.as_str() == name) {
+                        return next;
+                    }
+                    if let Ok(children) = self.children.get(next) {
+                        queue.extend(children.iter().filter(|&c| Some(c) != skip));
+                    }
+                }
+                skip = Some(entity);
+                current = self.parents.get(entity).ok().map(ChildOf::parent);
+            }
+            Entity::PLACEHOLDER
         }
     }
 
@@ -1824,21 +1856,4 @@ pub mod __private {
     impl_own!(A, B, C, D);
     impl_own!(A, B, C, D, E);
     impl_own!(A, B, C, D, E, F);
-}
-
-// `bsn!` checks that its call site's source text starts with `bsn!`. These
-// wrappers give it that call site when invoked from `rsn!` output. `bsn` and
-// `bsn_list` resolve through `__private`, which `rsn!` output glob-imports.
-// The body is passed as one braced group so punctuation keeps its spacing.
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __rsn_bsn {
-    ($body:tt) => { bsn! $body };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __rsn_bsn_list {
-    ($body:tt) => { bsn_list! $body };
 }

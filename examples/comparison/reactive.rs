@@ -3,9 +3,9 @@
 //! Plain Bevy version: `comparison_bevy`.
 //!
 //! `Count` lives on the counter's root node, so every `@counter()` has its
-//! own. `$Count` is the nearest `Count`: buttons write it in `on(..)`, the
-//! label re-renders when it changes, and the Reset button exists only while
-//! the count is not zero.
+//! own. `#Counter$Count` reads it from the nearest `#Counter`: buttons
+//! write it in `on(..)`, the label re-renders when it changes, and the Reset
+//! button exists only while the count is not zero.
 
 use bevy::{
     feathers::{
@@ -39,6 +39,7 @@ fn scene() -> impl SceneList {
 
 fn counter() -> impl Scene {
     rsn! {
+        #Counter
         Count(0)
         Node {
             width: percent(100),
@@ -55,25 +56,25 @@ fn counter() -> impl Scene {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $Count.0 -= 1)
+                on(|_: On<Activate>| #Counter$Count.0 -= 1)
                 Children [ @caption("-1") ]
                 --
-                Text({ $Count.0.to_string() })
+                Text({ #Counter$Count.0.to_string() })
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $Count.0 += 1)
+                on(|_: On<Activate>| #Counter$Count.0 += 1)
                 Children [ @caption("+1") ]
             ]
             --
-            if $Count.0 != 0 {
+            if #Counter$Count.0 != 0 {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $Count.0 = 0)
+                on(|_: On<Activate>| #Counter$Count.0 = 0)
                 Children [ @caption("Reset") ]
             }
         ]

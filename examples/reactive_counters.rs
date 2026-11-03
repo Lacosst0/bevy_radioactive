@@ -17,15 +17,16 @@ struct Increment {
 
 fn counter(name: &'static str) -> impl Scene {
     rsn! {
+        #Counter
         Count(0)
         Children [
             Name({name})
-            // `$Count` is the nearest `Count`: this counter's, not the other one's.
-            on(|_: On<Increment>| $Count.0 += 1)
+            // `#Counter#Counter$Count` is on the nearest `#Counter`: this one, not the other.
+            on(|_: On<Increment>| #Counter$Count.0 += 1)
             --
-            Label({ format!("{name} = {}", $Count.0) })
+            Label({ format!("{name} = {}", #Counter$Count.0) })
             --
-            if $Count.0 >= 3 { Label("  that's a lot") }
+            if #Counter$Count.0 >= 3 { Label("  that's a lot") }
         ]
     }
 }
