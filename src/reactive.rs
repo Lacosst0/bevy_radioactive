@@ -61,7 +61,7 @@
 //! | [`watch`] | re-run a closure on change; a returned component or bundle is inserted |
 //! | [`handle`] | run a closure when an entity event reaches this entity |
 //! | `@`[`when`]`(cond, then)` | show entities while a condition holds |
-//! | `@`[`r#if`]`(cond, then, otherwise)` | `if`/`else`; also named [`if_else`] |
+//! | `@r#if(cond, then, otherwise)` | `if`/`else`; also named [`if_else`] |
 //! | `@`[`switch`]`(key, render)` | show entities for the current value of a key (`match`) |
 //! | `@`[`each`]`(items, key, row)` | show entities per item, keyed |
 //! | `@`[`each_indexed`]`(items, row)` | show entities per item, by position |
@@ -1252,7 +1252,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// A region: the scene of an entity whose children are reactive content.
-/// Made by [`when`], [`if`](r#if), [`switch`], [`each`] and
+/// Made by [`when`], `r#if`, [`if_else`], [`switch`], [`each`] and
 /// [`each_indexed`], and included in `bsn!` with `@`.
 #[must_use = "include it in a scene with `@`, such as `Children [ @when(..) ]`"]
 pub struct RegionScene(BodyFactory);
@@ -1396,7 +1396,7 @@ where
     }))
 }
 
-/// [`if`](r#if) under a name that needs no `r#`: `@if_else(cond, then, otherwise)`.
+/// `r#if` under a name that needs no `r#`: `@if_else(cond, then, otherwise)`.
 pub fn if_else<M, C, L1, T, L2, E>(condition: C, then: T, otherwise: E) -> RegionScene
 where
     C: IntoReader<M, Output = bool> + Clone,
