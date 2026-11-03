@@ -26,7 +26,7 @@ struct Label(String);
 fn todo_list() -> impl Scene {
     rsn! {
         Children [
-            match *$Filter {
+            match *$Res<Filter> {
                 Filter::All => Label("Showing all"),
                 Filter::Open => Label("Showing open"),
             }
@@ -36,7 +36,7 @@ fn todo_list() -> impl Scene {
             // One row per todo entity, kept while it matches. `$Todo` in a row
             // reads that row's entity, so edits update the row in place.
             for _todo in $Query<Entity, With<Todo>> {
-                if *$Filter == Filter::All || !$Todo.done {
+                if *$Res<Filter> == Filter::All || !$Todo.done {
                     Label({ format!("[{}] {}", if $Todo.done { "x" } else { " " }, $Todo.title) })
                 }
             }

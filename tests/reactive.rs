@@ -154,9 +154,9 @@ fn ref_finds_the_nearest_ancestor_and_counters_stay_independent() {
 }
 
 #[test]
-fn ref_falls_back_to_the_resource() {
+fn ref_reads_components_and_res_reads_resources() {
     let mut app = app();
-    let label = app
+    let component = app
         .world_mut()
         .spawn_scene(bsn! {
             Label
@@ -164,9 +164,22 @@ fn ref_falls_back_to_the_resource() {
         })
         .unwrap()
         .id();
+    let resource = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Label
+            watch(|score: Res<Score>| Label(format!("{}", score.0)))
+        })
+        .unwrap()
+        .id();
     app.world_mut().resource_mut::<Score>().0 = 3;
     app.update();
-    assert_eq!(label_of(&app, label), "3");
+    assert_eq!(
+        label_of(&app, component),
+        "",
+        "a resource isn't a nearest component"
+    );
+    assert_eq!(label_of(&app, resource), "3");
 }
 
 #[test]

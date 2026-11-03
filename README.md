@@ -48,9 +48,9 @@ changes; everything else runs once, when the scene spawns.**
 
 | `$` read | Reads | Example |
 | --- | --- | --- |
-| `$Type` | the nearest `Type`: this entity, its `Source`, its ancestors, then resource `Type` | `$Count.0` |
+| `$Type` | the nearest component `Type`: this entity, its `Source`, then its ancestors | `$Count.0` |
 | `$(entity).Type` | `Type` on that entity (skipped while it has none) | `$(player).Health.0` |
-| `$Res<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, exactly as written | `$Query<&Enemy>.iter().count()` |
+| `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()` |
 
 ```rust,ignore
 use bevy::{prelude::*, ui_widgets::Activate};
@@ -90,7 +90,7 @@ fn app_body() -> impl Scene {
     rsn! {
         Node
         Children [
-            match *$Tab {
+            match *$Res<Tab> {
                 Tab::Home => @counter(),
                 Tab::Settings => Text("Settings"),
             }
@@ -126,7 +126,7 @@ fn app_body() -> impl Scene {
   `Clone + PartialEq`. Each row also gets `Source(entity)`, so `$Type` inside it reads
   the row's entity: loop over `$Query<Entity, With<T>>` and read `$T` to update rows
   in place instead.
-- Other `for` loops need owned items (`$Todos.0.clone()`, a range, a `Vec`) that
+- Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
@@ -151,7 +151,7 @@ bsn! {
 
 | In a closure | Re-runs it? | Meaning |
 | --- | --- | --- |
-| `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest `T`: this entity, its `Source`, its ancestors, then resource `T` |
+| `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest component `T`: this entity, its `Source`, then its ancestors |
 | `Res<T>` / `Option<Res<T>>` | yes | resource `T` |
 | `Query`, `Single`, `Populated` | yes | when a component they read or filter on changes, is added or removed |
 | `c: &mut C` | no | the nearest `C`, written in place |

@@ -13,9 +13,9 @@
 //!
 //! | `$` read | Reads |
 //! | --- | --- |
-//! | `$Type` | the nearest `Type`: this entity, its [`Source`], its ancestors, then resource `Type` |
+//! | `$Type` | the nearest component `Type`: this entity, its [`Source`], then its ancestors |
 //! | `$(entity).Type` | `Type` on that entity; skipped while it has none |
-//! | `$Res<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as written |
+//! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as in a Bevy system |
 //!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};
@@ -81,7 +81,7 @@
 //!
 //! | In a closure | Re-runs it? | Meaning |
 //! | --- | --- | --- |
-//! | `c: Ref<T>` | yes | the nearest `T`: this entity, its [`Source`], its ancestors, then resource `T` |
+//! | `c: Ref<T>` | yes | the nearest component `T`: this entity, its [`Source`], then its ancestors |
 //! | `c: Option<Ref<T>>` | yes | the same, `None` while there is none |
 //! | `Res<T>`, `Option<Res<T>>` | yes | resource `T` |
 //! | `Query<D, F>`, `Single<D, F>`, `Populated<D, F>` | yes | re-runs when a component it reads or filters on changes, is added or is removed on any entity |
@@ -258,7 +258,7 @@ struct Reaction {
 /// Where an input is looked up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lookup {
-    /// This entity, its `Source`, its ancestors, then the resource.
+    /// This entity, its `Source`, then its ancestors.
     Nearest,
     /// The resource.
     Resource,
@@ -287,7 +287,7 @@ fn resolve(world: &World, host: Entity, id: ComponentId, lookup: Lookup) -> Opti
     match lookup {
         Lookup::Any => None,
         Lookup::Resource => world.resource_entities().get(id),
-        Lookup::Nearest => nearest(world, host, id).or_else(|| world.resource_entities().get(id)),
+        Lookup::Nearest => nearest(world, host, id),
     }
 }
 
@@ -1661,7 +1661,7 @@ where
 
 /// Finds the nearest entity matching `D` from ordinary systems and
 /// observers, the way reactive closures find `Ref<T>`: the entity itself,
-/// its [`Source`], its ancestors, then a resource.
+/// its [`Source`], then its ancestors.
 ///
 /// ```ignore
 /// on(|click: On<Activate>, mut counts: Nearest<&mut Count>| {
@@ -1673,23 +1673,16 @@ where
 #[derive(SystemParam)]
 pub struct Nearest<'w, 's, D: QueryData + 'static> {
     entities: Query<'w, 's, D, (Allow<Disabled>, Without<IsResource>)>,
-    resources: Query<'w, 's, D, With<IsResource>>,
     links: Query<'w, 's, (Option<&'static ChildOf>, Option<&'static Source>), Allow<Disabled>>,
 }
 
-/// Where [`Nearest`] found its match.
-enum Found {
-    Entity(Entity),
-    Resource,
-}
-
 impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
-    fn find(&self, start: Entity) -> Option<Found> {
+    fn find(&self, start: Entity) -> Option<Entity> {
         let mut current = Some(start);
         let mut steps = 0;
         while let Some(entity) = current {
             if self.entities.contains(entity) {
-                return Some(Found::Entity(entity));
+                return Some(entity);
             }
             let Ok((parent, source)) = self.links.get(entity) else {
                 break;
@@ -1697,7 +1690,7 @@ impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
             if let Some(&Source(source)) = source
                 && self.entities.contains(source)
             {
-                return Some(Found::Entity(source));
+                return Some(source);
             }
             current = parent.map(ChildOf::parent);
             steps += 1;
@@ -1705,33 +1698,25 @@ impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
                 break;
             }
         }
-        (!self.resources.is_empty()).then_some(Found::Resource)
+        None
     }
 
-    /// The nearest entity matching `D`, if it isn't a resource.
+    /// The nearest entity matching `D`.
     #[must_use]
     pub fn entity(&self, start: Entity) -> Option<Entity> {
-        match self.find(start)? {
-            Found::Entity(entity) => Some(entity),
-            Found::Resource => None,
-        }
+        self.find(start)
     }
 
     /// The nearest match for `start`, read-only.
     #[must_use]
     pub fn get(&self, start: Entity) -> Option<bevy::ecs::query::ROQueryItem<'_, 's, D>> {
-        match self.find(start)? {
-            Found::Entity(entity) => self.entities.get(entity).ok(),
-            Found::Resource => self.resources.single().ok(),
-        }
+        self.entities.get(self.find(start)?).ok()
     }
 
     /// The nearest match for `start`.
     pub fn get_mut(&mut self, start: Entity) -> Option<D::Item<'_, 's>> {
-        match self.find(start)? {
-            Found::Entity(entity) => self.entities.get_mut(entity).ok(),
-            Found::Resource => self.resources.single_mut().ok(),
-        }
+        let entity = self.find(start)?;
+        self.entities.get_mut(entity).ok()
     }
 }
 

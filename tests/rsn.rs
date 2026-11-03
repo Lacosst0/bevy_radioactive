@@ -109,7 +109,7 @@ fn dollar_in_a_component_value_watches_it() {
             Children [
                 Label({ format!("count {}", $Count.0) })
                 --
-                Label({ format!("score {}", $Score.0) })
+                Label({ format!("score {}", $Res<Score>.0) })
             ]
         })
         .unwrap();
@@ -188,7 +188,7 @@ fn match_on_a_resource_with_bindings() {
         .spawn_scene(rsn! {
             Count(0)
             Children [
-                match *$Tab {
+                match *$Res<Tab> {
                     Tab::Home => Label("home"),
                     Tab::Settings => { Label("settings") -- Label("more") }
                     Tab::Profile(id) => Label({ format!("profile {id}") }) Row,
@@ -223,7 +223,7 @@ fn keyed_for_keeps_rows_and_uses_the_item_more_than_once() {
             Count(0)
             Children [
                 #[key(todo.id)]
-                for todo in $Todos.0.clone() {
+                for todo in $Res<Todos>.0.clone() {
                     Row
                     Label({ todo.title.clone() })
                     Children [
@@ -335,7 +335,7 @@ fn scene_functions_in_arms_and_nested_rsn_in_rows() {
         .spawn_scene(rsn! {
             Count(1)
             Children [
-                match *$Tab {
+                match *$Res<Tab> {
                     Tab::Home => @badge("home"),
                     _ => Label("other"),
                 }
@@ -466,4 +466,42 @@ fn explicit_sources_entity_and_resource() {
     app.world_mut().resource_mut::<Score>().0 = 3;
     app.update();
     assert_eq!(labels(&mut app), ["1 15 3", "single 15"]);
+}
+
+#[test]
+fn bevy_style_params_res_res_mut_and_local() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Count(0)
+            Children [
+                #Button
+                on(|poke: On<Poke>| {
+                    $ResMut<Score>.0 += 1;
+                    *$Local<i32> += poke.by;
+                    $Count.0 = *$Local<i32>;
+                })
+                --
+                Label({ format!("{} {}", $Res<Score>.0, $Count.0) })
+            ]
+        })
+        .unwrap();
+    let button = {
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &Name)>();
+        query
+            .iter(world)
+            .find(|(_, name)| name.as_str() == "Button")
+            .unwrap()
+            .0
+    };
+    for by in [2, 3] {
+        app.world_mut().trigger(Poke { entity: button, by });
+    }
+    app.update();
+    assert_eq!(
+        labels(&mut app),
+        ["2 5"],
+        "Local keeps its value between runs"
+    );
 }
