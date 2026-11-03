@@ -8,9 +8,14 @@
 //! what it writes.
 //!
 //! Scenes are usually written with [`rsn!`]: `bsn!` plus Rust control flow
-//! and `$Type`, "the nearest `Type`" (this entity, its [`Source`], its
-//! ancestors, then resource `Type`). Whatever reads a `$Type` re-runs when it
-//! changes.
+//! and `$` reads. Whatever contains a `$` re-runs when what it read changes;
+//! everything else runs once, when the scene spawns.
+//!
+//! | `$` read | Reads |
+//! | --- | --- |
+//! | `$Type` | the nearest `Type`: this entity, its [`Source`], its ancestors, then resource `Type` |
+//! | `$(entity).Type` | `Type` on that entity; skipped while it has none |
+//! | `$Res<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as written |
 //!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};
@@ -31,8 +36,7 @@
 //!             --
 //!             if $Count.0 > 10 { Text("That's a lot") } else { Text("Keep going") }
 //!             --
-//!             #[key(todo.id)]
-//!             for todo in $Todos.0.clone() { Text({ todo.title.clone() }) }
+//!             for todo in $Query<&Todo> { Text({ todo.title.clone() }) }
 //!         ]
 //!     }
 //! }
@@ -44,22 +48,25 @@
 //!
 //! | In `rsn!` | Becomes |
 //! | --- | --- |
-//! | `Comp(.. $T ..)` | a [`watch`] that rebuilds `Comp` when `T` changes |
-//! | `Comp { a: .. $T .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
-//! | `on(\|e: On<E>\| .. $T ..)` | a [`handle`]r where `$T` is the nearest `T`, writable |
+//! | `Comp(.. $ ..)` | a [`watch`] that rebuilds `Comp` |
+//! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
+//! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; `$Type` and `$(e).Type` are writable |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
+//! | `for pat in $Query<D, F> { .. }` | an [`each`] region with one row per entity |
 //! | `#[key(expr)] for pat in iter { .. }` | an [`each`] region, keyed |
 //! | `for pat in iter { .. }` | an [`each_indexed`] region |
 //! | anything else | passed to `bsn!` unchanged |
 //!
-//! Without `$`, `if`/`match`/`for` run once. `for` needs owned items that
-//! implement `PartialEq`. Loop and match bindings may be used any number of
-//! times in the body. [`rsn_list!`] is the list form.
+//! A `$Query` loop binds an owned copy of each item (`&T` becomes `T`, which
+//! needs `Clone + PartialEq`) and rebuilds a row when it changes. Each row
+//! gets `Source(entity)`, so `$Type` inside it reads the row's entity; loop
+//! over `$Query<Entity, With<T>>` and read `$T` to update rows in place.
+//! Other loops need owned items that implement `PartialEq`. Loop and match
+//! bindings may be used any number of times. [`rsn_list!`] is the list form.
 //!
 //! The functions it expands to are public and take closures with ordinary
-//! Bevy system parameters; use them in `bsn!` or plain Rust, and for inputs
-//! `$Type` doesn't cover, such as a `Query`:
+//! Bevy system parameters; use them in `bsn!` or plain Rust:
 //!
 //! ```ignore
 //! bsn! {
@@ -1735,6 +1742,103 @@ pub mod __private {
         switch as __rsn_switch, watch as __rsn_watch,
     };
     pub use bevy::scene::{bsn, bsn_list};
+
+    use super::{Cx, Input, IntoReader, Reader};
+    use bevy::prelude::*;
+    use std::marker::PhantomData;
+
+    /// A reader closure returning `Option<V>`, read as one returning `V`
+    /// that skips its run on `None`. Used for `$(entity).Type`.
+    pub struct Skip<F, M>(F, PhantomData<fn() -> M>);
+
+    impl<F: Clone, M> Clone for Skip<F, M> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone(), PhantomData)
+        }
+    }
+
+    pub fn __rsn_skip<M, F: IntoReader<M>>(f: F) -> Skip<F, M> {
+        Skip(f, PhantomData)
+    }
+
+    pub struct SkipMarker<M>(PhantomData<fn() -> M>);
+
+    impl<M: 'static, V: 'static, F> IntoReader<SkipMarker<M>> for Skip<F, M>
+    where
+        F: IntoReader<M, Output = Option<V>>,
+    {
+        type Output = V;
+
+        fn into_reader(self) -> Box<dyn Reader<V>> {
+            Box::new(SkipReader(self.0.into_reader()))
+        }
+    }
+
+    struct SkipReader<V>(Box<dyn Reader<Option<V>>>);
+
+    impl<V> Reader<V> for SkipReader<V> {
+        fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
+            self.0.inputs(world, inputs);
+        }
+
+        fn read(&mut self, world: &mut World, cx: &Cx) -> Option<V> {
+            self.0.read(world, cx).flatten()
+        }
+    }
+
+    /// An owned copy of a query item, for `for x in $Query<D> { .. }` rows.
+    #[allow(non_camel_case_types)]
+    pub trait __rsn_Own {
+        type Owned: Clone + PartialEq + Send + Sync + 'static;
+        fn __rsn_own(self) -> Self::Owned;
+    }
+
+    impl __rsn_Own for Entity {
+        type Owned = Entity;
+        fn __rsn_own(self) -> Entity {
+            self
+        }
+    }
+
+    impl<T: Clone + PartialEq + Send + Sync + 'static> __rsn_Own for &T {
+        type Owned = T;
+        fn __rsn_own(self) -> T {
+            self.clone()
+        }
+    }
+
+    impl<T: Component + Clone + PartialEq> __rsn_Own for Ref<'_, T> {
+        type Owned = T;
+        fn __rsn_own(self) -> T {
+            (*self).clone()
+        }
+    }
+
+    impl<A: __rsn_Own> __rsn_Own for Option<A> {
+        type Owned = Option<A::Owned>;
+        fn __rsn_own(self) -> Self::Owned {
+            self.map(A::__rsn_own)
+        }
+    }
+
+    macro_rules! impl_own {
+        ($($t:ident),*) => {
+            #[allow(non_snake_case, reason = "the bindings are type names")]
+            impl<$($t: __rsn_Own),*> __rsn_Own for ($($t,)*) {
+                type Owned = ($($t::Owned,)*);
+                fn __rsn_own(self) -> Self::Owned {
+                    let ($($t,)*) = self;
+                    ($($t.__rsn_own(),)*)
+                }
+            }
+        };
+    }
+    impl_own!(A);
+    impl_own!(A, B);
+    impl_own!(A, B, C);
+    impl_own!(A, B, C, D);
+    impl_own!(A, B, C, D, E);
+    impl_own!(A, B, C, D, E, F);
 }
 
 // `bsn!` checks that its call site's source text starts with `bsn!`. These

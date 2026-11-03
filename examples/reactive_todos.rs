@@ -1,8 +1,8 @@
 //! A keyed list of todo entities, a filter switch, and an empty state.
 //!
-//! Each todo is an entity. The list is keyed by entity, and each row reads
-//! its todo through `Source`, so editing a todo patches its row instead of
-//! rebuilding it.
+//! Each todo is an entity. `for _ in $Query<..>` keeps one row per todo
+//! entity, and `$Todo` inside a row reads that entity, so editing a todo
+//! patches its row instead of rebuilding it.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::reactive::*;
@@ -31,27 +31,15 @@ fn todo_list() -> impl Scene {
                 Filter::Open => Label("Showing open"),
             }
             --
-            // Closures with any system parameter work alongside `$`: here a
-            // `Query` that re-runs when todos spawn or despawn.
-            @when(|todos: Query<(), With<Todo>>| todos.is_empty(), || bsn! { Label("Nothing to do") })
+            if $Query<(), With<Todo>>.is_empty() { Label("Nothing to do") }
             --
-            @each(
-                |todos: Query<(Entity, &Todo)>, filter: Res<Filter>| {
-                    let mut rows: Vec<Entity> = todos
-                        .iter()
-                        .filter(|(_, todo)| *filter == Filter::All || !todo.done)
-                        .map(|(entity, _)| entity)
-                        .collect();
-                    rows.sort();
-                    rows
-                },
-                |&todo| todo,
-                // `Source` makes `$Todo` this row's todo entity.
-                |&todo| rsn! {
-                    Source({todo})
+            // One row per todo entity, kept while it matches. `$Todo` in a row
+            // reads that row's entity, so edits update the row in place.
+            for _todo in $Query<Entity, With<Todo>> {
+                if *$Filter == Filter::All || !$Todo.done {
                     Label({ format!("[{}] {}", if $Todo.done { "x" } else { " " }, $Todo.title) })
-                },
-            )
+                }
+            }
         ]
     }
 }

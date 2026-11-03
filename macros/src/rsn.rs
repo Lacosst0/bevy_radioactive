@@ -148,35 +148,183 @@ fn bindings(pattern: &[TokenTree]) -> Vec<Ident> {
 // `$Type` reads
 // ---------------------------------------------------------------------------
 
-/// The `$Type`s an expression reads, one parameter per type.
+/// Where a `$` read comes from.
+enum Kind {
+    /// `$Type`: the nearest `Type`.
+    Nearest,
+    /// `$Res<T>`, `$Query<..>`, ..: that system parameter, as written.
+    Exact,
+    /// `$(entity).Type`: `Type` on that entity.
+    Entity(TokenStream),
+}
+
+struct Param {
+    key: String,
+    name: Ident,
+    ty: TokenStream,
+    kind: Kind,
+}
+
+/// The `$` reads of one closure, one parameter per distinct read.
 #[derive(Default)]
-struct Params(Vec<(String, Ident, TokenStream)>);
+struct Params(Vec<Param>);
 
 impl Params {
-    fn param(&mut self, path: &[TokenTree]) -> Ident {
-        let key = stream(path).to_string();
-        if let Some((_, name, _)) = self.0.iter().find(|(k, _, _)| *k == key) {
-            return name.clone();
+    fn param(&mut self, ty: &[TokenTree], kind: Kind) -> Ident {
+        let key = match &kind {
+            Kind::Nearest => stream(ty).to_string(),
+            Kind::Exact => format!("exact {}", stream(ty)),
+            Kind::Entity(entity) => format!("({entity}).{}", stream(ty)),
+        };
+        if let Some(param) = self.0.iter().find(|p| p.key == key) {
+            return param.name.clone();
         }
         let name = format_ident!("__rsn_{}", self.0.len());
-        self.0.push((key, name.clone(), stream(path)));
+        self.0.push(Param {
+            key,
+            name: name.clone(),
+            ty: stream(ty),
+            kind,
+        });
         name
     }
 
-    /// `name: Ref<Type>, ..`
-    fn readers(&self) -> TokenStream {
-        let params = self
-            .0
-            .iter()
-            .map(|(_, name, ty)| quote!(#name: ::bevy::prelude::Ref<#ty>));
-        quote!(#(#params),*)
+    fn by_entity(&self) -> bool {
+        self.0.iter().any(|p| matches!(p.kind, Kind::Entity(_)))
     }
 
-    /// `name: &mut Type, ..`
-    fn writers(&self) -> TokenStream {
-        let params = self.0.iter().map(|(_, name, ty)| quote!(#name: &mut #ty));
-        quote!(#(#params),*)
+    /// Closure parameters, ending with a comma when not empty.
+    fn closure_params(&self, write: bool) -> TokenStream {
+        let mut out = TokenStream::new();
+        for (index, param) in self.0.iter().enumerate() {
+            let Param { name, ty, kind, .. } = param;
+            match (kind, write) {
+                (Kind::Nearest, false) => quote!(#name: ::bevy::prelude::Ref<#ty>,),
+                (Kind::Nearest, true) => quote!(#name: &mut #ty,),
+                (Kind::Exact, _) => quote!(#[allow(unused_mut)] mut #name: #ty,),
+                (Kind::Entity(_), false) => {
+                    let query = format_ident!("__rsn_q{index}");
+                    quote!(#query: ::bevy::prelude::Query<::bevy::prelude::Ref<#ty>>,)
+                }
+                (Kind::Entity(_), true) => {
+                    let query = format_ident!("__rsn_q{index}");
+                    quote!(mut #query: ::bevy::prelude::Query<&mut #ty>,)
+                }
+            }
+            .to_tokens(&mut out);
+        }
+        out
     }
+
+    /// Looks up `$(entity).Type` reads; a reader skips its run while one is
+    /// missing, a handler does nothing.
+    fn lookups(&self, write: bool) -> TokenStream {
+        let mut out = TokenStream::new();
+        for (index, param) in self.0.iter().enumerate() {
+            let Kind::Entity(entity) = &param.kind else {
+                continue;
+            };
+            let name = &param.name;
+            let query = format_ident!("__rsn_q{index}");
+            if write {
+                quote!(let ::core::result::Result::Ok(mut #name) = #query.get_mut(#entity) else { return; };)
+            } else {
+                quote!(let #name = ::core::result::Result::ok(#query.get(#entity))?;)
+            }
+            .to_tokens(&mut out);
+        }
+        out
+    }
+
+    /// A reader closure: `move |params| -> ret { body }`, wrapped so it
+    /// skips runs while a `$(entity).Type` is missing.
+    fn reader(
+        &self,
+        extra: TokenStream,
+        ret: Option<TokenStream>,
+        body: TokenStream,
+    ) -> TokenStream {
+        let params = self.closure_params(false);
+        if !self.by_entity() {
+            let ret = ret.map(|ret| quote!(-> #ret));
+            return quote!(move |#params #extra| #ret { #body });
+        }
+        let lookups = self.lookups(false);
+        let ret = ret.unwrap_or_else(|| quote!(_));
+        let skip = private("skip");
+        quote! {
+            #skip(move |#params #extra| -> ::core::option::Option<#ret> {
+                #lookups
+                ::core::option::Option::Some({ #body })
+            })
+        }
+    }
+}
+
+/// Parses a `$` read at `tokens[i]` (the `$`): returns the parameter name
+/// and the index after the read.
+fn dollar(tokens: &[TokenTree], i: usize, params: &mut Params) -> Result<(Ident, usize), Span> {
+    let span = tokens[i].span();
+    let mut j = i + 1;
+    // `$(entity).Type`
+    let entity = match tokens.get(j) {
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+            if !is_punct(tokens.get(j + 1), '.') {
+                return Err(g.span());
+            }
+            j += 2;
+            Some(g.stream())
+        }
+        _ => None,
+    };
+    let start = j;
+    if is_punct(tokens.get(j), ':') && is_punct(tokens.get(j + 1), ':') {
+        j += 2;
+    }
+    loop {
+        if !matches!(tokens.get(j), Some(TokenTree::Ident(_))) {
+            break;
+        }
+        j += 1;
+        if is_punct(tokens.get(j), ':')
+            && is_punct(tokens.get(j + 1), ':')
+            && matches!(tokens.get(j + 2), Some(TokenTree::Ident(_)))
+        {
+            j += 2;
+        } else {
+            break;
+        }
+    }
+    if j == start || !matches!(tokens.get(j - 1), Some(TokenTree::Ident(_))) {
+        return Err(span);
+    }
+    // `$Query<..>`: a system parameter as written.
+    let mut exact = false;
+    if entity.is_none() && is_punct(tokens.get(j), '<') {
+        let mut depth = 0usize;
+        while j < tokens.len() {
+            if is_punct(tokens.get(j), '<') {
+                depth += 1;
+            } else if is_punct(tokens.get(j), '>') && !is_punct(tokens.get(j - 1), '-') {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if depth != 0 {
+            return Err(span);
+        }
+        j += 1;
+        exact = true;
+    }
+    let kind = match entity {
+        Some(entity) => Kind::Entity(entity),
+        None if exact => Kind::Exact,
+        None => Kind::Nearest,
+    };
+    Ok((params.param(&tokens[start..j], kind), j))
 }
 
 fn has_dollar(tokens: &[TokenTree]) -> bool {
@@ -201,35 +349,20 @@ fn reads(tokens: &[TokenTree], params: &mut Params) -> TokenStream {
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
-            TokenTree::Punct(p) if p.as_char() == '$' => {
-                let start = i + 1;
-                let mut j = start;
-                if is_punct(tokens.get(j), ':') && is_punct(tokens.get(j + 1), ':') {
-                    j += 2;
+            TokenTree::Punct(p) if p.as_char() == '$' => match dollar(tokens, i, params) {
+                Ok((name, next)) => {
+                    name.to_tokens(&mut out);
+                    i = next;
                 }
-                loop {
-                    if !matches!(tokens.get(j), Some(TokenTree::Ident(_))) {
-                        break;
-                    }
-                    j += 1;
-                    if is_punct(tokens.get(j), ':')
-                        && is_punct(tokens.get(j + 1), ':')
-                        && matches!(tokens.get(j + 2), Some(TokenTree::Ident(_)))
-                    {
-                        j += 2;
-                    } else {
-                        break;
-                    }
-                }
-                if j == start || !matches!(tokens.get(j - 1), Some(TokenTree::Ident(_))) {
-                    error(p.span(), "expected `$Type`: a component or resource type")
-                        .to_tokens(&mut out);
+                Err(span) => {
+                    error(
+                        span,
+                        "expected `$Type`, `$(entity).Type` or a system parameter such as `$Query<..>`",
+                    )
+                    .to_tokens(&mut out);
                     i += 1;
-                    continue;
                 }
-                params.param(&tokens[start..j]).to_tokens(&mut out);
-                i = j;
-            }
+            },
             TokenTree::Group(g) if !nested_rsn(tokens, i) => {
                 let mut group = Group::new(g.delimiter(), reads(&tokens_of(g), params));
                 group.set_span(g.span());
@@ -423,9 +556,9 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
                 }
             })
             .collect::<Vec<_>>();
-        let params = params.readers();
+        let reader = params.reader(TokenStream::new(), None, quote!(#ty(#(#args),*)));
         return quote! {
-            #watch({ #site move |#params| #ty(#(#args),*) })
+            #watch({ #site #reader })
         };
     }
     if group.delimiter() != Delimiter::Brace {
@@ -454,13 +587,10 @@ fn reactive_component(path: &[TokenTree], group: &Group, scope: &mut Scope) -> T
         );
         kept.into_token_stream()
     };
-    let mut all = params.readers();
-    if !params.0.is_empty() {
-        quote!(,).to_tokens(&mut all);
-    }
+    let reader = params.reader(quote!(__rsn_c: &mut #ty), None, assignments);
     quote! {
         #ty #kept
-        #watch({ #site move |#all __rsn_c: &mut #ty| { #assignments } })
+        #watch({ #site #reader })
     }
 }
 
@@ -534,10 +664,11 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
     let mut params = Params::default();
     let body = reads(body, &mut params);
     let rest = closure_params.iter().map(|p| stream(p));
-    let writers = params.writers();
+    let writers = params.closure_params(true);
+    let lookups = params.lookups(true);
     let handle = private("handle");
     quote! {
-        #handle({ #site move |#pattern: &#event, #(#rest,)* #writers| { #body; } })
+        #handle({ #site move |#pattern: &#event, #(#rest,)* #writers| { #lookups #body; } })
     }
 }
 
@@ -648,9 +779,12 @@ fn if_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
     if branches.last().is_some_and(|(cond, _)| cond.is_some()) {
         quote!(else { ::core::option::Option::None }).to_tokens(&mut selector);
     }
-    let readers = params.readers();
     let key = scope.capture(
-        quote!(move |#readers| -> ::core::option::Option<usize> { #selector }),
+        params.reader(
+            TokenStream::new(),
+            Some(quote!(::core::option::Option<usize>)),
+            selector,
+        ),
         &cond_tokens,
     );
     let body_tokens: Tokens = branches
@@ -717,8 +851,7 @@ fn match_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
 
     let mut params = Params::default();
     let read = reads(&scrutinee, &mut params);
-    let readers = params.readers();
-    let key = scope.capture(quote!(move |#readers| #read), &scrutinee);
+    let key = scope.capture(params.reader(TokenStream::new(), None, read), &scrutinee);
     let body_tokens: Tokens = arms.iter().flat_map(|(_, body)| body.stream()).collect();
     let arms = arms.iter().map(|(pattern, body)| {
         let bound = bindings(pattern);
@@ -751,13 +884,23 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
     if next < item.len() {
         return error(item[next].span(), "unexpected tokens after `for`");
     }
+    if let Some((data, filter)) = query_loop(&iter) {
+        if key.is_some() {
+            return error(
+                item[0].span(),
+                "a `$Query` loop is keyed by entity; remove `#[key(..)]`",
+            );
+        }
+        return query_for(pattern_tokens, &data, &filter, &body, scope);
+    }
     let mut params = Params::default();
     let read = reads(&iter, &mut params);
-    let readers = params.readers();
     let items = scope.capture(
-        quote! {
-            move |#readers| ::core::iter::IntoIterator::into_iter(#read).collect::<::std::vec::Vec<_>>()
-        },
+        params.reader(
+            TokenStream::new(),
+            None,
+            quote!(::core::iter::IntoIterator::into_iter(#read).collect::<::std::vec::Vec<_>>()),
+        ),
         &iter,
     );
     let bound = bindings(pattern_tokens);
@@ -797,4 +940,72 @@ fn for_item(item: &[TokenTree], key: Option<&[TokenTree]>, scope: &mut Scope) ->
             quote!(@#each(#items, #row))
         }
     }
+}
+
+/// `$Query<D, F>` as a whole `for` iterator: returns `D` and `F`.
+fn query_loop(iter: &[TokenTree]) -> Option<(TokenStream, TokenStream)> {
+    match iter {
+        [dollar, TokenTree::Ident(query), lt, generics @ .., gt]
+            if is_punct(Some(dollar), '$')
+                && query == "Query"
+                && is_punct(Some(lt), '<')
+                && is_punct(Some(gt), '>') =>
+        {
+            let parts = split_params(generics);
+            match parts.as_slice() {
+                [data] => Some((stream(data), quote!(()))),
+                [data, filter] => Some((stream(data), stream(filter))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `for pat in $Query<D, F> { .. }`: one row per matching entity, keyed by
+/// entity. A row binds an owned copy of its item, is rebuilt when that
+/// changes, and its entities get `Source(entity)` so `$Type` inside reads the
+/// row's entity.
+fn query_for(
+    pattern: &[TokenTree],
+    data: &TokenStream,
+    filter: &TokenStream,
+    body: &Group,
+    scope: &mut Scope,
+) -> TokenStream {
+    let own = private("Own");
+    let items = quote! {
+        move |__rsn_query: ::bevy::prelude::Query<(::bevy::prelude::Entity, #data), #filter>| {
+            __rsn_query
+                .iter()
+                .map(|(__rsn_e, __rsn_item)| (__rsn_e, #own::__rsn_own(__rsn_item)))
+                .collect::<::std::vec::Vec<_>>()
+        }
+    };
+    let bound = bindings(pattern);
+    let pattern = stream(pattern);
+    let mut inner = scope.child(bound);
+    let mut list = TokenStream::new();
+    for (index, item) in split_items(&tokens_of(body)).iter().enumerate() {
+        if index > 0 {
+            dashes().to_tokens(&mut list);
+        }
+        list_item(item, &mut inner).to_tokens(&mut list);
+        quote!(::bevy_radioactive::reactive::Source({ __rsn_e })).to_tokens(&mut list);
+    }
+    let prelude = inner.prelude;
+    let bsn_list = invoke("bsn_list");
+    let row = scope.capture(
+        quote! {
+            move |__rsn_row: &_| -> ::std::boxed::Box<dyn ::bevy::scene::SceneList> {
+                #[allow(unused_variables)]
+                let (__rsn_e, #pattern) = ::core::clone::Clone::clone(__rsn_row);
+                #prelude
+                ::std::boxed::Box::new(#bsn_list { { #list } }) as ::std::boxed::Box<dyn ::bevy::scene::SceneList>
+            }
+        },
+        &tokens_of(body),
+    );
+    let each = private("each");
+    quote!(@#each(#items, |__rsn_row: &(::bevy::prelude::Entity, _)| __rsn_row.0, #row))
 }

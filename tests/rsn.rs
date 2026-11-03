@@ -352,3 +352,118 @@ fn scene_functions_in_arms_and_nested_rsn_in_rows() {
     app.update();
     assert_eq!(labels(&mut app), ["home 1", "source 43"]);
 }
+
+#[derive(Component, Clone, Debug, PartialEq)]
+struct Task {
+    title: String,
+    done: bool,
+}
+
+#[derive(Component, Clone, Copy, Default)]
+struct Player;
+
+#[test]
+fn for_over_a_query_tracks_membership_and_values() {
+    let mut app = app();
+    let first = app
+        .world_mut()
+        .spawn(Task {
+            title: "a".into(),
+            done: false,
+        })
+        .id();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Count(0)
+            Children [
+                for task in $Query<&Task> {
+                    Row
+                    Label({ format!("{} {}", task.title, if task.done { "x" } else { "-" }) })
+                }
+                --
+                Label({ format!("{} open", $Query<&Task>.iter().filter(|t| !t.done).count()) })
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["a -", "1 open"]);
+
+    app.world_mut().spawn(Task {
+        title: "b".into(),
+        done: false,
+    });
+    app.update();
+    assert_eq!(labels(&mut app), ["a -", "b -", "2 open"]);
+
+    app.world_mut().get_mut::<Task>(first).unwrap().done = true;
+    app.update();
+    assert_eq!(labels(&mut app), ["a x", "b -", "1 open"]);
+
+    app.world_mut().entity_mut(first).despawn();
+    app.update();
+    assert_eq!(labels(&mut app), ["b -", "1 open"]);
+}
+
+#[test]
+fn query_rows_read_their_entity_with_dollar() {
+    let mut app = app();
+    let task = app
+        .world_mut()
+        .spawn(Task {
+            title: "a".into(),
+            done: false,
+        })
+        .id();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Count(0)
+            Children [
+                // Entity rows: the row is never rebuilt, `$Task` reads its entity.
+                for _entity in $Query<Entity, With<Task>> {
+                    Label({ $Task.title.clone() })
+                }
+            ]
+        })
+        .unwrap();
+    let rows = entities_with::<Label>(&mut app);
+    app.world_mut().get_mut::<Task>(task).unwrap().title = "b".into();
+    app.update();
+    assert_eq!(labels(&mut app), ["b"]);
+    assert_eq!(entities_with::<Label>(&mut app), rows, "updated in place");
+}
+
+#[test]
+fn explicit_sources_entity_and_resource() {
+    let mut app = app();
+    let player = app.world_mut().spawn((Player, Count(10))).id();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Count(1)
+            Children [
+                Label({ format!("{} {} {}", $Count.0, $(player).Count.0, $Res<Score>.0) })
+                --
+                Label({ format!("single {}", $Single<&Count, With<Player>>.0) })
+                --
+                #Button
+                on(|poke: On<Poke>| $(player).Count.0 += poke.by)
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["1 10 0", "single 10"]);
+
+    let button = {
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &Name)>();
+        query
+            .iter(world)
+            .find(|(_, name)| name.as_str() == "Button")
+            .unwrap()
+            .0
+    };
+    app.world_mut().trigger(Poke {
+        entity: button,
+        by: 5,
+    });
+    app.world_mut().resource_mut::<Score>().0 = 3;
+    app.update();
+    assert_eq!(labels(&mut app), ["1 15 3", "single 15"]);
+}

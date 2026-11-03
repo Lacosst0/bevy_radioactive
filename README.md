@@ -42,9 +42,15 @@ One API for reactivity and control flow where the ECS is the reactive graph:
 state is a component or resource, context is an ancestor's component, a branch
 is an entity, and cleanup is despawning.
 
-Write scenes with `rsn!`: it is `bsn!` plus Rust `if`/`match`/`for` and `$Type`,
-which means "the nearest `Type`" (this entity, its `Source`, its ancestors, then
-resource `Type`). Anything that reads a `$Type` re-runs when it changes.
+Write scenes with `rsn!`: it is `bsn!` plus Rust `if`/`match`/`for` and `$` reads.
+**One rule tells reactive from not: whatever contains a `$` re-runs when what it read
+changes; everything else runs once, when the scene spawns.**
+
+| `$` read | Reads | Example |
+| --- | --- | --- |
+| `$Type` | the nearest `Type`: this entity, its `Source`, its ancestors, then resource `Type` | `$Count.0` |
+| `$(entity).Type` | `Type` on that entity (skipped while it has none) | `$(player).Health.0` |
+| `$Res<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, exactly as written | `$Query<&Enemy>.iter().count()` |
 
 ```rust,ignore
 use bevy::{prelude::*, ui_widgets::Activate};
@@ -53,11 +59,8 @@ use bevy_radioactive::reactive::*;
 #[derive(Component, Clone, Default)]
 struct Count(i32);
 
-#[derive(Clone, PartialEq)]
-struct Todo { id: u32, title: String }
-
-#[derive(Resource, Clone, Default)]
-struct Todos(Vec<Todo>);
+#[derive(Component, Clone, PartialEq)]
+struct Todo { title: String, done: bool }
 
 #[derive(Resource, Clone, Copy, PartialEq, Default)]
 enum Tab { #[default] Home, Settings }
@@ -71,6 +74,8 @@ fn counter() -> impl Scene {
             on(|_: On<Activate>| $Count.0 += 1)  // writes the nearest Count
             --
             Text({ $Count.0.to_string() })        // re-renders when it changes
+            --
+            Text({ format!("{} enemies", $Query<(), With<Enemy>>.iter().count()) })
             --
             if $Count.0 > 10 {
                 Text("That's a lot")
@@ -90,10 +95,13 @@ fn app_body() -> impl Scene {
                 Tab::Settings => Text("Settings"),
             }
             --
-            #[key(todo.id)]
-            for todo in $Todos.0.clone() {
+            // One row per entity with a Todo, added and removed as they come and go.
+            for todo in $Query<&Todo> {
                 Text({ todo.title.clone() })
             }
+            --
+            // A plain loop: runs once.
+            for i in 0..3 { Text({ i.to_string() }) }
         ]
     }
 }
@@ -103,19 +111,23 @@ fn app_body() -> impl Scene {
 
 | In `rsn!` | Becomes |
 | --- | --- |
-| `Comp(.. $T ..)` | a `watch` that rebuilds `Comp` when `T` changes |
-| `Comp { a: .. $T .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
-| `on(\|e: On<E>\| .. $T ..)` | a handler; `$T` is the nearest `T`, writable (`$Count.0 += 1`) |
+| `Comp(.. $ ..)` | a `watch` that rebuilds `Comp` |
+| `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
+| `on(\|e: On<E>\| .. $ ..)` | a handler; `$Type` and `$(e).Type` are writable (`$Count.0 += 1`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
+| `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
 | `#[key(expr)] for pat in iter { .. }` | a keyed list; rows are kept, moved or rebuilt per key |
 | `for pat in iter { .. }` | a list by position |
 | anything else | passed to `bsn!` unchanged |
 
-- `if`, `match` and `for` work without `$` too: they then run once.
-- `for` needs owned items (`$Todos.0.clone()`, a range, a `Vec`), and items need
-  `PartialEq` so unchanged rows are kept. Loop and match bindings can be used any
-  number of times in the body.
+- `for pat in $Query<D, F>` keeps one row per entity. `pat` binds an owned copy of
+  the item (`&T` becomes `T`), and the row is rebuilt when it changes, so `T` needs
+  `Clone + PartialEq`. Each row also gets `Source(entity)`, so `$Type` inside it reads
+  the row's entity: loop over `$Query<Entity, With<T>>` and read `$T` to update rows
+  in place instead.
+- Other `for` loops need owned items (`$Todos.0.clone()`, a range, a `Vec`) that
+  implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
@@ -123,8 +135,7 @@ fn app_body() -> impl Scene {
 ### The functions under `rsn!`
 
 `rsn!` expands to functions you can use directly in `bsn!` or plain Rust. They
-take closures with ordinary Bevy system parameters, which is also how to react
-to a `Query` or anything else `$Type` doesn't cover:
+take closures with ordinary Bevy system parameters:
 
 ```rust,ignore
 bsn! {

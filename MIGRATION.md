@@ -39,8 +39,9 @@ glob: `use bevy_radioactive::view::*;`.
 | `COAT_DEBUG` | `VIEW_DEBUG` |
 
 New: the `reactive` module (feature `reactive`, `ReactivePlugin`) is a fifth style. Its
-`rsn!` macro is `bsn!` plus Rust `if`/`match`/`for` (with `#[key(..)]`) and `$Type` reads
-of the nearest component or resource, expanding to `watch`, `handle`, `when`, `switch`
+`rsn!` macro is `bsn!` plus Rust `if`/`match`/`for` and `$` reads (`$Type` for the nearest
+component or resource, `$(entity).Type`, or a system parameter such as `$Query<..>`),
+expanding to `watch`, `handle`, `when`, `switch`
 and `each`, which also work directly. Components are state and despawning is cleanup.
 Nothing else changes.
 
