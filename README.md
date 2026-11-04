@@ -189,7 +189,42 @@ bsn! {
   `ReactiveSystems` in `PostUpdate`; outer regions run before the reactions inside
   them, and chained reactions settle in the same frame.
 
-Examples: `reactive_counters`, `reactive_todos`, `comparison_reactive`.
+### Transitions
+
+Put `Transition` on the root of an `if`/`match` arm or a `for` row and it animates in
+and out instead of popping. Its `Presence` goes from 0 to 1 when it appears; when the
+region removes it, it gets `Leaving`, stays where it was while `Presence` goes back
+to 0, and then despawns. The animation is ordinary reactive code that reads
+`Presence`:
+
+```rust,ignore
+rsn! {
+    Children [
+        if $Res<Menu>.open {
+            #Panel
+            Node { top: px($Ref<Presence>(#Panel).lerp(-40.0, 0.0)) }
+            Transition::new(0.25).ease(EaseFunction::CubicOut)
+            BackgroundColor(Color::BLACK.with_alpha(0.8 * $Ref<Presence>(#Panel).value()))
+        }
+    ]
+}
+```
+
+| Item | Use it to |
+| --- | --- |
+| `Transition::new(secs)` | animate in and out over `secs`; `.enter(s)`, `.exit(s)`, `.ease(EaseFunction::..)`, `.appear()` |
+| `Presence` | read `.value()` (eased, 0 hidden to 1 shown), `.progress()` (linear), `.phase()`, `.lerp(hidden, shown)` |
+| `Leaving` | marks content animating out: filter it with `Without<Leaving>`, or start your own animation with `On<Add<Leaving>>` |
+
+- A region's first content shows at once; `.appear()` makes it animate in too.
+- Content that comes back while it is leaving (the condition flips back, or a `for`
+  row returns with the same key and item) turns around instead of being rebuilt.
+- A keyed row whose item changes is rebuilt in place, without transitions.
+- Leaving content keeps its place among its siblings, so new content and leaving
+  content take up space together. Position one absolutely to cross-fade.
+- `Ref<Presence>` in `watch` also finds the root's `Presence` from its descendants.
+
+Examples: `reactive_counters`, `reactive_todos`, `reactive_transitions`, `comparison_reactive`.
 
 ## `subscribe`
 

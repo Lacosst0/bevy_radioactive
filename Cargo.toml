@@ -12,7 +12,7 @@ categories = ["game-development", "gui"]
 [features]
 default = ["reactive", "subscribe", "hooks", "view", "ui"]
 ## `watch`, `handle`, `when`, `switch`, `each`: one ECS-native API for reactivity and control flow.
-reactive = []
+reactive = ["bevy/bevy_curve"]
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
 subscribe = []
 ## `#[component]`: React-style function components with hooks.
@@ -53,6 +53,11 @@ required-features = ["reactive"]
 [[example]]
 name = "reactive_todos"
 path = "examples/reactive_todos.rs"
+required-features = ["reactive"]
+
+[[example]]
+name = "reactive_transitions"
+path = "examples/reactive_transitions.rs"
 required-features = ["reactive"]
 
 [[example]]

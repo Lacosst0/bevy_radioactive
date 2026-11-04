@@ -133,6 +133,14 @@
 //! branch despawns everything in it, including the reactions and observers it
 //! declared. Run cleanup code with Bevy's own `on(|_: On<Despawn>| ..)`.
 //!
+//! # Transitions
+//!
+//! Region content whose root has a [`Transition`] animates in and out
+//! instead of popping: its [`Presence`] counts from 0 to 1 when it appears,
+//! and when it is removed it gets [`Leaving`] and stays until its
+//! [`Presence`] is back at 0. Animate anything by reading it:
+//! `Alpha($Ref<Presence>(#Panel).value())`.
+//!
 //! # Updates
 //!
 //! A reaction first runs right after its scene spawns, then in
@@ -143,7 +151,12 @@
 
 pub use crate::macros::{rsn, rsn_list};
 
-use crate::shared::{self, despawn_all, lock};
+mod transition;
+
+use transition::Start;
+pub use transition::{Leaving, Phase, Presence, Transition};
+
+use crate::shared::{self, lock};
 
 use std::{
     any::TypeId,
@@ -180,7 +193,12 @@ impl Plugin for ReactivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AnyChanges>()
             .init_resource::<Pending>()
-            .add_systems(PostUpdate, run_reactions.in_set(ReactiveSystems));
+            .add_systems(
+                PostUpdate,
+                (transition::animate, run_reactions)
+                    .chain()
+                    .in_set(ReactiveSystems),
+            );
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
@@ -1207,11 +1225,19 @@ fn region<B: Body + 'static>(make: impl Fn() -> B + Send + Sync + 'static) -> Re
     RegionScene(Arc::new(move || Box::new(make()) as Box<dyn Body>))
 }
 
-fn spawn_children(world: &mut World, parent: Entity, list: Box<dyn SceneList>) -> Vec<Entity> {
-    // Hold first runs until the content has its parent, so lookups through
-    // ancestors work.
+/// Spawns region content under `parent` and starts its transitions.
+fn spawn_children(
+    world: &mut World,
+    parent: Entity,
+    list: Box<dyn SceneList>,
+    start: Start,
+) -> Vec<Entity> {
+    // Hold first runs until the content has its parent and its `Presence`,
+    // so lookups through ancestors work and nothing renders fully shown
+    // before it enters.
     world.resource_mut::<Pending>().held += 1;
     let entities = shared::spawn_children(world, parent, list, "bevy_radioactive::reactive");
+    transition::start(world, &entities, start);
     world.resource_mut::<Pending>().held -= 1;
     run_pending(world);
     entities
@@ -1222,6 +1248,8 @@ struct BranchBody<K> {
     key: Box<dyn Reader<K>>,
     render: Render<K>,
     current: Option<(K, Vec<Entity>)>,
+    /// Earlier branches still animating out, newest last.
+    leaving: Vec<(K, Vec<Entity>)>,
 }
 
 impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
@@ -1236,10 +1264,27 @@ impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
         if self.current.as_ref().is_some_and(|(key, _)| *key == next) {
             return;
         }
-        if let Some((_, children)) = self.current.take() {
-            despawn_all(world, &children);
+        let first = self.current.is_none();
+        self.leaving
+            .retain(|(_, children)| transition::any_alive(world, children));
+        if let Some((key, children)) = self.current.take()
+            && transition::remove(world, &children)
+        {
+            self.leaving.push((key, children));
         }
-        let children = spawn_children(world, cx.host, (self.render)(&next));
+        // A branch coming back while it is still leaving turns around.
+        if let Some(index) = self
+            .leaving
+            .iter()
+            .rposition(|(key, children)| *key == next && transition::is_leaving(world, children))
+        {
+            let (key, children) = self.leaving.remove(index);
+            transition::revive(world, &children);
+            self.current = Some((key, children));
+            return;
+        }
+        let start = if first { Start::Initial } else { Start::New };
+        let children = spawn_children(world, cx.host, (self.render)(&next), start);
         self.current = Some((next, children));
     }
 }
@@ -1253,6 +1298,7 @@ fn branch<K: PartialEq + Send + Sync + 'static>(
         key: key(),
         render: Arc::clone(&render),
         current: None,
+        leaving: Vec::new(),
     })
 }
 
@@ -1417,7 +1463,9 @@ where
         key: Arc::clone(&key),
         row: Arc::clone(&row),
         rows: HashMap::default(),
+        leaving: HashMap::default(),
         order: Vec::new(),
+        started: false,
     })
 }
 
@@ -1426,7 +1474,11 @@ struct EachBody<I, V, K> {
     key: Key<V, K>,
     row: Render<V>,
     rows: HashMap<K, (V, Vec<Entity>)>,
+    /// Removed rows still animating out.
+    leaving: HashMap<K, (V, Vec<Entity>)>,
+    /// The host's children as last set: shown and leaving rows.
     order: Vec<Entity>,
+    started: bool,
 }
 
 impl<I, V, K> Body for EachBody<I, V, K>
@@ -1443,27 +1495,52 @@ where
         let Some(items) = self.items.read(world, cx) else {
             return;
         };
+        let start = if self.started {
+            Start::New
+        } else {
+            Start::Initial
+        };
+        self.started = true;
+        self.leaving
+            .retain(|_, (_, children)| transition::any_alive(world, children));
         let mut next_rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
-        let mut next_order = Vec::with_capacity(self.order.len());
+        let mut shown = Vec::with_capacity(self.order.len());
         let mut duplicates = 0;
         for (index, item) in items.into_iter().enumerate() {
             let key = (self.key)(index, &item);
             let row = match self.rows.remove(&key) {
                 Some((old, children)) if old == item => (old, children),
-                old => {
-                    if let Some((_, children)) = old {
-                        despawn_all(world, &children);
-                    }
-                    let children = spawn_children(world, cx.host, (self.row)(&item));
+                // A changed item is the same row with new content: replaced
+                // in place, without transitions.
+                Some((_, children)) => {
+                    transition::despawn(world, &children);
+                    let children =
+                        spawn_children(world, cx.host, (self.row)(&item), Start::Replace);
                     (item, children)
                 }
+                None => match self.leaving.remove(&key) {
+                    // A row coming back while it is still leaving turns around.
+                    Some((old, children))
+                        if old == item && transition::is_leaving(world, &children) =>
+                    {
+                        transition::revive(world, &children);
+                        (old, children)
+                    }
+                    leaving => {
+                        if let Some((_, children)) = leaving {
+                            transition::despawn(world, &children);
+                        }
+                        let children = spawn_children(world, cx.host, (self.row)(&item), start);
+                        (item, children)
+                    }
+                },
             };
-            next_order.extend_from_slice(&row.1);
+            shown.extend_from_slice(&row.1);
             if let Some((_, displaced)) = next_rows.insert(key, row) {
                 // A duplicate key: the later item wins.
                 duplicates += 1;
-                next_order.retain(|entity| !displaced.contains(entity));
-                despawn_all(world, &displaced);
+                shown.retain(|entity| !displaced.contains(entity));
+                transition::despawn(world, &displaced);
             }
         }
         if duplicates > 0 {
@@ -1472,17 +1549,40 @@ where
                  key is shown"
             );
         }
-        for (_, (_, children)) in self.rows.drain() {
-            despawn_all(world, &children);
+        for (key, (item, children)) in self.rows.drain() {
+            if transition::remove(world, &children) {
+                self.leaving.insert(key, (item, children));
+            }
         }
         self.rows = next_rows;
-        if next_order != self.order
+        let order = with_leaving(world, &self.order, shown);
+        if order != self.order
             && let Ok(mut host) = world.get_entity_mut(cx.host)
         {
-            host.replace_children(&next_order);
+            host.replace_children(&order);
         }
-        self.order = next_order;
+        self.order = order;
     }
+}
+
+/// `shown` with the leaving entities of `old` kept where they were: each
+/// right after the entity it followed before.
+fn with_leaving(world: &World, old: &[Entity], mut shown: Vec<Entity>) -> Vec<Entity> {
+    for (index, &entity) in old.iter().enumerate() {
+        let leaving = world
+            .get_entity(entity)
+            .is_ok_and(|entity| entity.contains::<Leaving>());
+        if !leaving || shown.contains(&entity) {
+            continue;
+        }
+        let at = old[..index]
+            .iter()
+            .rev()
+            .find_map(|before| shown.iter().position(|e| e == before))
+            .map_or(0, |position| position + 1);
+        shown.insert(at, entity);
+    }
+    shown
 }
 
 // ---------------------------------------------------------------------------
