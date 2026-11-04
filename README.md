@@ -51,7 +51,7 @@ changes; everything else runs once, when the scene spawns.**
 | `$Ref<Type>(entity)` | `Type` on that entity (skipped while it has none) | `$Ref<Health>(player).0` |
 | `$Mut<Type>(#Name)`, `$Mut<Type>(entity)` | the same, writable; only in `on(..)` | `$Mut<Count>(#Counter).0 += 1` |
 | `$Ref<Type>("Name")` | like `#Name`, for an entity named in another scene (not checked at compile time) | `$Ref<Theme>("App").0` |
-| `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()` |
+| `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, `$Commands`, any system param | that parameter, as in a Bevy system | `$Res<Score>.0`, `$Query<&Enemy>.iter().count()`, `$Commands.trigger(Hit)` |
 
 A `#Name` must be declared in the same `rsn!`, so a typo is a compile error. In debug
 builds, a closure whose name matches nothing (or whose entity lacks the component) logs
@@ -135,6 +135,9 @@ fn app_body() -> impl Scene {
   them: `for e in $Query<Entity, With<Todo>> { Text({ $Ref<Todo>(e).title.clone() }) }`.
 - Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
+- A loop's iterator can be a block, as in Rust: `#[key(e)] for e in { let mut v = ..; v.sort(); v } { .. }`.
+- In one `on(..)`, `$Res<T>` and `$ResMut<T>` share a single `ResMut<T>`, so reading and
+  writing a resource doesn't conflict.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
@@ -369,6 +372,18 @@ view! { Text($(format!("HP {}", $health))) }   // not patched when `name` change
 ```
 
 Examples: `view_todos`, `view_tabs`.
+
+## Game UI example
+
+`examples/game_ui` is a small game UI written only with `rsn!`: a main menu with a
+setting, a HUD (health bar, gold, weapon), an inventory with selectable slots, a pause
+menu and a game over screen. The rules in `game.rs` are plain Bevy (states, resources,
+systems, observers); the scenes in `ui.rs` read that state with `$` and have no marker
+components or sync systems. `tests/game_ui.rs` plays through it without a window.
+
+```sh
+cargo run --example game_ui --features comparison
+```
 
 ## Comparison with plain Bevy
 

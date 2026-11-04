@@ -480,7 +480,9 @@ fn capturing_statement(statement: &[TokenTree], scope: &mut Scope) -> TokenStrea
 /// Splits at the first top-level brace group (a Rust condition or
 /// scrutinee): returns the tokens before it, the group, and the next index.
 fn until_block(tokens: &[TokenTree], from: usize) -> Option<(Tokens, Group, usize)> {
-    let index = (from..tokens.len()).find(
+    // The header is never empty, so a block right after the keyword is the
+    // header (`for x in { .. } { .. }`), as in Rust.
+    let index = (from + 1..tokens.len()).find(
         |&j| matches!(&tokens[j], TokenTree::Group(g) if g.delimiter() == Delimiter::Brace),
     )?;
     let TokenTree::Group(group) = &tokens[index] else {

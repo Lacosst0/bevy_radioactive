@@ -230,12 +230,29 @@ struct Params {
 
 impl Params {
     fn param(&mut self, ty: &[TokenTree], kind: Kind) -> Ident {
-        let key = match &kind {
-            Kind::Named(entity) => format!("#{entity}.{}", stream(ty)),
-            Kind::Exact => format!("exact {}", stream(ty)),
-            Kind::Entity(entity) => format!("({entity}).{}", stream(ty)),
+        // In a handler, `$Res<T>` and `$ResMut<T>` share one `ResMut<T>`:
+        // two parameters would conflict.
+        let resource = match ty {
+            [TokenTree::Ident(res), TokenTree::Punct(lt), inner @ ..]
+                if self.write
+                    && matches!(kind, Kind::Exact)
+                    && lt.as_char() == '<'
+                    && (res == "Res" || res == "ResMut") =>
+            {
+                Some((res == "ResMut", inner))
+            }
+            _ => None,
         };
-        if let Some(param) = self.params.iter().find(|p| p.key == key) {
+        let key = match (&kind, resource) {
+            (_, Some((_, inner))) => format!("resource {}", stream(inner)),
+            (Kind::Named(entity), _) => format!("#{entity}.{}", stream(ty)),
+            (Kind::Exact, _) => format!("exact {}", stream(ty)),
+            (Kind::Entity(entity), _) => format!("({entity}).{}", stream(ty)),
+        };
+        if let Some(param) = self.params.iter_mut().find(|p| p.key == key) {
+            if let Some((true, _)) = resource {
+                param.ty = stream(ty);
+            }
             return param.name.clone();
         }
         let name = format_ident!("__rsn_{}", self.params.len());
@@ -355,7 +372,7 @@ impl Params {
 
 const DOLLAR_HELP: &str = "expected a Bevy system parameter: `$Ref<T>(#Name)` or \
      `$Ref<T>(entity)` for a component on an entity (`$Mut<T>(..)` to write it in `on(..)`), \
-     or `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`";
+     or `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, `$Commands`";
 
 /// Parses a `$` read at `tokens[i]` (the `$`): returns the parameter name
 /// and the index after the read.
@@ -383,6 +400,10 @@ fn dollar(
         } else {
             break;
         }
+    }
+    // `$Commands`: the one common parameter without generics.
+    if j == start + 1 && is_ident(tokens.get(start), "Commands") && !is_punct(tokens.get(j), '<') {
+        return Ok((params.param(&tokens[start..j], Kind::Exact), j));
     }
     if j == start || !is_punct(tokens.get(j), '<') {
         return Err((span, DOLLAR_HELP));
@@ -960,8 +981,15 @@ fn split_list(tokens: &[TokenTree]) -> Vec<Tokens> {
                     break;
                 }
             }
-        } else if is_ident(tokens.get(j), "match") || is_ident(tokens.get(j), "for") {
+        } else if is_ident(tokens.get(j), "match") {
             j = block_after(j + 1);
+        } else if is_ident(tokens.get(j), "for") {
+            // After `in`: the pattern may have braces, and the iterator may
+            // be a block.
+            let after = j + 1;
+            j = (after..tokens.len())
+                .find(|&k| is_ident(tokens.get(k), "in"))
+                .map_or(tokens.len(), |k| block_after(k + 1));
         } else {
             while j < tokens.len() && !separator(j) {
                 j += 1;
