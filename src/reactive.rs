@@ -1699,6 +1699,13 @@ mod widgets {
 
     pub(super) fn register(app: &mut App) {
         use super::BindableAppExt;
+        // `bind` shows a value by editing `EditableText`, so it must run before
+        // the edits are applied. `UiPlugin` implies this order; without it the
+        // two would be unordered and a stale edit could overwrite the value.
+        app.configure_sets(
+            PostUpdate,
+            super::ReactiveSystems.before(bevy::text::EditableTextSystems),
+        );
         app.register_bindable::<Slider>()
             .register_bindable::<Checkbox>()
             .register_bindable::<TextInput>();
