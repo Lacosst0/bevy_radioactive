@@ -160,7 +160,7 @@ bsn! {
 | --- | --- | --- |
 | `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest component `T`: this entity, its `Source`, then its ancestors |
 | `Res<T>` / `Option<Res<T>>` | yes | resource `T` |
-| `Query`, `Single`, `Populated` | yes | when a component they read or filter on changes, is added or removed |
+| `Query`, `Single`, `Populated` | yes | when a component they read changes, is added or removed; a `With`/`Without` filter only when it is added or removed |
 | `c: &mut C` | no | the nearest `C`, written in place |
 | `e: Entity` | no | the entity that declared the closure |
 | `ResMut`, `Commands`, `Local`, messages | no | ordinary system parameters |
