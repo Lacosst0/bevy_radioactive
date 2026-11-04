@@ -33,7 +33,8 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
-affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
+affect layout. The default `widgets` feature lets `reactive`'s `bind` drive the
+`bevy_ui_widgets` slider, checkbox and text input. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
 
 ## `reactive`
 
@@ -124,6 +125,7 @@ fn app_body() -> impl Scene {
 | `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a `switch` region, rebuilt when an input changes |
 | `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a `watch` that patches `Comp` in place |
 | `on(\|e: On<E>\| .. $ ..)` | a handler; write with `$Mut<Type>(#Name)`, `$Mut<Type>(e)` or `$ResMut<T>` (`$Mut<Count>(#Counter).0 += 1`) |
+| `bind(.. $ ..)` | a two-way binding: the widget shows the value, and the user's edits are written back (`bind($Res<Settings>.volume)`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
 | `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
@@ -166,6 +168,39 @@ fn app_body() -> impl Scene {
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
 
+### Two-way binding
+
+`bind(place)` keeps a widget and a value in sync, both ways. The widget shows the
+value and follows it when it changes; when the user edits the widget, the new value
+is written back to the place (only when it differs, so change detection stays quiet).
+Read the place with `$Res`/`$Ref`; `bind` writes it through `$ResMut`/`$Mut` for you.
+
+```rust,ignore
+rsn! {
+    #Panel
+    Brightness(0.5)
+    Children [
+        Slider SliderRange::new(0.0, 1.0) bind($Res<Settings>.volume)  // f32
+        --
+        Checkbox bind($Res<Settings>.muted)                            // bool
+        --
+        TextInput bind($Res<Settings>.name)                            // String
+        --
+        Slider bind($Ref<Brightness>(#Panel).0)                        // a component
+        --
+        Button on(|_: On<Activate>| $ResMut<Settings>.muted = true)    // a click handler
+    ]
+}
+```
+
+The widget is the entity's `Bindable` component for the value's type. The `widgets`
+feature (on by default) registers `bevy_ui_widgets`' `Slider`, `Checkbox` and
+`TextInput`, which Feathers' controls are built on. Register your own widget with
+`app.register_bindable::<MyKnob>()` after implementing `Bindable` for it: its value
+type, the event it sends when edited, how to show a value and how to read one from
+the event. In `bsn!` or plain Rust, `bind` takes a getter and a setter:
+`bind(|s: Res<Settings>| s.volume, |v: &f32, mut s: ResMut<Settings>| s.volume = *v)`.
+
 ### The functions under `rsn!`
 
 `rsn!` expands to functions you can use directly in `bsn!` or plain Rust. They
@@ -197,6 +232,7 @@ bsn! {
 | --- | --- | --- |
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
+| `bind(\|..\| value, \|v: &V, ..\| ..)` | template | sync a widget with a value, both ways |
 | `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
 | `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` |
 | `@switch(\|..\| key, \|key\| ..)` | scene | `match`; arms are boxed with `.into()` |
@@ -216,7 +252,7 @@ bsn! {
   `ReactiveSystems` in `PostUpdate`; outer regions run before the reactions inside
   them, and chained reactions settle in the same frame.
 
-Examples: `reactive_counters`, `reactive_todos`, `comparison_reactive`.
+Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `comparison_reactive`.
 
 ## `subscribe`
 

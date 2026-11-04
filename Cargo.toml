@@ -10,7 +10,7 @@ keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [features]
-default = ["reactive", "subscribe", "hooks", "view", "ui"]
+default = ["reactive", "subscribe", "hooks", "view", "ui", "widgets"]
 ## `watch`, `handle`, `when`, `switch`, `each`: one ECS-native API for reactivity and control flow.
 reactive = []
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
@@ -21,6 +21,8 @@ hooks = []
 view = []
 ## Runs updates before UI layout and makes component hosts and regions `GhostNode`s.
 ui = ["bevy/bevy_ui", "bevy/ghost_nodes"]
+## `reactive::bind` support for the `bevy_ui_widgets` slider, checkbox and text input.
+widgets = ["ui", "bevy/bevy_ui_widgets"]
 ## Full Bevy with Feathers, for the `examples/comparison` examples.
 comparison = ["ui", "bevy/ui", "bevy/bevy_feathers"]
 
@@ -54,6 +56,11 @@ required-features = ["reactive"]
 name = "reactive_todos"
 path = "examples/reactive_todos.rs"
 required-features = ["reactive"]
+
+[[example]]
+name = "reactive_settings"
+path = "examples/reactive_settings.rs"
+required-features = ["reactive", "widgets"]
 
 [[example]]
 name = "subscribe"
