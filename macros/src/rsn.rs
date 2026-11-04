@@ -270,7 +270,8 @@ impl Params {
                 (Kind::Exact, _) => quote!(#[allow(unused_mut)] mut #name: #ty,),
                 (Kind::Entity(_) | Kind::Named(_), false) => {
                     let query = format_ident!("__rsn_q{index}");
-                    quote!(#query: ::bevy::prelude::Query<::bevy::prelude::Ref<#ty>>,)
+                    let get = private("Get");
+                    quote!(#query: #get<#ty>,)
                 }
                 (Kind::Entity(_) | Kind::Named(_), true) => {
                     let query = format_ident!("__rsn_q{index}");

@@ -846,3 +846,64 @@ fn dollar_in_tuple_scene_components_rebuilds_the_component() {
     assert_eq!(labels(&mut app), ["badge 6"]);
     assert_eq!(entities_with::<Label>(&mut app), before);
 }
+
+#[test]
+fn entity_reads_rerun_only_for_their_own_entity() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    let mut app = app();
+    let tasks: Vec<Entity> = (0..3)
+        .map(|i| {
+            app.world_mut()
+                .spawn(Task {
+                    title: format!("t{i}"),
+                    done: false,
+                })
+                .id()
+        })
+        .collect();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                for task in $Query<Entity, With<Task>> {
+                    Label({
+                        RUNS.fetch_add(1, Ordering::Relaxed);
+                        $Ref<Task>(task).title.clone()
+                    })
+                }
+            ]
+        })
+        .unwrap();
+    app.update();
+    let rows = entities_with::<Label>(&mut app);
+    let before = RUNS.load(Ordering::Relaxed);
+
+    app.world_mut().get_mut::<Task>(tasks[1]).unwrap().title = "edited".into();
+    app.update();
+    assert_eq!(labels(&mut app), ["t0", "edited", "t2"]);
+    assert_eq!(
+        RUNS.load(Ordering::Relaxed) - before,
+        1,
+        "only the edited row re-runs"
+    );
+    assert_eq!(
+        entities_with::<Label>(&mut app),
+        rows,
+        "a value change doesn't rebuild the list"
+    );
+
+    // Losing and regaining the component is still seen.
+    app.world_mut().entity_mut(tasks[0]).remove::<Task>();
+    app.update();
+    let mut shown = labels(&mut app);
+    shown.sort();
+    assert_eq!(shown, ["edited", "t2"]);
+    app.world_mut().entity_mut(tasks[0]).insert(Task {
+        title: "back".into(),
+        done: false,
+    });
+    app.update();
+    assert_eq!(labels(&mut app).len(), 3);
+    assert!(labels(&mut app).contains(&"back".to_string()));
+}
