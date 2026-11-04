@@ -149,7 +149,10 @@ use std::{
     any::TypeId,
     hash::Hash,
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use bevy::{
@@ -158,11 +161,13 @@ use bevy::{
         component::{ComponentId, Mutable},
         entity_disabling::Disabled,
         event::EntityEvent,
+        lifecycle::{Discard, Insert},
         message::Message,
         query::{Allow, IterQueryData, QueryData, QueryFilter},
         resource::IsResource,
         system::{SystemParam, SystemParamItem, SystemState},
         template::{FromTemplate, Template, TemplateContext},
+        world::DeferredWorld,
     },
     platform::collections::HashMap,
     prelude::*,
@@ -180,6 +185,13 @@ impl Plugin for ReactivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AnyChanges>()
             .init_resource::<Pending>()
+            .init_resource::<HierarchyChanged>()
+            .add_observer(|_: On<Insert<(ChildOf, Source)>>, world: DeferredWorld| {
+                note_hierarchy(world);
+            })
+            .add_observer(|_: On<Discard<(ChildOf, Source)>>, world: DeferredWorld| {
+                note_hierarchy(world);
+            })
             .add_systems(PostUpdate, run_reactions.in_set(ReactiveSystems));
         #[cfg(feature = "ui")]
         app.configure_sets(
@@ -236,7 +248,12 @@ struct Reaction {
     host: Entity,
     inputs: Vec<Input>,
     resolved: Vec<Option<Entity>>,
+    /// What the last run read through `$Ref<T>(..)` in `rsn!`.
+    reads: Vec<Read>,
     last_run: Option<Tick>,
+    /// When `resolved` was last confirmed, which may be after `last_run`.
+    /// Atomic so the check can update it through a shared reference.
+    resolved_at: AtomicU32,
     body: Option<Box<dyn Body>>,
 }
 
@@ -262,13 +279,58 @@ pub struct Input {
     type_id: TypeId,
     id: ComponentId,
     lookup: Lookup,
-    tracked: bool,
+    track: Track,
+}
+
+/// What change to an input re-runs its reaction.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Track {
+    /// None: the input is only read.
+    No,
+    /// An entity gaining or losing the component, as for a `With` or
+    /// `Without` filter.
+    Presence,
+    /// That, or a change to its value.
+    Value,
 }
 
 impl Input {
     fn same_target(&self, other: &Self) -> bool {
         self.id == other.id && self.lookup == other.lookup
     }
+}
+
+/// One component read on a specific entity during a run, recorded while
+/// the run happens instead of declared up front.
+#[derive(Clone, Copy, Debug)]
+enum Read {
+    /// Component `id` on `entity`, which had it.
+    At(Entity, ComponentId),
+    /// Component `id` on an entity that didn't have it, or that couldn't
+    /// be found: re-runs when any entity gains or loses it.
+    Missing(ComponentId),
+}
+
+std::thread_local! {
+    /// The reads of the reaction running on this thread, if any.
+    static READS: std::cell::RefCell<Option<Vec<Read>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records a read for the running reaction; does nothing outside one.
+fn record(read: Read) {
+    READS.with_borrow_mut(|reads| {
+        if let Some(reads) = reads {
+            reads.push(read);
+        }
+    });
+}
+
+/// Runs `f`, collecting the reads it records. Nested runs collect their
+/// own.
+fn collect_reads(f: impl FnOnce()) -> Vec<Read> {
+    let outer = READS.replace(Some(Vec::new()));
+    f();
+    READS.replace(outer).unwrap_or_default()
 }
 
 /// Hierarchy walks stop after this many steps, in case of a `ChildOf` cycle.
@@ -295,6 +357,23 @@ fn find_nearest(
         }
         links(entity).1.filter(|&source| matches(source))
     })
+}
+
+/// When an entity last got or lost a [`ChildOf`] or [`Source`]: until then,
+/// `Ref<T>` lookups find what they found before, unless an entity gained or
+/// lost `T`.
+#[derive(Resource)]
+struct HierarchyChanged(Tick);
+
+impl FromWorld for HierarchyChanged {
+    fn from_world(world: &mut World) -> Self {
+        Self(world.change_tick())
+    }
+}
+
+fn note_hierarchy(mut world: DeferredWorld) {
+    let now = world.change_tick();
+    world.resource_mut::<HierarchyChanged>().0 = now;
 }
 
 /// The entity holding component `id` for a reaction declared on `host`.
@@ -350,93 +429,162 @@ impl Cx<'_> {
 }
 
 /// Last change seen per component tracked on any entity (by `Query`
-/// parameters), and how many entities had it.
+/// parameters and missed `$Ref<T>(..)` reads).
 #[derive(Resource, Default)]
 struct AnyChanges(HashMap<ComponentId, AnyState>);
 
 struct AnyState {
+    /// Entities with the component.
     count: u64,
-    stamp: Tick,
+    /// The newest change to the component's value or presence.
+    changed: Tick,
+    /// The newest change to which entities have it.
+    presence: Tick,
 }
 
-/// How many entities have component `id`.
-fn count_with(world: &World, id: ComponentId) -> u64 {
-    world
-        .archetypes()
-        .iter()
-        .filter(|archetype| archetype.contains(id))
-        .map(|archetype| u64::from(archetype.len()))
-        .sum()
-}
-
-/// How many entities have component `id`, and the newest change to it after
-/// `since`.
-fn survey(world: &World, id: ComponentId, since: Tick, now: Tick) -> (u64, Tick) {
-    let mut count = 0;
-    let mut newest = since;
-    for archetype in world.archetypes().iter().filter(|a| a.contains(id)) {
-        count += u64::from(archetype.len());
-        for entity in archetype.entities() {
-            if let Some(ticks) = world
-                .get_entity(entity.id())
-                .ok()
-                .and_then(|entity| entity.get_change_ticks_by_id(id))
-                && ticks.changed.is_newer_than(newest, now)
-            {
-                newest = ticks.changed;
-            }
+impl AnyState {
+    fn new(world: &World, id: ComponentId) -> Self {
+        let now = world.read_change_tick();
+        Self {
+            count: archetypes_with(world, id).map(|a| u64::from(a.len())).sum(),
+            changed: now,
+            presence: now,
         }
     }
-    (count, newest)
+
+    /// Catches up with changes since the last survey.
+    fn survey(&mut self, world: &World, id: ComponentId, now: Tick) {
+        let mut count = 0;
+        let (mut changed, mut added) = (self.changed, self.presence);
+        for archetype in archetypes_with(world, id) {
+            count += u64::from(archetype.len());
+            for entity in archetype.entities() {
+                if let Some(ticks) = world
+                    .get_entity(entity.id())
+                    .ok()
+                    .and_then(|entity| entity.get_change_ticks_by_id(id))
+                {
+                    if ticks.changed.is_newer_than(changed, now) {
+                        changed = ticks.changed;
+                    }
+                    if ticks.added.is_newer_than(added, now) {
+                        added = ticks.added;
+                    }
+                }
+            }
+        }
+        // As many entities, unless one lost the component.
+        if count != self.count {
+            changed = now;
+            added = now;
+        }
+        self.count = count;
+        self.changed = changed;
+        self.presence = added;
+    }
+
+    /// Whether a change `track` cares about happened after `since`.
+    fn changed_since(&self, track: Track, since: Tick, now: Tick) -> bool {
+        match track {
+            Track::No => false,
+            Track::Presence => self.presence.is_newer_than(since, now),
+            Track::Value => self.changed.is_newer_than(since, now),
+        }
+    }
 }
 
 fn scan_any(world: &mut World) {
     world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
         let now = world.change_tick();
         for (&id, state) in &mut changes.bypass_change_detection().0 {
-            let (count, newest) = survey(world, id, state.stamp, now);
-            // An entity gaining or losing the component is a change too.
-            state.stamp = if count == state.count { newest } else { now };
-            state.count = count;
+            state.survey(world, id, now);
         }
     });
 }
 
-fn track_any(world: &mut World, inputs: &[Input]) {
-    let now = world.change_tick();
-    world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
-        for input in inputs.iter().filter(|input| input.lookup == Lookup::Any) {
-            changes.0.entry(input.id).or_insert_with(|| AnyState {
-                count: count_with(world, input.id),
-                stamp: now,
-            });
+fn archetypes_with(
+    world: &World,
+    id: ComponentId,
+) -> impl Iterator<Item = &bevy::ecs::archetype::Archetype> {
+    world
+        .archetypes()
+        .iter()
+        .filter(move |archetype| archetype.contains(id))
+}
+
+/// Starts surveying each of `ids` that isn't surveyed yet.
+fn track_any(world: &mut World, ids: impl IntoIterator<Item = ComponentId>) {
+    for id in ids {
+        if world.resource::<AnyChanges>().0.contains_key(&id) {
+            continue;
         }
-    });
+        let state = AnyState::new(world, id);
+        world
+            .resource_mut::<AnyChanges>()
+            .bypass_change_detection()
+            .0
+            .insert(id, state);
+    }
 }
 
 impl Reaction {
     /// Whether a tracked input changed, or now resolves to another entity,
     /// since the last run.
-    fn is_dirty(&self, world: &World, changes: &AnyChanges, now: Tick) -> bool {
+    fn is_dirty(&self, world: &World, changes: &AnyChanges, hierarchy: Tick, now: Tick) -> bool {
         let Some(last_run) = self.last_run else {
             return true;
         };
-        self.inputs.iter().enumerate().any(|(index, input)| {
-            if input.lookup == Lookup::Any {
-                return input.tracked
-                    && changes
+        let any_changed = |id: ComponentId, track: Track| {
+            changes
+                .0
+                .get(&id)
+                .is_some_and(|state| state.changed_since(track, last_run, now))
+        };
+        let ticks = |entity: Entity, id: ComponentId| {
+            world
+                .get_entity(entity)
+                .ok()
+                .and_then(|entity| entity.get_change_ticks_by_id(id))
+        };
+        let read_changed = |read: &Read| match *read {
+            Read::At(entity, id) => {
+                ticks(entity, id).is_none_or(|ticks| ticks.is_changed(last_run, now))
+            }
+            Read::Missing(id) => any_changed(id, Track::Presence),
+        };
+        let resolved_at = Tick::new(self.resolved_at.load(Ordering::Relaxed));
+        let dirty = self.reads.iter().any(read_changed)
+            || self.inputs.iter().enumerate().any(|(index, input)| {
+                if input.lookup == Lookup::Any {
+                    return any_changed(input.id, input.track);
+                }
+                let cached = self.resolved.get(index).copied().flatten();
+                // Walking the hierarchy is the costly part, so it is skipped
+                // while nothing could have moved the input.
+                let moved = input.lookup != Lookup::Nearest
+                    || hierarchy.is_newer_than(resolved_at, now)
+                    || changes
                         .0
                         .get(&input.id)
-                        .is_some_and(|state| state.stamp.is_newer_than(last_run, now));
-            }
-            let entity = resolve(world, self.host, input.id, input.lookup);
-            entity != self.resolved.get(index).copied().flatten()
-                || (input.tracked
-                    && entity
-                        .and_then(|entity| world.get_entity(entity).ok())
-                        .and_then(|entity| entity.get_change_ticks_by_id(input.id))
-                        .is_some_and(|ticks| ticks.is_changed(last_run, now)))
-        })
+                        .is_none_or(|state| state.changed_since(Track::Presence, resolved_at, now))
+                    || cached.is_some_and(|entity| ticks(entity, input.id).is_none());
+                let entity = if moved {
+                    resolve(world, self.host, input.id, input.lookup)
+                } else {
+                    cached
+                };
+                entity != cached
+                    || (input.track != Track::No
+                        && entity
+                            .and_then(|entity| ticks(entity, input.id))
+                            .is_some_and(|ticks| ticks.is_changed(last_run, now)))
+            });
+        if !dirty {
+            // Every input resolves as before: no need to walk again until
+            // something moves after `now`.
+            self.resolved_at.store(now.get(), Ordering::Relaxed);
+        }
+        dirty
     }
 }
 
@@ -462,17 +610,19 @@ pub trait ReactiveParam {
 }
 
 impl Input {
-    fn new<T: Component>(world: &mut World, lookup: Lookup, tracked: bool) -> Self {
+    fn new<T: Component>(world: &mut World, lookup: Lookup, track: Track) -> Self {
         Self {
             type_id: TypeId::of::<T>(),
             id: world.register_component::<T>(),
             lookup,
-            tracked,
+            track,
         }
     }
 }
 
 /// Every component a query reads or filters on, except those it writes.
+/// Components it only filters on with `With` or `Without` re-run it only
+/// when entities gain or lose them.
 fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
     world: &mut World,
     inputs: &mut Vec<Input>,
@@ -486,17 +636,21 @@ fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
         .reads()
         .as_finite_set()
         .into_iter()
-        .flat_map(bevy::ecs::query::ComponentIdSet::iter);
-    let ids = reads
-        .chain(access.with_filters())
-        .chain(access.without_filters());
+        .flat_map(bevy::ecs::query::ComponentIdSet::iter)
+        .map(|id| (id, Track::Value));
+    let filters = access
+        .with_filters()
+        .chain(access.without_filters())
+        .map(|id| (id, Track::Presence));
     inputs.extend(
-        ids.filter(|&id| !writes.contains(id) && id != is_resource)
-            .map(|id| Input {
+        reads
+            .chain(filters)
+            .filter(|&(id, _)| !writes.contains(id) && id != is_resource)
+            .map(|(id, track)| Input {
                 type_id: TypeId::of::<()>(),
                 id,
                 lookup: Lookup::Any,
-                tracked: true,
+                track,
             }),
     );
 }
@@ -511,7 +665,7 @@ impl<T: Component> ReactiveParam for Ref<'_, T> {
     type Item<'w, 's> = Ref<'w, T>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, Track::Value));
     }
 
     fn fetch<'w, 's>(
@@ -527,7 +681,7 @@ impl<T: Component> ReactiveParam for Option<Ref<'_, T>> {
     type Item<'w, 's> = Option<Ref<'w, T>>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, Track::Value));
     }
 
     fn fetch<'w, 's>(
@@ -543,7 +697,7 @@ impl<C: Component<Mutability = Mutable>> ReactiveParam for &mut C {
     type Item<'w, 's> = &'w mut C;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<C>(world, Lookup::Nearest, false));
+        inputs.push(Input::new::<C>(world, Lookup::Nearest, Track::No));
     }
 
     fn fetch<'w, 's>(
@@ -591,9 +745,9 @@ macro_rules! system_params {
 system_params! {
     // Tracked.
     ['a, T: Resource] Res<'a, T> => Res<'static, T>, Res<'w, T>,
-        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
     ['a, T: Resource] Option<Res<'a, T>> => Option<Res<'static, T>>, Option<Res<'w, T>>,
-        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
     ['a, 'b, D: QueryData + 'static, F: QueryFilter + 'static] Query<'a, 'b, D, F>
         => Query<'static, 'static, D, F>, Query<'w, 's, D, F>, query_inputs::<D, F>;
     ['a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static] Single<'a, 'b, D, F>
@@ -822,27 +976,39 @@ fn attach(world: &mut World, host: Entity, body: Box<dyn Body>) -> Result<Entity
     let mut unique: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
         if let Some(existing) = unique.iter_mut().find(|other| other.same_target(&input)) {
-            existing.tracked |= input.tracked;
+            existing.track = existing.track.max(input.track);
         } else {
             unique.push(input);
         }
     }
-    track_any(world, &unique);
+    track_any(
+        world,
+        unique
+            .iter()
+            .filter(|input| input.lookup != Lookup::Resource)
+            .map(|input| input.id),
+    );
     let reaction = world
         .spawn((
             Reaction {
                 host,
                 inputs: unique,
                 resolved: Vec::new(),
+                reads: Vec::new(),
                 last_run: None,
+                resolved_at: AtomicU32::new(0),
                 body: Some(body),
             },
             ReactionOf(host),
         ))
         .id();
     // After the rest of the scene spawns, so ancestors and `Source`s exist.
-    world.resource_mut::<Pending>().reactions.push(reaction);
-    world.commands().queue(run_pending);
+    let mut pending = world.resource_mut::<Pending>();
+    pending.reactions.push(reaction);
+    // One queued run covers every reaction attached before it applies.
+    if pending.reactions.len() == 1 {
+        world.commands().queue(run_pending);
+    }
     Ok(reaction)
 }
 
@@ -881,17 +1047,26 @@ fn run_reaction(world: &mut World, reaction: Entity) {
     };
     let inputs = std::mem::take(&mut state.inputs);
     let resolved = resolve_all(world, host, &inputs);
-    if world.get_entity(host).is_ok() {
-        body.run(
-            world,
-            &Cx {
-                host,
-                inputs: &inputs,
-                resolved: &resolved,
-                event: None,
-            },
-        );
-    }
+    let reads = collect_reads(|| {
+        if world.get_entity(host).is_ok() {
+            body.run(
+                world,
+                &Cx {
+                    host,
+                    inputs: &inputs,
+                    resolved: &resolved,
+                    event: None,
+                },
+            );
+        }
+    });
+    track_any(
+        world,
+        reads.iter().filter_map(|read| match *read {
+            Read::Missing(id) => Some(id),
+            Read::At(..) => None,
+        }),
+    );
     // Its own writes are older than `last_run`; later ones are newer.
     let last_run = world.increment_change_tick();
     if let Some(mut state) = world.get_mut::<Reaction>(reaction) {
@@ -899,7 +1074,9 @@ fn run_reaction(world: &mut World, reaction: Entity) {
         state.body = Some(body);
         state.inputs = inputs;
         state.resolved = resolved;
+        state.reads = reads;
         state.last_run = Some(last_run);
+        state.resolved_at = AtomicU32::new(last_run.get());
     }
     world.flush();
 }
@@ -922,6 +1099,7 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
     let mut due: Vec<(usize, Entity)> = {
         let world = &*world;
         let changes = world.resource::<AnyChanges>();
+        let hierarchy = world.resource::<HierarchyChanged>().0;
         reactions
             .iter(world)
             .filter(|(_, reaction)| {
@@ -929,7 +1107,7 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
                     && !world
                         .get_entity(reaction.host)
                         .is_ok_and(|host| host.contains::<Disabled>())
-                    && reaction.is_dirty(world, changes, now)
+                    && reaction.is_dirty(world, changes, hierarchy, now)
             })
             .map(|(entity, reaction)| {
                 let depth = ancestors(reaction.host, |entity| {
@@ -940,6 +1118,8 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
             })
             .collect()
     };
+    // Changes from here on are newer than the `now` checks were made at.
+    world.increment_change_tick();
     // Outer regions first: they may despawn the reactions inside them.
     due.sort_unstable();
     for &(_, reaction) in &due {
@@ -1544,8 +1724,15 @@ pub mod __private {
     };
     pub use bevy::scene::{bsn, bsn_list};
 
-    use super::{Cx, Disabled, Input, IntoReader, Reader};
-    use bevy::prelude::*;
+    use super::{Cx, Disabled, Input, IntoReader, ReactiveParam, Read, Reader, record};
+    use bevy::{
+        ecs::{
+            component::{ComponentId, ComponentIdFor},
+            query::QueryEntityError,
+            system::SystemParamItem,
+        },
+        prelude::*,
+    };
     use std::marker::PhantomData;
 
     /// A reader closure returning `Option<V>`, read as one returning `V`
@@ -1584,6 +1771,45 @@ pub mod __private {
 
         fn read(&mut self, world: &mut World, cx: &Cx) -> Option<V> {
             self.0.read(world, cx).flatten()
+        }
+    }
+
+    /// `$Ref<Type>(..)`'s parameter: like `Query<Ref<Type>>`, but re-runs
+    /// the closure only when what it got changes, not any `Type` anywhere.
+    #[allow(non_camel_case_types)]
+    pub struct __rsn_Get<'w, 's, T: Component> {
+        query: Query<'w, 's, Ref<'static, T>>,
+        id: ComponentId,
+    }
+
+    impl<T: Component> __rsn_Get<'_, '_, T> {
+        /// `T` on `entity`, recording the read.
+        pub fn get(&self, entity: Entity) -> Result<Ref<'_, T>, QueryEntityError> {
+            let found = self.query.get(entity);
+            record(if found.is_ok() {
+                Read::At(entity, self.id)
+            } else {
+                Read::Missing(self.id)
+            });
+            found
+        }
+    }
+
+    impl<T: Component> ReactiveParam for __rsn_Get<'_, '_, T> {
+        type Param = (
+            Query<'static, 'static, Ref<'static, T>>,
+            ComponentIdFor<'static, T>,
+        );
+        type Item<'w, 's> = __rsn_Get<'w, 's, T>;
+
+        fn fetch<'w, 's>(
+            (query, id): SystemParamItem<'w, 's, Self::Param>,
+            _: &Cx,
+        ) -> Option<Self::Item<'w, 's>> {
+            Some(__rsn_Get {
+                query,
+                id: id.get(),
+            })
         }
     }
 

@@ -717,3 +717,88 @@ fn missing_plugin_is_an_error() {
     });
     assert!(result.is_err());
 }
+
+#[test]
+fn ref_lookups_follow_hierarchy_changes_after_idle_frames() {
+    let mut app = app();
+    let far = app.world_mut().spawn(Count(1)).id();
+    let middle = app.world_mut().spawn(ChildOf(far)).id();
+    let label = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Label
+            watch(|count: Ref<Count>| Label(format!("{}", count.0)))
+        })
+        .unwrap()
+        .id();
+    app.world_mut().entity_mut(label).insert(ChildOf(middle));
+    app.update();
+    assert_eq!(label_of(&app, label), "1");
+    // Idle frames, so the lookup is cached.
+    app.update();
+    app.update();
+
+    // A nearer ancestor gains the component.
+    app.world_mut().entity_mut(middle).insert(Count(2));
+    app.update();
+    assert_eq!(label_of(&app, label), "2");
+
+    // ... and loses it again.
+    app.world_mut().entity_mut(middle).remove::<Count>();
+    app.update();
+    assert_eq!(label_of(&app, label), "1");
+
+    // Moved under another ancestor.
+    let other = app.world_mut().spawn(Count(3)).id();
+    app.update();
+    app.world_mut().entity_mut(label).insert(ChildOf(other));
+    app.update();
+    assert_eq!(label_of(&app, label), "3");
+
+    // A `Source` added on the way.
+    let source = app.world_mut().spawn(Count(4)).id();
+    app.update();
+    app.world_mut().entity_mut(label).insert(Source(source));
+    app.update();
+    assert_eq!(label_of(&app, label), "4");
+}
+
+#[test]
+fn with_filters_rerun_on_membership_not_values() {
+    let mut app = app();
+    let goblin = app.world_mut().spawn((Enemy, Health(5))).id();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|enemies: Query<Entity, With<Health>>, mut runs: ResMut<Runs>| {
+                let _ = enemies.iter().count();
+                runs.0 += 1;
+            })
+        })
+        .unwrap();
+    app.update();
+    let before = app.world().resource::<Runs>().0;
+
+    app.world_mut().get_mut::<Health>(goblin).unwrap().0 = 1;
+    app.update();
+    assert_eq!(
+        app.world().resource::<Runs>().0,
+        before,
+        "a value change doesn't re-run"
+    );
+
+    app.world_mut().spawn(Health(2));
+    app.update();
+    assert_eq!(
+        app.world().resource::<Runs>().0,
+        before + 1,
+        "a new member does"
+    );
+
+    app.world_mut().entity_mut(goblin).remove::<Health>();
+    app.update();
+    assert_eq!(
+        app.world().resource::<Runs>().0,
+        before + 2,
+        "a lost member does"
+    );
+}

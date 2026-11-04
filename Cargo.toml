@@ -104,3 +104,8 @@ required-features = ["comparison", "hooks"]
 name = "comparison_view"
 path = "examples/comparison/view.rs"
 required-features = ["comparison", "view"]
+
+[[bench]]
+name = "reactive"
+harness = false
+required-features = ["reactive"]
