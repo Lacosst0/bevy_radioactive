@@ -664,6 +664,60 @@ fn comma_separated_lists_with_control_flow() {
     assert_eq!(labels(&mut app), ["first", "on", "a", "some", "last"]);
 }
 
+#[derive(Event, Clone, Copy)]
+struct Bump;
+
+#[test]
+fn for_over_a_block_res_and_res_mut_together_and_commands() {
+    let mut app = app();
+    app.add_observer(|_: On<Bump>, mut score: ResMut<Score>| score.0 += 100);
+    app.world_mut().resource_mut::<Todos>().0 = vec![todo(2, "b"), todo(1, "a")];
+    app.world_mut()
+        .spawn_scene(rsn! {
+            #Root
+            Count(0)
+            Children [
+                // The iterator is a block, as Rust allows.
+                #[key(todo.id)]
+                for todo in {
+                    let mut todos = $Res<Todos>.0.clone();
+                    todos.sort_by_key(|todo| todo.id);
+                    todos
+                } {
+                    Label({ todo.title.clone() })
+                }
+                --
+                #Button
+                on(|_: On<Poke>| {
+                    // One `ResMut<Score>`, not a conflicting pair.
+                    let next = $Res<Score>.0 + 1;
+                    $ResMut<Score>.0 = next;
+                    $Commands.trigger(Bump);
+                })
+                --
+                Label({ format!("score {}", $Res<Score>.0) })
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["a", "b", "score 0"]);
+
+    let button = {
+        let world = app.world_mut();
+        let mut query = world.query::<(Entity, &Name)>();
+        query
+            .iter(world)
+            .find(|(_, name)| name.as_str() == "Button")
+            .unwrap()
+            .0
+    };
+    app.world_mut().trigger(Poke {
+        entity: button,
+        by: 0,
+    });
+    app.update();
+    assert_eq!(labels(&mut app), ["a", "b", "score 101"]);
+}
+
 // ---------------------------------------------------------------------------
 // `$` in scene inputs
 // ---------------------------------------------------------------------------

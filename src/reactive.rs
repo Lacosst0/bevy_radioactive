@@ -22,7 +22,7 @@
 //! In debug builds, a closure whose `#Name` or `"Name"` matches nothing (or
 //! whose entity lacks the component) logs one warning; it is skipped either
 //! way.
-//! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, .. | that system parameter, as in a Bevy system |
+//! | `$Res<T>`, `$ResMut<T>`, `$Local<T>`, `$Query<..>`, `$Single<..>`, `$Commands`, .. | that system parameter, as in a Bevy system; in one `on(..)`, `$Res<T>` and `$ResMut<T>` share one `ResMut<T>` |
 //!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};

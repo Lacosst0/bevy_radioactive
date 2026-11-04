@@ -38,6 +38,8 @@ bevy = { version = "0.20", default-features = false, features = [
     "bevy_scene",
     "bevy_log",
     "bevy_ui_widgets",
+    "bevy_state",
+    "bevy_picking",
 ] }
 
 [lints.clippy]
@@ -116,6 +118,11 @@ required-features = ["comparison", "hooks"]
 name = "comparison_view"
 path = "examples/comparison/view.rs"
 required-features = ["comparison", "view"]
+
+[[example]]
+name = "game_ui"
+path = "examples/game_ui/main.rs"
+required-features = ["comparison", "reactive"]
 
 [[bench]]
 name = "reactive"
