@@ -121,6 +121,8 @@ fn app_body() -> impl Scene {
 | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
 | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a `watch` that rebuilds the component the expression returns |
 | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
+| `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a `switch` region, rebuilt when an input changes |
+| `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a `watch` that patches `Comp` in place |
 | `on(\|e: On<E>\| .. $ ..)` | a handler; write with `$Mut<Type>(#Name)`, `$Mut<Type>(e)` or `$ResMut<T>` (`$Mut<Count>(#Counter).0 += 1`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
@@ -136,6 +138,31 @@ fn app_body() -> impl Scene {
 - Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
+- Scenes take reactive inputs two ways. A scene function runs once, so
+  `@greeting($Res<Title>.0)` rebuilds the entity (and its state) when an input
+  changes; inputs are cloned out of the read and need `Clone + PartialEq`. A
+  [`SceneComponent`](https://docs.rs/bevy/0.20.0/bevy/prelude/trait.SceneComponent.html)
+  field is patched in place instead, so its scene keeps its entities and reads the
+  field with `$`:
+
+  ```rust,ignore
+  #[derive(SceneComponent, Clone, Default)]
+  struct Meter { value: u32, max: u32 }
+
+  impl Meter {
+      fn scene() -> impl Scene {
+          rsn! {
+              #Meter
+              Children [ Text({ format!("{}/{}", $Ref<Meter>(#Meter).value, $Ref<Meter>(#Meter).max) }) ]
+          }
+      }
+  }
+
+  // Patches `value` when `Health` changes; the meter is never rebuilt.
+  rsn! { @Meter { value: $Res<Health>.0, max: 100 } }
+  ```
+
+  `@prop`s are scene function inputs, so a `$` in one rebuilds like an argument.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
 

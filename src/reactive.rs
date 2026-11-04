@@ -60,6 +60,8 @@
 //! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
 //! | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a [`watch`] that rebuilds the component the expression returns |
 //! | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
+//! | `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a [`switch`] region, rebuilt when an input changes |
+//! | `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a [`watch`] that patches `Comp` in place |
 //! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; write with `$Mut<Type>(..)` or `$ResMut<T>` |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
@@ -73,6 +75,12 @@
 //! `$Query<Entity, With<T>>` and read `$Ref<T>(entity)` to update rows in place.
 //! Other loops need owned items that implement `PartialEq`. Loop and match
 //! bindings may be used any number of times. [`rsn_list!`] is the list form.
+//!
+//! A scene function runs once, so `$` in `@scene(..)` arguments or `@prop`s
+//! rebuilds the entity when an input changes (inputs are cloned out of the
+//! read and need `Clone + PartialEq`). A `SceneComponent` field is patched in
+//! place instead, and its scene reads the field with `$Ref<Comp>(#Root)`: use
+//! fields for values that change often and scenes that keep state.
 //!
 //! The functions it expands to are public and take closures with ordinary
 //! Bevy system parameters; use them in `bsn!` or plain Rust:
