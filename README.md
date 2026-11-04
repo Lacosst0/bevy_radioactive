@@ -33,7 +33,8 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
-affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
+affect layout. The default `widgets` feature lets `reactive`'s `bind` drive the
+`bevy_ui_widgets` slider, checkbox and text input. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
 
 ## `reactive`
 
@@ -121,7 +122,10 @@ fn app_body() -> impl Scene {
 | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
 | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a `watch` that rebuilds the component the expression returns |
 | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
+| `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a `switch` region, rebuilt when an input changes |
+| `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a `watch` that patches `Comp` in place |
 | `on(\|e: On<E>\| .. $ ..)` | a handler; write with `$Mut<Type>(#Name)`, `$Mut<Type>(e)` or `$ResMut<T>` (`$Mut<Count>(#Counter).0 += 1`) |
+| `bind(.. $ ..)` | a two-way binding: the widget shows the value, and the user's edits are written back (`bind($Res<Settings>.volume)`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
 | `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
@@ -136,8 +140,66 @@ fn app_body() -> impl Scene {
 - Other `for` loops need owned items (`$Res<Todos>.0.clone()`, a range, a `Vec`) that
   implement `PartialEq`. Loop and match bindings can be used any number of times.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
+- Scenes take reactive inputs two ways. A scene function runs once, so
+  `@greeting($Res<Title>.0)` rebuilds the entity (and its state) when an input
+  changes; inputs are cloned out of the read and need `Clone + PartialEq`. A
+  [`SceneComponent`](https://docs.rs/bevy/0.20.0/bevy/prelude/trait.SceneComponent.html)
+  field is patched in place instead, so its scene keeps its entities and reads the
+  field with `$`:
+
+  ```rust,ignore
+  #[derive(SceneComponent, Clone, Default)]
+  struct Meter { value: u32, max: u32 }
+
+  impl Meter {
+      fn scene() -> impl Scene {
+          rsn! {
+              #Meter
+              Children [ Text({ format!("{}/{}", $Ref<Meter>(#Meter).value, $Ref<Meter>(#Meter).max) }) ]
+          }
+      }
+  }
+
+  // Patches `value` when `Health` changes; the meter is never rebuilt.
+  rsn! { @Meter { value: $Res<Health>.0, max: 100 } }
+  ```
+
+  `@prop`s are scene function inputs, so a `$` in one rebuilds like an argument.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
+
+### Two-way binding
+
+`bind(place)` keeps a widget and a value in sync, both ways. The widget shows the
+value and follows it when it changes; when the user edits the widget, the new value
+is written back to the place (only when it differs, so change detection stays quiet).
+Read the place with `$Res`/`$Ref`; `bind` writes it through `$ResMut`/`$Mut` for you.
+
+```rust,ignore
+rsn! {
+    #Panel
+    Brightness(0.5)
+    Children [
+        Slider SliderRange::new(0.0, 1.0) bind($Res<Settings>.volume)  // f32
+        --
+        Checkbox bind($Res<Settings>.muted)                            // bool
+        --
+        TextInput bind($Res<Settings>.name)                            // String
+        --
+        Slider bind($Ref<Brightness>(#Panel).0)                        // a component
+        --
+        Button on(|_: On<Activate>| $ResMut<Settings>.muted = true)    // a click handler
+    ]
+}
+```
+
+The widget is the entity's `Bindable` component for the value's type. The `widgets`
+feature (on by default) registers `bevy_ui_widgets`' `Slider`, `Checkbox` and
+`TextInput`, which Feathers' controls are built on. Register your own widget with
+`app.register_bindable::<MyKnob>()` after implementing `Bindable` for it: its value
+type, the event it sends when edited, how to show a value and how to read one from
+the event. In `bsn!` or plain Rust, `bind` takes a getter and a setter:
+`bind(|s: Res<Settings>| s.volume, |v: &f32, mut s: ResMut<Settings>| s.volume = *v)`.
 
 ### The functions under `rsn!`
 
@@ -160,7 +222,7 @@ bsn! {
 | --- | --- | --- |
 | `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest component `T`: this entity, its `Source`, then its ancestors |
 | `Res<T>` / `Option<Res<T>>` | yes | resource `T` |
-| `Query`, `Single`, `Populated` | yes | when a component they read or filter on changes, is added or removed |
+| `Query`, `Single`, `Populated` | yes | when a component they read changes, is added or removed; a `With`/`Without` filter only when it is added or removed |
 | `c: &mut C` | no | the nearest `C`, written in place |
 | `e: Entity` | no | the entity that declared the closure |
 | `ResMut`, `Commands`, `Local`, messages | no | ordinary system parameters |
@@ -170,6 +232,7 @@ bsn! {
 | --- | --- | --- |
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
+| `bind(\|..\| value, \|v: &V, ..\| ..)` | template | sync a widget with a value, both ways |
 | `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
 | `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` |
 | `@switch(\|..\| key, \|key\| ..)` | scene | `match`; arms are boxed with `.into()` |
@@ -224,7 +287,7 @@ rsn! {
   content take up space together. Position one absolutely to cross-fade.
 - `Ref<Presence>` in `watch` also finds the root's `Presence` from its descendants.
 
-Examples: `reactive_counters`, `reactive_todos`, `reactive_transitions`, `comparison_reactive`.
+Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `reactive_transitions`, `comparison_reactive`.
 
 ## `subscribe`
 

@@ -10,6 +10,9 @@
 //! - `Comp(.. $X ..)` becomes `watch(..)` returning `Comp`;
 //!   `Comp { field: .. $X .., .. }` keeps the other fields and patches the
 //!   reactive ones in a `watch`.
+//! - `@scene(.. $X ..)` and `@Comp { @prop: .. $X .. }` become a `match` on
+//!   the inputs, so the entity is rebuilt when they change; `@Comp { field:
+//!   .. $X .. }` patches the scene component like any component.
 //!
 //! Names bound by `for` and `match` patterns are cloned per use (a *site*),
 //! because `bsn!` moves what each value captures.
@@ -267,7 +270,8 @@ impl Params {
                 (Kind::Exact, _) => quote!(#[allow(unused_mut)] mut #name: #ty,),
                 (Kind::Entity(_) | Kind::Named(_), false) => {
                     let query = format_ident!("__rsn_q{index}");
-                    quote!(#query: ::bevy::prelude::Query<::bevy::prelude::Ref<#ty>>,)
+                    let get = private("Get");
+                    quote!(#query: #get<#ty>,)
                 }
                 (Kind::Entity(_) | Kind::Named(_), true) => {
                     let query = format_ident!("__rsn_q{index}");
@@ -451,8 +455,8 @@ fn dollar(
     Ok((params.param(ty, kind), j + 1))
 }
 
-const MISPLACED_DOLLAR: &str =
-    "`$` reads work in component values, `on(..)` handlers and `if`/`match`/`for` headers";
+const MISPLACED_DOLLAR: &str = "`$` reads work in component values, `@scene(..)` arguments, `on(..)` handlers, \
+     `bind(..)` and `if`/`match`/`for` headers";
 
 fn has_dollar(tokens: &[TokenTree]) -> bool {
     tokens.iter().enumerate().any(|(i, token)| match token {
@@ -557,6 +561,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
         // `Type`, `Type { .. }`, `Type(..)` or `Enum::Variant`, as in `bsn!`.
         let is_component = idents.last().is_some_and(upper);
         let is_on = path.len() == 1 && is_ident(path.first(), "on");
+        let is_bind = path.len() == 1 && is_ident(path.first(), "bind");
 
         if let Some(TokenTree::Group(g)) = tokens.get(i)
             && g.delimiter() == Delimiter::Bracket
@@ -592,18 +597,25 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
         let content = group.as_ref().map(tokens_of).unwrap_or_default();
 
         if has_dollar(&content) || has_dollar(chain) {
-            if start > 0
-                && (is_punct(tokens.get(start - 1), '@') || is_punct(tokens.get(start - 1), ':'))
-            {
+            let scene = start > 0 && is_punct(tokens.get(start - 1), '@');
+            if start > 0 && is_punct(tokens.get(start - 1), ':') || scene && !is_component {
                 error(
                     tokens[start].span(),
-                    "a scene's arguments are read once; read `$` inside the scene function's own \
-                     `rsn!`, or pick the scene with `if`/`match`",
+                    "`$` works in `@scene(..)` arguments and `@Comp { .. }` fields; \
+                     `:` scenes and `@{ .. }` are read once",
                 );
                 continue;
             }
             match &group {
+                // `@Comp(.. $ ..)`: the scene with a default `Comp`, and a
+                // watch that rebuilds it. (`@Comp { .. }` patches its fields
+                // like any component; `@prop`s were made inputs in `list_item`.)
+                Some(g) if scene && g.delimiter() == Delimiter::Parenthesis && chain.is_empty() => {
+                    stream(path).to_tokens(&mut out);
+                    reactive_component(path, g, scope).to_tokens(&mut out);
+                }
                 Some(g) if is_on && chain.is_empty() => handler(g, scope).to_tokens(&mut out),
+                Some(g) if is_bind && chain.is_empty() => binding(g, scope).to_tokens(&mut out),
                 Some(g) if is_component && chain.is_empty() => {
                     reactive_component(path, g, scope).to_tokens(&mut out);
                 }
@@ -660,9 +672,14 @@ fn captured_args(group: &Group, is_component: bool, scope: &mut Scope) -> Group 
             if !scope.mentions(part) {
                 return stream(part);
             }
+            // `@prop: value` in a scene component.
+            let (prop, part) = match part.split_first() {
+                Some((at, rest)) if is_punct(Some(at), '@') => (quote!(@), rest),
+                _ => (TokenStream::new(), &part[..]),
+            };
             let (name, value) = match field_split(part, group.delimiter()) {
                 Some((name, value)) => (Some(name), value),
-                None => (None, &part[..]),
+                None => (None, part),
             };
             let site = scope.site(value);
             let value = unbrace(value);
@@ -673,7 +690,7 @@ fn captured_args(group: &Group, is_component: bool, scope: &mut Scope) -> Group 
                 quote!({ #site #value })
             };
             match name {
-                Some(name) => quote!(#name: #value),
+                Some(name) => quote!(#prop #name: #value),
                 None => value,
             }
         })
@@ -906,6 +923,67 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
     }
 }
 
+/// `$Res`/`$ResMut` and `$Ref`/`$Mut` in `tokens`, deeply, as the reading
+/// (`write: false`) or writing form.
+fn access(tokens: &[TokenTree], write: bool) -> Tokens {
+    let (from, to) = if write {
+        (["Res", "Ref"], ["ResMut", "Mut"])
+    } else {
+        (["ResMut", "Mut"], ["Res", "Ref"])
+    };
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| match token {
+            TokenTree::Ident(ident) if is_punct(tokens.get(i.wrapping_sub(1)), '$') => {
+                match from.iter().position(|name| ident == name) {
+                    Some(index) => TokenTree::Ident(Ident::new(to[index], ident.span())),
+                    None => token.clone(),
+                }
+            }
+            TokenTree::Group(g) if !nested_rsn(tokens, i) => {
+                let mut group = Group::new(g.delimiter(), stream(&access(&tokens_of(g), write)));
+                group.set_span(g.span());
+                TokenTree::Group(group)
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// `bind(place with $X)` → `bind(|x: Res<X>| clone(place), |v: &_, x: ResMut<X>| place = v)`.
+fn binding(group: &Group, scope: &mut Scope) -> TokenStream {
+    let content = tokens_of(group);
+    let site = scope.site(&content);
+
+    let mut params = Params::default();
+    let read = reads(&access(&content, false), &mut params);
+    let get = params.reader(
+        TokenStream::new(),
+        None,
+        quote!(::core::clone::Clone::clone(&(#read))),
+    );
+
+    let mut params = Params {
+        params: Vec::new(),
+        write: true,
+    };
+    let place = reads(&access(&content, true), &mut params);
+    let writers = params.closure_params(true);
+    let lookups = params.lookups(true);
+    let differs = private("differs");
+    let set = quote! {
+        move |__rsn_value: &_, #writers| {
+            #lookups
+            if #differs(&(#place), __rsn_value) {
+                #place = ::core::clone::Clone::clone(__rsn_value);
+            }
+        }
+    };
+    let bind = private("bind");
+    quote!(#bind({ #site #get }, { #site #set }))
+}
+
 // ---------------------------------------------------------------------------
 // Scene lists and control flow
 // ---------------------------------------------------------------------------
@@ -998,9 +1076,121 @@ fn list_item(item: &[TokenTree], scope: &mut Scope) -> TokenStream {
         if_item(rest, scope)
     } else if is_ident(rest.first(), "match") {
         match_item(rest, scope)
+    } else if let Some(rebuilt) = scene_inputs(rest) {
+        match_item(&rebuilt, scope)
     } else {
         entity(rest, scope)
     }
+}
+
+/// An entity whose scene inputs read `$`: `@scene(.. $ ..)` arguments, or
+/// `@Comp { @prop: .. $ .. }` props. A scene function runs once, so the
+/// entity is rebuilt when the inputs change:
+///
+/// `Node @scene($Res<X>.0, 5)` →
+/// `match (clone(&$Res<X>.0),) { (a,) => { Node @scene(a, 5) } }`.
+///
+/// Scene component fields (`@Comp { field: $.. }`) are left to `entity`,
+/// which patches them in place.
+fn scene_inputs(item: &[TokenTree]) -> Option<Tokens> {
+    let mut values: Vec<TokenStream> = Vec::new();
+    let mut names: Vec<Ident> = Vec::new();
+    let mut input = |value: &[TokenTree]| {
+        let name = format_ident!("__rsn_a{}", HOISTED.fetch_add(1, Ordering::Relaxed));
+        let value = unbrace(value);
+        values.push(quote!(::core::clone::Clone::clone(&(#value))));
+        names.push(name.clone());
+        name
+    };
+    let mut out = Tokens::new();
+    let mut i = 0;
+    while i < item.len() {
+        if !is_punct(item.get(i), '@') {
+            out.push(item[i].clone());
+            i += 1;
+            continue;
+        }
+        // `@path`, as in `entity`.
+        let start = i + 1;
+        let mut j = start;
+        if is_punct(item.get(j), ':') && is_punct(item.get(j + 1), ':') {
+            j += 2;
+        }
+        while let Some(TokenTree::Ident(_)) = item.get(j) {
+            j += 1;
+            if is_punct(item.get(j), ':') && is_punct(item.get(j + 1), ':') {
+                j += 2;
+            } else {
+                break;
+            }
+        }
+        let path = &item[start..j];
+        let is_type = matches!(
+            path.iter().rev().find(|t| matches!(t, TokenTree::Ident(_))),
+            Some(TokenTree::Ident(last)) if last.to_string().starts_with(char::is_uppercase)
+        );
+        let rewritten = match item.get(j) {
+            // `@scene(args)`: each argument with a `$` becomes an input.
+            Some(TokenTree::Group(g))
+                if !path.is_empty()
+                    && !is_type
+                    && g.delimiter() == Delimiter::Parenthesis
+                    && has_dollar(&tokens_of(g)) =>
+            {
+                let args = split_commas(&tokens_of(g)).into_iter().map(|arg| {
+                    if has_dollar(&arg) {
+                        input(&arg).into_token_stream()
+                    } else {
+                        stream(&arg)
+                    }
+                });
+                let args: Vec<_> = args.collect();
+                let mut group = Group::new(Delimiter::Parenthesis, quote!(#(#args),*));
+                group.set_span(g.span());
+                Some(group)
+            }
+            // `@Comp { @prop: $.. }`: props with a `$` become inputs.
+            Some(TokenTree::Group(g)) if is_type && g.delimiter() == Delimiter::Brace => {
+                let fields = split_commas(&tokens_of(g));
+                let reactive_prop =
+                    |field: &Tokens| is_punct(field.first(), '@') && has_dollar(field);
+                if fields.iter().any(reactive_prop) {
+                    let fields: Vec<TokenStream> = fields
+                        .iter()
+                        .map(|field| match field_split(&field[1..], Delimiter::Brace) {
+                            Some((name, value)) if reactive_prop(field) => {
+                                let input = input(value);
+                                quote!(@#name: {#input})
+                            }
+                            _ => stream(field),
+                        })
+                        .collect();
+                    let mut group = Group::new(Delimiter::Brace, quote!(#(#fields),*));
+                    group.set_span(g.span());
+                    Some(group)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        out.extend(item[i..j].iter().cloned());
+        i = j;
+        if let Some(group) = rewritten {
+            out.push(TokenTree::Group(group));
+            i += 1;
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    let span = item.first().map_or_else(Span::call_site, TokenTree::span);
+    let mut body = Group::new(Delimiter::Brace, stream(&out));
+    body.set_span(span);
+    let scrutinee = quote!((#(#values,)*));
+    let pattern = quote!((#(#names,)*));
+    let arms = Group::new(Delimiter::Brace, quote!(#pattern => #body));
+    Some(quote!(match #scrutinee #arms).into_iter().collect())
 }
 
 /// A branch's content: `{ prelude Box::new(bsn_list! { .. }) }`, with the
