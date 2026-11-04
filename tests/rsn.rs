@@ -717,3 +717,247 @@ fn for_over_a_block_res_and_res_mut_together_and_commands() {
     app.update();
     assert_eq!(labels(&mut app), ["a", "b", "score 101"]);
 }
+
+// ---------------------------------------------------------------------------
+// `$` in scene inputs
+// ---------------------------------------------------------------------------
+
+#[derive(Resource, Clone, Default)]
+struct Title(String);
+
+#[allow(clippy::needless_pass_by_value)]
+fn greeting(name: String, score: u32) -> impl Scene {
+    rsn! { Label({ format!("{name}: {score}") }) }
+}
+
+#[test]
+fn dollar_in_scene_arguments_rebuilds_the_scene() {
+    let mut app = app();
+    app.insert_resource(Title("ann".into()));
+    app.world_mut()
+        .spawn_scene(rsn! {
+            #Root
+            Count(0)
+            Children [
+                // Owned values are cloned out of the read, so no `.clone()`.
+                @greeting($Res<Title>.0, $Res<Score>.0),
+                @greeting("bob".to_string(), 1) Row,
+                Row @greeting({ format!("#{}", $Ref<Count>(#Root).0) }, 2)
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["ann: 0", "bob: 1", "#0: 2"]);
+    let first = entities_with::<Label>(&mut app);
+
+    app.world_mut().resource_mut::<Score>().0 = 3;
+    app.update();
+    assert_eq!(labels(&mut app), ["ann: 3", "bob: 1", "#0: 2"]);
+    let after = entities_with::<Label>(&mut app);
+    assert_eq!(
+        after.iter().filter(|e| first.contains(e)).count(),
+        2,
+        "only the scene whose input changed is rebuilt"
+    );
+    assert_eq!(
+        entities_with::<Row>(&mut app).len(),
+        2,
+        "the rest of the entity comes back"
+    );
+
+    app.insert_resource(Title("cy".into()));
+    set_count(&mut app, 5);
+    assert_eq!(labels(&mut app), ["cy: 3", "bob: 1", "#5: 2"]);
+}
+
+#[test]
+fn dollar_scene_arguments_inside_control_flow_and_loops() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                for i in 0..2u32 {
+                    @greeting(i.to_string(), $Res<Score>.0 + i)
+                },
+                if $Res<Score>.0 > 0 {
+                    @greeting("big".to_string(), $Res<Score>.0 * 10)
+                }
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["0: 0", "1: 1"]);
+    app.world_mut().resource_mut::<Score>().0 = 2;
+    app.update();
+    assert_eq!(labels(&mut app), ["0: 2", "1: 3", "big: 20"]);
+}
+
+/// A scene component: `value` is a field, so `$` patches it in place, and the
+/// scene reads it like any component. `@prefix` is a prop: the scene function
+/// takes it, so a `$` there rebuilds the scene.
+#[derive(SceneComponent, Clone, Default)]
+#[scene(Meter::scene(MeterProps))]
+struct Meter {
+    value: u32,
+    max: u32,
+}
+
+#[derive(Default)]
+struct MeterProps {
+    prefix: String,
+}
+
+impl Meter {
+    fn scene(props: MeterProps) -> impl Scene {
+        let prefix = props.prefix;
+        rsn! {
+            #Meter
+            Children [
+                Label({ format!("{prefix}{}/{}", $Ref<Meter>(#Meter).value, $Ref<Meter>(#Meter).max) })
+            ]
+        }
+    }
+}
+
+#[test]
+fn dollar_in_scene_component_fields_patches_without_rebuilding() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                @Meter { value: $Res<Score>.0, max: 10 },
+                @Meter { @prefix: { "hp ".to_string() }, value: 1, max: $Res<Score>.0 + 1 }
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["0/10", "hp 1/1"]);
+    let before = entities_with::<Label>(&mut app);
+
+    app.world_mut().resource_mut::<Score>().0 = 4;
+    app.update();
+    assert_eq!(labels(&mut app), ["4/10", "hp 1/5"]);
+    assert_eq!(
+        entities_with::<Label>(&mut app),
+        before,
+        "fields patch in place"
+    );
+}
+
+#[test]
+fn dollar_in_scene_component_props_rebuilds() {
+    let mut app = app();
+    app.insert_resource(Title("a ".into()));
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                @Meter { @prefix: $Res<Title>.0, value: $Res<Score>.0, max: 9 }
+            ]
+        })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["a 0/9"]);
+    let before = entities_with::<Label>(&mut app);
+
+    app.world_mut().resource_mut::<Score>().0 = 1;
+    app.update();
+    assert_eq!(labels(&mut app), ["a 1/9"]);
+    assert_eq!(
+        entities_with::<Label>(&mut app),
+        before,
+        "a field change patches"
+    );
+
+    app.insert_resource(Title("b ".into()));
+    app.update();
+    assert_eq!(labels(&mut app), ["b 1/9"]);
+    assert_ne!(
+        entities_with::<Label>(&mut app),
+        before,
+        "a prop change rebuilds"
+    );
+}
+
+#[derive(SceneComponent, Clone, Default)]
+#[scene(Badge::scene)]
+struct Badge(u32);
+
+impl Badge {
+    fn scene() -> impl Scene {
+        rsn! {
+            #Badge
+            Children [ Label({ format!("badge {}", $Ref<Badge>(#Badge).0) }) ]
+        }
+    }
+}
+
+#[test]
+fn dollar_in_tuple_scene_components_rebuilds_the_component() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(rsn! { @Badge($Res<Score>.0 * 2) })
+        .unwrap();
+    assert_eq!(labels(&mut app), ["badge 0"]);
+    let before = entities_with::<Label>(&mut app);
+    app.world_mut().resource_mut::<Score>().0 = 3;
+    app.update();
+    assert_eq!(labels(&mut app), ["badge 6"]);
+    assert_eq!(entities_with::<Label>(&mut app), before);
+}
+
+#[test]
+fn entity_reads_rerun_only_for_their_own_entity() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    let mut app = app();
+    let tasks: Vec<Entity> = (0..3)
+        .map(|i| {
+            app.world_mut()
+                .spawn(Task {
+                    title: format!("t{i}"),
+                    done: false,
+                })
+                .id()
+        })
+        .collect();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Children [
+                for task in $Query<Entity, With<Task>> {
+                    Label({
+                        RUNS.fetch_add(1, Ordering::Relaxed);
+                        $Ref<Task>(task).title.clone()
+                    })
+                }
+            ]
+        })
+        .unwrap();
+    app.update();
+    let rows = entities_with::<Label>(&mut app);
+    let before = RUNS.load(Ordering::Relaxed);
+
+    app.world_mut().get_mut::<Task>(tasks[1]).unwrap().title = "edited".into();
+    app.update();
+    assert_eq!(labels(&mut app), ["t0", "edited", "t2"]);
+    assert_eq!(
+        RUNS.load(Ordering::Relaxed) - before,
+        1,
+        "only the edited row re-runs"
+    );
+    assert_eq!(
+        entities_with::<Label>(&mut app),
+        rows,
+        "a value change doesn't rebuild the list"
+    );
+
+    // Losing and regaining the component is still seen.
+    app.world_mut().entity_mut(tasks[0]).remove::<Task>();
+    app.update();
+    let mut shown = labels(&mut app);
+    shown.sort();
+    assert_eq!(shown, ["edited", "t2"]);
+    app.world_mut().entity_mut(tasks[0]).insert(Task {
+        title: "back".into(),
+        done: false,
+    });
+    app.update();
+    assert_eq!(labels(&mut app).len(), 3);
+    assert!(labels(&mut app).contains(&"back".to_string()));
+}

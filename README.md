@@ -33,7 +33,8 @@ bevy_radioactive = { path = "../bevy_radioactive" }
 
 The default `ui` feature runs updates before Bevy UI layout, so changes show in the
 same frame, and makes component hosts and `view!` regions `GhostNode`s so they don't
-affect layout. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
+affect layout. The default `widgets` feature lets `reactive`'s `bind` drive the
+`bevy_ui_widgets` slider, checkbox and text input. See [MIGRATION.md](MIGRATION.md) for upgrading from 0.5.
 
 ## `reactive`
 
@@ -121,7 +122,10 @@ fn app_body() -> impl Scene {
 | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a `watch` that patches `a` |
 | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a `watch` that rebuilds the component the expression returns |
 | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
+| `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a `switch` region, rebuilt when an input changes |
+| `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a `watch` that patches `Comp` in place |
 | `on(\|e: On<E>\| .. $ ..)` | a handler; write with `$Mut<Type>(#Name)`, `$Mut<Type>(e)` or `$ResMut<T>` (`$Mut<Count>(#Counter).0 += 1`) |
+| `bind(.. $ ..)` | a two-way binding: the widget shows the value, and the user's edits are written back (`bind($Res<Settings>.volume)`) |
 | `if`/`else if`/`else` | a region showing one branch, rebuilt when the branch changes |
 | `match value { pat => .., }` | a region per arm; arms are `pat => scene,` or `pat => { scene -- scene }` |
 | `for pat in $Query<D, F> { .. }` | one row per matching entity; see below |
@@ -139,8 +143,66 @@ fn app_body() -> impl Scene {
 - In one `on(..)`, `$Res<T>` and `$ResMut<T>` share a single `ResMut<T>`, so reading and
   writing a resource doesn't conflict.
 - `rsn_list!` is the list form (`a -- b`), like `bsn_list!`.
+- Scenes take reactive inputs two ways. A scene function runs once, so
+  `@greeting($Res<Title>.0)` rebuilds the entity (and its state) when an input
+  changes; inputs are cloned out of the read and need `Clone + PartialEq`. A
+  [`SceneComponent`](https://docs.rs/bevy/0.20.0/bevy/prelude/trait.SceneComponent.html)
+  field is patched in place instead, so its scene keeps its entities and reads the
+  field with `$`:
+
+  ```rust,ignore
+  #[derive(SceneComponent, Clone, Default)]
+  struct Meter { value: u32, max: u32 }
+
+  impl Meter {
+      fn scene() -> impl Scene {
+          rsn! {
+              #Meter
+              Children [ Text({ format!("{}/{}", $Ref<Meter>(#Meter).value, $Ref<Meter>(#Meter).max) }) ]
+          }
+      }
+  }
+
+  // Patches `value` when `Health` changes; the meter is never rebuilt.
+  rsn! { @Meter { value: $Res<Health>.0, max: 100 } }
+  ```
+
+  `@prop`s are scene function inputs, so a `$` in one rebuilds like an argument.
 - A control flow item becomes a region: an entity (a `GhostNode` with the `ui`
   feature) whose children are the content.
+
+### Two-way binding
+
+`bind(place)` keeps a widget and a value in sync, both ways. The widget shows the
+value and follows it when it changes; when the user edits the widget, the new value
+is written back to the place (only when it differs, so change detection stays quiet).
+Read the place with `$Res`/`$Ref`; `bind` writes it through `$ResMut`/`$Mut` for you.
+
+```rust,ignore
+rsn! {
+    #Panel
+    Brightness(0.5)
+    Children [
+        Slider SliderRange::new(0.0, 1.0) bind($Res<Settings>.volume)  // f32
+        --
+        Checkbox bind($Res<Settings>.muted)                            // bool
+        --
+        TextInput bind($Res<Settings>.name)                            // String
+        --
+        Slider bind($Ref<Brightness>(#Panel).0)                        // a component
+        --
+        Button on(|_: On<Activate>| $ResMut<Settings>.muted = true)    // a click handler
+    ]
+}
+```
+
+The widget is the entity's `Bindable` component for the value's type. The `widgets`
+feature (on by default) registers `bevy_ui_widgets`' `Slider`, `Checkbox` and
+`TextInput`, which Feathers' controls are built on. Register your own widget with
+`app.register_bindable::<MyKnob>()` after implementing `Bindable` for it: its value
+type, the event it sends when edited, how to show a value and how to read one from
+the event. In `bsn!` or plain Rust, `bind` takes a getter and a setter:
+`bind(|s: Res<Settings>| s.volume, |v: &f32, mut s: ResMut<Settings>| s.volume = *v)`.
 
 ### The functions under `rsn!`
 
@@ -163,7 +225,7 @@ bsn! {
 | --- | --- | --- |
 | `c: Ref<T>` / `Option<Ref<T>>` | yes | the nearest component `T`: this entity, its `Source`, then its ancestors |
 | `Res<T>` / `Option<Res<T>>` | yes | resource `T` |
-| `Query`, `Single`, `Populated` | yes | when a component they read or filter on changes, is added or removed |
+| `Query`, `Single`, `Populated` | yes | when a component they read changes, is added or removed; a `With`/`Without` filter only when it is added or removed |
 | `c: &mut C` | no | the nearest `C`, written in place |
 | `e: Entity` | no | the entity that declared the closure |
 | `ResMut`, `Commands`, `Local`, messages | no | ordinary system parameters |
@@ -173,6 +235,7 @@ bsn! {
 | --- | --- | --- |
 | `watch(\|..\| ..)` | template | re-run on change; a returned component or bundle is inserted (a derived value) |
 | `handle(\|e: &E, ..\| ..)` | template | run when entity event `E` reaches this entity |
+| `bind(\|..\| value, \|v: &V, ..\| ..)` | template | sync a widget with a value, both ways |
 | `@when(cond, \|\| ..)` | scene | show content while `cond` holds |
 | `@if_else(cond, \|\| then, \|\| otherwise)` | scene | `if` / `else` |
 | `@switch(\|..\| key, \|key\| ..)` | scene | `match`; arms are boxed with `.into()` |
@@ -192,7 +255,42 @@ bsn! {
   `ReactiveSystems` in `PostUpdate`; outer regions run before the reactions inside
   them, and chained reactions settle in the same frame.
 
-Examples: `reactive_counters`, `reactive_todos`, `comparison_reactive`.
+### Transitions
+
+Put `Transition` on the root of an `if`/`match` arm or a `for` row and it animates in
+and out instead of popping. Its `Presence` goes from 0 to 1 when it appears; when the
+region removes it, it gets `Leaving`, stays where it was while `Presence` goes back
+to 0, and then despawns. The animation is ordinary reactive code that reads
+`Presence`:
+
+```rust,ignore
+rsn! {
+    Children [
+        if $Res<Menu>.open {
+            #Panel
+            Node { top: px($Ref<Presence>(#Panel).lerp(-40.0, 0.0)) }
+            Transition::new(0.25).ease(EaseFunction::CubicOut)
+            BackgroundColor(Color::BLACK.with_alpha(0.8 * $Ref<Presence>(#Panel).value()))
+        }
+    ]
+}
+```
+
+| Item | Use it to |
+| --- | --- |
+| `Transition::new(secs)` | animate in and out over `secs`; `.enter(s)`, `.exit(s)`, `.ease(EaseFunction::..)`, `.appear()` |
+| `Presence` | read `.value()` (eased, 0 hidden to 1 shown), `.progress()` (linear), `.phase()`, `.lerp(hidden, shown)` |
+| `Leaving` | marks content animating out: filter it with `Without<Leaving>`, or start your own animation with `On<Add<Leaving>>` |
+
+- A region's first content shows at once; `.appear()` makes it animate in too.
+- Content that comes back while it is leaving (the condition flips back, or a `for`
+  row returns with the same key and item) turns around instead of being rebuilt.
+- A keyed row whose item changes is rebuilt in place, without transitions.
+- Leaving content keeps its place among its siblings, so new content and leaving
+  content take up space together. Position one absolutely to cross-fade.
+- `Ref<Presence>` in `watch` also finds the root's `Presence` from its descendants.
+
+Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `reactive_transitions`, `comparison_reactive`.
 
 ## `subscribe`
 

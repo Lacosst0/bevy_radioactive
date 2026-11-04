@@ -67,3 +67,51 @@ fn text_constructors_next_to_plain_nodes() {
         .collect();
     assert!(sizes.contains(&TextFont::from_font_size(17.0).font_size));
 }
+
+#[derive(Resource, Clone, Copy, Default)]
+struct Menu {
+    open: bool,
+}
+
+#[test]
+fn a_panel_fades_and_slides_with_its_presence() {
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin::default(),
+        ScenePlugin,
+        ReactivePlugin,
+    ))
+    .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+        std::time::Duration::from_millis(100),
+    ))
+    .init_resource::<Menu>();
+    app.world_mut()
+        .spawn_scene(rsn! {
+            Node
+            Children [
+                if $Res<Menu>.open {
+                    #Panel
+                    Node { top: px($Ref<Presence>(#Panel).lerp(-40.0, 0.0)) }
+                    Transition::new(0.25).ease(EaseFunction::CubicOut)
+                    BackgroundColor(Color::BLACK.with_alpha(0.8 * $Ref<Presence>(#Panel).value()))
+                }
+            ]
+        })
+        .unwrap();
+    app.update();
+    app.world_mut().resource_mut::<Menu>().open = true;
+    app.update();
+    let world = app.world_mut();
+    let (panel, node) = world
+        .query_filtered::<(Entity, &Node), With<Transition>>()
+        .single(world)
+        .unwrap();
+    assert_eq!(node.top, px(-40.0));
+    for _ in 0..4 {
+        app.update();
+    }
+    let world = app.world();
+    assert_eq!(world.get::<Node>(panel).unwrap().top, px(0.0));
+    assert!((world.get::<BackgroundColor>(panel).unwrap().0.alpha() - 0.8).abs() < 1e-5);
+}

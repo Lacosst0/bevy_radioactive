@@ -60,7 +60,10 @@
 //! | `Comp { a: .. $ .., b: .. }` | `Comp { b: .. }` plus a [`watch`] that patches `a` |
 //! | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a [`watch`] that rebuilds the component the expression returns |
 //! | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
+//! | `@scene(.. $ ..)`, `@Comp { @prop: .. $ .. }` | the entity in a [`switch`] region, rebuilt when an input changes |
+//! | `@Comp { field: .. $ .. }`, `@Comp(.. $ ..)` | the scene once, plus a [`watch`] that patches `Comp` in place |
 //! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; write with `$Mut<Type>(..)` or `$ResMut<T>` |
+//! | `bind(.. $ ..)` | a [`bind`]ing: the widget shows the value and writes the user's edits back |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
 //! | `for pat in $Query<D, F> { .. }` | an [`each`] region with one row per entity |
@@ -74,6 +77,12 @@
 //! Other loops need owned items that implement `PartialEq`. Loop and match
 //! bindings may be used any number of times. [`rsn_list!`] is the list form.
 //!
+//! A scene function runs once, so `$` in `@scene(..)` arguments or `@prop`s
+//! rebuilds the entity when an input changes (inputs are cloned out of the
+//! read and need `Clone + PartialEq`). A `SceneComponent` field is patched in
+//! place instead, and its scene reads the field with `$Ref<Comp>(#Root)`: use
+//! fields for values that change often and scenes that keep state.
+//!
 //! The functions it expands to are public and take closures with ordinary
 //! Bevy system parameters; use them in `bsn!` or plain Rust:
 //!
@@ -85,6 +94,27 @@
 //!     @when(|count: Ref<Count>| count.0 > 10, || bsn! { Text("That's a lot") })
 //! }
 //! ```
+//!
+//! # Two-way binding
+//!
+//! `bind(place)` in [`rsn!`] keeps a widget and a value in sync: the widget
+//! shows the value and re-renders when it changes, and the user's edits are
+//! written back. The place is read with `$Res`/`$Ref` and written with
+//! `$ResMut`/`$Mut`, only when the edit differs from what is there.
+//!
+//! ```ignore
+//! Slider SliderRange::new(0.0, 1.0) bind($Res<Settings>.volume)  // f32
+//! --
+//! Checkbox bind($Res<Settings>.muted)                            // bool
+//! --
+//! TextInput bind($Ref<Player>(#Player).name)                     // String
+//! ```
+//!
+//! The widget is the entity's [`Bindable`] component for the value's type.
+//! The `widgets` feature registers `bevy_ui_widgets`' `Slider`, `Checkbox`
+//! and `TextInput`, which Feathers' controls build on; register your own
+//! with [`BindableAppExt::register_bindable`]. Button clicks and other
+//! events are handled with `on(|_: On<Activate>| ..)`.
 //!
 //! # Parameters
 //!
@@ -109,6 +139,7 @@
 //! | --- | --- |
 //! | [`watch`] | re-run a closure on change; a returned component or bundle is inserted |
 //! | [`handle`] | run a closure when an entity event reaches this entity |
+//! | [`bind`] | keep a widget and a value in sync, both ways |
 //! | `@`[`when`]`(cond, then)` | show entities while a condition holds |
 //! | `@`[`if_else`]`(cond, then, otherwise)` | `if`/`else` |
 //! | `@`[`switch`]`(key, render)` | show entities for the current value of a key (`match`) |
@@ -133,6 +164,14 @@
 //! branch despawns everything in it, including the reactions and observers it
 //! declared. Run cleanup code with Bevy's own `on(|_: On<Despawn>| ..)`.
 //!
+//! # Transitions
+//!
+//! Region content whose root has a [`Transition`] animates in and out
+//! instead of popping: its [`Presence`] counts from 0 to 1 when it appears,
+//! and when it is removed it gets [`Leaving`] and stays until its
+//! [`Presence`] is back at 0. Animate anything by reading it:
+//! `Alpha($Ref<Presence>(#Panel).value())`.
+//!
 //! # Updates
 //!
 //! A reaction first runs right after its scene spawns, then in
@@ -143,13 +182,21 @@
 
 pub use crate::macros::{rsn, rsn_list};
 
-use crate::shared::{self, despawn_all, lock};
+mod transition;
+
+use transition::Start;
+pub use transition::{Leaving, Phase, Presence, Transition};
+
+use crate::shared::{self, lock};
 
 use std::{
     any::TypeId,
     hash::Hash,
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use bevy::{
@@ -158,11 +205,13 @@ use bevy::{
         component::{ComponentId, Mutable},
         entity_disabling::Disabled,
         event::EntityEvent,
+        lifecycle::{Discard, Insert},
         message::Message,
         query::{Allow, IterQueryData, QueryData, QueryFilter},
         resource::IsResource,
         system::{SystemParam, SystemParamItem, SystemState},
         template::{FromTemplate, Template, TemplateContext},
+        world::DeferredWorld,
     },
     platform::collections::HashMap,
     prelude::*,
@@ -180,12 +229,27 @@ impl Plugin for ReactivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AnyChanges>()
             .init_resource::<Pending>()
-            .add_systems(PostUpdate, run_reactions.in_set(ReactiveSystems));
+            .init_resource::<Bindables>()
+            .init_resource::<HierarchyChanged>()
+            .add_observer(|_: On<Insert<(ChildOf, Source)>>, world: DeferredWorld| {
+                note_hierarchy(world);
+            })
+            .add_observer(|_: On<Discard<(ChildOf, Source)>>, world: DeferredWorld| {
+                note_hierarchy(world);
+            })
+            .add_systems(
+                PostUpdate,
+                (transition::animate, run_reactions)
+                    .chain()
+                    .in_set(ReactiveSystems),
+            );
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
             ReactiveSystems.before(bevy::ui::UiSystems::Prepare),
         );
+        #[cfg(feature = "widgets")]
+        widgets::register(app);
     }
 }
 
@@ -236,7 +300,12 @@ struct Reaction {
     host: Entity,
     inputs: Vec<Input>,
     resolved: Vec<Option<Entity>>,
+    /// What the last run read through `$Ref<T>(..)` in `rsn!`.
+    reads: Vec<Read>,
     last_run: Option<Tick>,
+    /// When `resolved` was last confirmed, which may be after `last_run`.
+    /// Atomic so the check can update it through a shared reference.
+    resolved_at: AtomicU32,
     body: Option<Box<dyn Body>>,
 }
 
@@ -262,13 +331,58 @@ pub struct Input {
     type_id: TypeId,
     id: ComponentId,
     lookup: Lookup,
-    tracked: bool,
+    track: Track,
+}
+
+/// What change to an input re-runs its reaction.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Track {
+    /// None: the input is only read.
+    No,
+    /// An entity gaining or losing the component, as for a `With` or
+    /// `Without` filter.
+    Presence,
+    /// That, or a change to its value.
+    Value,
 }
 
 impl Input {
     fn same_target(&self, other: &Self) -> bool {
         self.id == other.id && self.lookup == other.lookup
     }
+}
+
+/// One component read on a specific entity during a run, recorded while
+/// the run happens instead of declared up front.
+#[derive(Clone, Copy, Debug)]
+enum Read {
+    /// Component `id` on `entity`, which had it.
+    At(Entity, ComponentId),
+    /// Component `id` on an entity that didn't have it, or that couldn't
+    /// be found: re-runs when any entity gains or loses it.
+    Missing(ComponentId),
+}
+
+std::thread_local! {
+    /// The reads of the reaction running on this thread, if any.
+    static READS: std::cell::RefCell<Option<Vec<Read>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records a read for the running reaction; does nothing outside one.
+fn record(read: Read) {
+    READS.with_borrow_mut(|reads| {
+        if let Some(reads) = reads {
+            reads.push(read);
+        }
+    });
+}
+
+/// Runs `f`, collecting the reads it records. Nested runs collect their
+/// own.
+fn collect_reads(f: impl FnOnce()) -> Vec<Read> {
+    let outer = READS.replace(Some(Vec::new()));
+    f();
+    READS.replace(outer).unwrap_or_default()
 }
 
 /// Hierarchy walks stop after this many steps, in case of a `ChildOf` cycle.
@@ -295,6 +409,23 @@ fn find_nearest(
         }
         links(entity).1.filter(|&source| matches(source))
     })
+}
+
+/// When an entity last got or lost a [`ChildOf`] or [`Source`]: until then,
+/// `Ref<T>` lookups find what they found before, unless an entity gained or
+/// lost `T`.
+#[derive(Resource)]
+struct HierarchyChanged(Tick);
+
+impl FromWorld for HierarchyChanged {
+    fn from_world(world: &mut World) -> Self {
+        Self(world.change_tick())
+    }
+}
+
+fn note_hierarchy(mut world: DeferredWorld) {
+    let now = world.change_tick();
+    world.resource_mut::<HierarchyChanged>().0 = now;
 }
 
 /// The entity holding component `id` for a reaction declared on `host`.
@@ -350,93 +481,162 @@ impl Cx<'_> {
 }
 
 /// Last change seen per component tracked on any entity (by `Query`
-/// parameters), and how many entities had it.
+/// parameters and missed `$Ref<T>(..)` reads).
 #[derive(Resource, Default)]
 struct AnyChanges(HashMap<ComponentId, AnyState>);
 
 struct AnyState {
+    /// Entities with the component.
     count: u64,
-    stamp: Tick,
+    /// The newest change to the component's value or presence.
+    changed: Tick,
+    /// The newest change to which entities have it.
+    presence: Tick,
 }
 
-/// How many entities have component `id`.
-fn count_with(world: &World, id: ComponentId) -> u64 {
-    world
-        .archetypes()
-        .iter()
-        .filter(|archetype| archetype.contains(id))
-        .map(|archetype| u64::from(archetype.len()))
-        .sum()
-}
-
-/// How many entities have component `id`, and the newest change to it after
-/// `since`.
-fn survey(world: &World, id: ComponentId, since: Tick, now: Tick) -> (u64, Tick) {
-    let mut count = 0;
-    let mut newest = since;
-    for archetype in world.archetypes().iter().filter(|a| a.contains(id)) {
-        count += u64::from(archetype.len());
-        for entity in archetype.entities() {
-            if let Some(ticks) = world
-                .get_entity(entity.id())
-                .ok()
-                .and_then(|entity| entity.get_change_ticks_by_id(id))
-                && ticks.changed.is_newer_than(newest, now)
-            {
-                newest = ticks.changed;
-            }
+impl AnyState {
+    fn new(world: &World, id: ComponentId) -> Self {
+        let now = world.read_change_tick();
+        Self {
+            count: archetypes_with(world, id).map(|a| u64::from(a.len())).sum(),
+            changed: now,
+            presence: now,
         }
     }
-    (count, newest)
+
+    /// Catches up with changes since the last survey.
+    fn survey(&mut self, world: &World, id: ComponentId, now: Tick) {
+        let mut count = 0;
+        let (mut changed, mut added) = (self.changed, self.presence);
+        for archetype in archetypes_with(world, id) {
+            count += u64::from(archetype.len());
+            for entity in archetype.entities() {
+                if let Some(ticks) = world
+                    .get_entity(entity.id())
+                    .ok()
+                    .and_then(|entity| entity.get_change_ticks_by_id(id))
+                {
+                    if ticks.changed.is_newer_than(changed, now) {
+                        changed = ticks.changed;
+                    }
+                    if ticks.added.is_newer_than(added, now) {
+                        added = ticks.added;
+                    }
+                }
+            }
+        }
+        // As many entities, unless one lost the component.
+        if count != self.count {
+            changed = now;
+            added = now;
+        }
+        self.count = count;
+        self.changed = changed;
+        self.presence = added;
+    }
+
+    /// Whether a change `track` cares about happened after `since`.
+    fn changed_since(&self, track: Track, since: Tick, now: Tick) -> bool {
+        match track {
+            Track::No => false,
+            Track::Presence => self.presence.is_newer_than(since, now),
+            Track::Value => self.changed.is_newer_than(since, now),
+        }
+    }
 }
 
 fn scan_any(world: &mut World) {
     world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
         let now = world.change_tick();
         for (&id, state) in &mut changes.bypass_change_detection().0 {
-            let (count, newest) = survey(world, id, state.stamp, now);
-            // An entity gaining or losing the component is a change too.
-            state.stamp = if count == state.count { newest } else { now };
-            state.count = count;
+            state.survey(world, id, now);
         }
     });
 }
 
-fn track_any(world: &mut World, inputs: &[Input]) {
-    let now = world.change_tick();
-    world.resource_scope(|world, mut changes: Mut<AnyChanges>| {
-        for input in inputs.iter().filter(|input| input.lookup == Lookup::Any) {
-            changes.0.entry(input.id).or_insert_with(|| AnyState {
-                count: count_with(world, input.id),
-                stamp: now,
-            });
+fn archetypes_with(
+    world: &World,
+    id: ComponentId,
+) -> impl Iterator<Item = &bevy::ecs::archetype::Archetype> {
+    world
+        .archetypes()
+        .iter()
+        .filter(move |archetype| archetype.contains(id))
+}
+
+/// Starts surveying each of `ids` that isn't surveyed yet.
+fn track_any(world: &mut World, ids: impl IntoIterator<Item = ComponentId>) {
+    for id in ids {
+        if world.resource::<AnyChanges>().0.contains_key(&id) {
+            continue;
         }
-    });
+        let state = AnyState::new(world, id);
+        world
+            .resource_mut::<AnyChanges>()
+            .bypass_change_detection()
+            .0
+            .insert(id, state);
+    }
 }
 
 impl Reaction {
     /// Whether a tracked input changed, or now resolves to another entity,
     /// since the last run.
-    fn is_dirty(&self, world: &World, changes: &AnyChanges, now: Tick) -> bool {
+    fn is_dirty(&self, world: &World, changes: &AnyChanges, hierarchy: Tick, now: Tick) -> bool {
         let Some(last_run) = self.last_run else {
             return true;
         };
-        self.inputs.iter().enumerate().any(|(index, input)| {
-            if input.lookup == Lookup::Any {
-                return input.tracked
-                    && changes
+        let any_changed = |id: ComponentId, track: Track| {
+            changes
+                .0
+                .get(&id)
+                .is_some_and(|state| state.changed_since(track, last_run, now))
+        };
+        let ticks = |entity: Entity, id: ComponentId| {
+            world
+                .get_entity(entity)
+                .ok()
+                .and_then(|entity| entity.get_change_ticks_by_id(id))
+        };
+        let read_changed = |read: &Read| match *read {
+            Read::At(entity, id) => {
+                ticks(entity, id).is_none_or(|ticks| ticks.is_changed(last_run, now))
+            }
+            Read::Missing(id) => any_changed(id, Track::Presence),
+        };
+        let resolved_at = Tick::new(self.resolved_at.load(Ordering::Relaxed));
+        let dirty = self.reads.iter().any(read_changed)
+            || self.inputs.iter().enumerate().any(|(index, input)| {
+                if input.lookup == Lookup::Any {
+                    return any_changed(input.id, input.track);
+                }
+                let cached = self.resolved.get(index).copied().flatten();
+                // Walking the hierarchy is the costly part, so it is skipped
+                // while nothing could have moved the input.
+                let moved = input.lookup != Lookup::Nearest
+                    || hierarchy.is_newer_than(resolved_at, now)
+                    || changes
                         .0
                         .get(&input.id)
-                        .is_some_and(|state| state.stamp.is_newer_than(last_run, now));
-            }
-            let entity = resolve(world, self.host, input.id, input.lookup);
-            entity != self.resolved.get(index).copied().flatten()
-                || (input.tracked
-                    && entity
-                        .and_then(|entity| world.get_entity(entity).ok())
-                        .and_then(|entity| entity.get_change_ticks_by_id(input.id))
-                        .is_some_and(|ticks| ticks.is_changed(last_run, now)))
-        })
+                        .is_none_or(|state| state.changed_since(Track::Presence, resolved_at, now))
+                    || cached.is_some_and(|entity| ticks(entity, input.id).is_none());
+                let entity = if moved {
+                    resolve(world, self.host, input.id, input.lookup)
+                } else {
+                    cached
+                };
+                entity != cached
+                    || (input.track != Track::No
+                        && entity
+                            .and_then(|entity| ticks(entity, input.id))
+                            .is_some_and(|ticks| ticks.is_changed(last_run, now)))
+            });
+        if !dirty {
+            // Every input resolves as before: no need to walk again until
+            // something moves after `now`.
+            self.resolved_at.store(now.get(), Ordering::Relaxed);
+        }
+        dirty
     }
 }
 
@@ -462,17 +662,19 @@ pub trait ReactiveParam {
 }
 
 impl Input {
-    fn new<T: Component>(world: &mut World, lookup: Lookup, tracked: bool) -> Self {
+    fn new<T: Component>(world: &mut World, lookup: Lookup, track: Track) -> Self {
         Self {
             type_id: TypeId::of::<T>(),
             id: world.register_component::<T>(),
             lookup,
-            tracked,
+            track,
         }
     }
 }
 
 /// Every component a query reads or filters on, except those it writes.
+/// Components it only filters on with `With` or `Without` re-run it only
+/// when entities gain or lose them.
 fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
     world: &mut World,
     inputs: &mut Vec<Input>,
@@ -486,17 +688,21 @@ fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
         .reads()
         .as_finite_set()
         .into_iter()
-        .flat_map(bevy::ecs::query::ComponentIdSet::iter);
-    let ids = reads
-        .chain(access.with_filters())
-        .chain(access.without_filters());
+        .flat_map(bevy::ecs::query::ComponentIdSet::iter)
+        .map(|id| (id, Track::Value));
+    let filters = access
+        .with_filters()
+        .chain(access.without_filters())
+        .map(|id| (id, Track::Presence));
     inputs.extend(
-        ids.filter(|&id| !writes.contains(id) && id != is_resource)
-            .map(|id| Input {
+        reads
+            .chain(filters)
+            .filter(|&(id, _)| !writes.contains(id) && id != is_resource)
+            .map(|(id, track)| Input {
                 type_id: TypeId::of::<()>(),
                 id,
                 lookup: Lookup::Any,
-                tracked: true,
+                track,
             }),
     );
 }
@@ -511,7 +717,7 @@ impl<T: Component> ReactiveParam for Ref<'_, T> {
     type Item<'w, 's> = Ref<'w, T>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, Track::Value));
     }
 
     fn fetch<'w, 's>(
@@ -527,7 +733,7 @@ impl<T: Component> ReactiveParam for Option<Ref<'_, T>> {
     type Item<'w, 's> = Option<Ref<'w, T>>;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<T>(world, Lookup::Nearest, true));
+        inputs.push(Input::new::<T>(world, Lookup::Nearest, Track::Value));
     }
 
     fn fetch<'w, 's>(
@@ -543,7 +749,7 @@ impl<C: Component<Mutability = Mutable>> ReactiveParam for &mut C {
     type Item<'w, 's> = &'w mut C;
 
     fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
-        inputs.push(Input::new::<C>(world, Lookup::Nearest, false));
+        inputs.push(Input::new::<C>(world, Lookup::Nearest, Track::No));
     }
 
     fn fetch<'w, 's>(
@@ -591,9 +797,9 @@ macro_rules! system_params {
 system_params! {
     // Tracked.
     ['a, T: Resource] Res<'a, T> => Res<'static, T>, Res<'w, T>,
-        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
     ['a, T: Resource] Option<Res<'a, T>> => Option<Res<'static, T>>, Option<Res<'w, T>>,
-        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, true));
+        |world, inputs: &mut Vec<Input>| inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
     ['a, 'b, D: QueryData + 'static, F: QueryFilter + 'static] Query<'a, 'b, D, F>
         => Query<'static, 'static, D, F>, Query<'w, 's, D, F>, query_inputs::<D, F>;
     ['a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static] Single<'a, 'b, D, F>
@@ -822,27 +1028,39 @@ fn attach(world: &mut World, host: Entity, body: Box<dyn Body>) -> Result<Entity
     let mut unique: Vec<Input> = Vec::with_capacity(inputs.len());
     for input in inputs {
         if let Some(existing) = unique.iter_mut().find(|other| other.same_target(&input)) {
-            existing.tracked |= input.tracked;
+            existing.track = existing.track.max(input.track);
         } else {
             unique.push(input);
         }
     }
-    track_any(world, &unique);
+    track_any(
+        world,
+        unique
+            .iter()
+            .filter(|input| input.lookup != Lookup::Resource)
+            .map(|input| input.id),
+    );
     let reaction = world
         .spawn((
             Reaction {
                 host,
                 inputs: unique,
                 resolved: Vec::new(),
+                reads: Vec::new(),
                 last_run: None,
+                resolved_at: AtomicU32::new(0),
                 body: Some(body),
             },
             ReactionOf(host),
         ))
         .id();
     // After the rest of the scene spawns, so ancestors and `Source`s exist.
-    world.resource_mut::<Pending>().reactions.push(reaction);
-    world.commands().queue(run_pending);
+    let mut pending = world.resource_mut::<Pending>();
+    pending.reactions.push(reaction);
+    // One queued run covers every reaction attached before it applies.
+    if pending.reactions.len() == 1 {
+        world.commands().queue(run_pending);
+    }
     Ok(reaction)
 }
 
@@ -881,17 +1099,26 @@ fn run_reaction(world: &mut World, reaction: Entity) {
     };
     let inputs = std::mem::take(&mut state.inputs);
     let resolved = resolve_all(world, host, &inputs);
-    if world.get_entity(host).is_ok() {
-        body.run(
-            world,
-            &Cx {
-                host,
-                inputs: &inputs,
-                resolved: &resolved,
-                event: None,
-            },
-        );
-    }
+    let reads = collect_reads(|| {
+        if world.get_entity(host).is_ok() {
+            body.run(
+                world,
+                &Cx {
+                    host,
+                    inputs: &inputs,
+                    resolved: &resolved,
+                    event: None,
+                },
+            );
+        }
+    });
+    track_any(
+        world,
+        reads.iter().filter_map(|read| match *read {
+            Read::Missing(id) => Some(id),
+            Read::At(..) => None,
+        }),
+    );
     // Its own writes are older than `last_run`; later ones are newer.
     let last_run = world.increment_change_tick();
     if let Some(mut state) = world.get_mut::<Reaction>(reaction) {
@@ -899,7 +1126,9 @@ fn run_reaction(world: &mut World, reaction: Entity) {
         state.body = Some(body);
         state.inputs = inputs;
         state.resolved = resolved;
+        state.reads = reads;
         state.last_run = Some(last_run);
+        state.resolved_at = AtomicU32::new(last_run.get());
     }
     world.flush();
 }
@@ -922,6 +1151,7 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
     let mut due: Vec<(usize, Entity)> = {
         let world = &*world;
         let changes = world.resource::<AnyChanges>();
+        let hierarchy = world.resource::<HierarchyChanged>().0;
         reactions
             .iter(world)
             .filter(|(_, reaction)| {
@@ -929,7 +1159,7 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
                     && !world
                         .get_entity(reaction.host)
                         .is_ok_and(|host| host.contains::<Disabled>())
-                    && reaction.is_dirty(world, changes, now)
+                    && reaction.is_dirty(world, changes, hierarchy, now)
             })
             .map(|(entity, reaction)| {
                 let depth = ancestors(reaction.host, |entity| {
@@ -940,6 +1170,8 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
             })
             .collect()
     };
+    // Changes from here on are newer than the `now` checks were made at.
+    world.increment_change_tick();
     // Outer regions first: they may despawn the reactions inside them.
     due.sort_unstable();
     for &(_, reaction) in &due {
@@ -1112,30 +1344,12 @@ where
     F: IntoHandler<E, M> + Clone,
 {
     fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
-        let handler = Arc::new(Mutex::new((self.0.clone().into_handler(), None)));
+        let handler = handler_state(self.0.clone().into_handler());
         let observer = move |event: On<E>, mut commands: Commands| {
             let event = event.event().clone();
             let handler = Arc::clone(&handler);
             // Exclusive world access, so handlers can take any parameter.
-            commands.queue(move |world: &mut World| {
-                let mut handler = lock(&handler);
-                let (reader, inputs) = &mut *handler;
-                let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
-                    let mut inputs = Vec::new();
-                    reader.inputs(world, &mut inputs);
-                    inputs
-                });
-                let resolved = resolve_all(world, host, inputs);
-                reader.read(
-                    world,
-                    &Cx {
-                        host,
-                        inputs,
-                        resolved: &resolved,
-                        event: Some(&event),
-                    },
-                );
-            });
+            commands.queue(move |world: &mut World| run_handler(world, host, &handler, &event));
         };
         world
             .get_entity_mut(host)
@@ -1143,6 +1357,39 @@ where
             .observe(observer);
         Ok(())
     }
+}
+
+/// A handler closure and its inputs, found on its first run.
+type HandlerState = Arc<Mutex<(Box<dyn Reader<()>>, Option<Vec<Input>>)>>;
+
+fn handler_state(reader: Box<dyn Reader<()>>) -> HandlerState {
+    Arc::new(Mutex::new((reader, None)))
+}
+
+/// Runs a [`handle`] or [`bind`] closure for `event`, declared on `host`.
+fn run_handler(
+    world: &mut World,
+    host: Entity,
+    handler: &HandlerState,
+    event: &(dyn std::any::Any + Send + Sync),
+) {
+    let mut handler = lock(handler);
+    let (reader, inputs) = &mut *handler;
+    let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
+        let mut inputs = Vec::new();
+        reader.inputs(world, &mut inputs);
+        inputs
+    });
+    let resolved = resolve_all(world, host, inputs);
+    reader.read(
+        world,
+        &Cx {
+            host,
+            inputs,
+            resolved: &resolved,
+            event: Some(event),
+        },
+    );
 }
 
 impl<E, F, M: 'static> Template for Handler<E, F, M>
@@ -1158,6 +1405,328 @@ where
 
     fn clone_template(&self) -> Self {
         Self(self.0.clone(), PhantomData)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bind
+// ---------------------------------------------------------------------------
+
+/// Keeps a widget and a value in sync, both ways: the widget shows what `get`
+/// returns, re-run like [`watch`], and when the user edits the widget, `set`
+/// runs with the new value, like a [`handle`]r.
+///
+/// The widget is the entity's [`Bindable`] component for the value's type:
+/// with the `widgets` feature, a `Slider` edits an `f32`, a `Checkbox` a
+/// `bool` and a `TextInput` a `String`. Register others with
+/// [`BindableAppExt::register_bindable`].
+///
+/// ```ignore
+/// Slider SliderRange::new(0.0, 1.0)
+/// bind(
+///     |volume: Res<Volume>| volume.0,
+///     |value: &f32, mut volume: ResMut<Volume>| volume.0 = *value,
+/// )
+/// ```
+///
+/// In [`rsn!`], write the value once: `bind($Res<Volume>.0)` reads it with
+/// `$Res`/`$Ref` and writes it with `$ResMut`/`$Mut`, only when it differs.
+pub fn bind<M, N, G, S>(get: G, set: S) -> Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    Bind(get, set, PhantomData)
+}
+
+/// Made by [`bind`].
+pub struct Bind<G, S, M, N>(G, S, PhantomData<fn() -> (M, N)>);
+
+/// A widget component that edits a value: what [`bind`] syncs.
+///
+/// ```ignore
+/// impl Bindable for Knob {
+///     type Value = f32;
+///     type Event = ValueChange<f32>;
+///
+///     fn show(entity: &mut EntityWorldMut, value: &f32) {
+///         entity.insert(KnobAngle(*value));
+///     }
+///
+///     fn value(event: &ValueChange<f32>, _: EntityRef) -> Option<f32> {
+///         Some(event.value)
+///     }
+/// }
+///
+/// // app.register_bindable::<Knob>()
+/// ```
+pub trait Bindable: Component {
+    /// The value the widget edits.
+    type Value: Clone + PartialEq + Send + Sync + 'static;
+    /// The event the widget sends when the user edits it.
+    type Event: EntityEvent;
+
+    /// Shows `value` in the widget. Called when the bound value changes, so
+    /// skip work when the widget already shows it.
+    fn show(entity: &mut EntityWorldMut, value: &Self::Value);
+
+    /// The edited value an `event` on `entity` carries, if any.
+    fn value(event: &Self::Event, entity: EntityRef) -> Option<Self::Value>;
+}
+
+/// Registers [`Bindable`] widgets for [`bind`].
+pub trait BindableAppExt {
+    /// Lets [`bind`] sync `W` with values of type `W::Value`. Widgets
+    /// registered later are tried first.
+    fn register_bindable<W: Bindable>(&mut self) -> &mut Self;
+}
+
+impl BindableAppExt for App {
+    fn register_bindable<W: Bindable>(&mut self) -> &mut Self {
+        let marker = self.world_mut().register_component::<W>();
+        self.world_mut()
+            .get_resource_or_init::<Bindables>()
+            .0
+            .push(Widget {
+                marker,
+                value: TypeId::of::<W::Value>(),
+                name: std::any::type_name::<W>(),
+                show: show_widget::<W>,
+                observe: observe_widget::<W>,
+            });
+        self
+    }
+}
+
+/// The registered [`Bindable`]s.
+#[derive(Resource, Default)]
+struct Bindables(Vec<Widget>);
+
+/// A [`Bindable`], type-erased.
+#[derive(Clone, Copy)]
+struct Widget {
+    marker: ComponentId,
+    value: TypeId,
+    name: &'static str,
+    show: fn(&mut World, Entity, &(dyn std::any::Any + Send + Sync)),
+    observe: fn(&mut World, Entity, HandlerState),
+}
+
+fn show_widget<W: Bindable>(
+    world: &mut World,
+    host: Entity,
+    value: &(dyn std::any::Any + Send + Sync),
+) {
+    if let Some(value) = value.downcast_ref::<W::Value>()
+        && let Ok(mut entity) = world.get_entity_mut(host)
+    {
+        W::show(&mut entity, value);
+    }
+}
+
+fn observe_widget<W: Bindable>(world: &mut World, host: Entity, set: HandlerState) {
+    let observer = move |event: On<W::Event>, mut world: DeferredWorld| {
+        if event.event_target() != host {
+            return;
+        }
+        let Ok(entity) = world.get_entity(host) else {
+            return;
+        };
+        let Some(value) = W::value(event.event(), entity) else {
+            return;
+        };
+        let set = Arc::clone(&set);
+        world
+            .commands()
+            .queue(move |world: &mut World| run_handler(world, host, &set, &value));
+    };
+    if let Ok(mut entity) = world.get_entity_mut(host) {
+        entity.observe(observer);
+    }
+}
+
+struct BindBody<V> {
+    get: Box<dyn Reader<V>>,
+    set: HandlerState,
+    /// The widget, found on the first run.
+    widget: Option<Widget>,
+    looked_up: bool,
+}
+
+impl<V: Clone + PartialEq + Send + Sync + 'static> BindBody<V> {
+    fn widget(&mut self, world: &mut World, host: Entity) -> Option<Widget> {
+        if self.looked_up {
+            return self.widget;
+        }
+        let found = world.get_resource::<Bindables>().and_then(|bindables| {
+            let entity = world.get_entity(host).ok()?;
+            bindables
+                .0
+                .iter()
+                .rev()
+                .find(|widget| {
+                    widget.value == TypeId::of::<V>() && entity.contains_id(widget.marker)
+                })
+                .copied()
+        });
+        if let Some(widget) = found {
+            (widget.observe)(world, host, Arc::clone(&self.set));
+        } else {
+            let registered: Vec<&str> = world
+                .get_resource::<Bindables>()
+                .map(|bindables| {
+                    bindables
+                        .0
+                        .iter()
+                        .filter(|widget| widget.value == TypeId::of::<V>())
+                        .map(|widget| widget.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            warn!(
+                "bind: entity {host} has no widget that edits `{}` values; add one of [{}], \
+                 or register yours with `app.register_bindable::<W>()`",
+                std::any::type_name::<V>(),
+                registered.join(", "),
+            );
+        }
+        self.widget = found;
+        self.looked_up = true;
+        found
+    }
+}
+
+impl<V: Clone + PartialEq + Send + Sync + 'static> Body for BindBody<V> {
+    fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
+        self.get.inputs(world, inputs);
+    }
+
+    fn run(&mut self, world: &mut World, cx: &Cx) {
+        let Some(value) = self.get.read(world, cx) else {
+            return;
+        };
+        if let Some(widget) = self.widget(world, cx.host) {
+            (widget.show)(world, cx.host, &value);
+        }
+    }
+}
+
+impl<G, S, M: 'static, N: 'static> Reactive for Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
+        let body = Box::new(BindBody {
+            get: self.0.clone().into_reader(),
+            set: handler_state(self.1.clone().into_handler()),
+            widget: None,
+            looked_up: false,
+        });
+        attach(world, host, body).map(|_| ())
+    }
+}
+
+impl<G, S, M: 'static, N: 'static> Template for Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        build_reactive(self, context)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self(self.0.clone(), self.1.clone(), PhantomData)
+    }
+}
+
+/// [`Bindable`] for the `bevy_ui_widgets` widgets.
+#[cfg(feature = "widgets")]
+mod widgets {
+    use super::Bindable;
+    use bevy::{
+        prelude::*,
+        text::{EditableText, TextEdit, TextEditChange},
+        ui::Checked,
+        ui_widgets::{Checkbox, Slider, SliderValue, TextInput, ValueChange},
+    };
+
+    impl Bindable for Slider {
+        type Value = f32;
+        type Event = ValueChange<f32>;
+
+        #[allow(clippy::float_cmp, reason = "skips only an exact repeat")]
+        fn show(entity: &mut EntityWorldMut, &value: &f32) {
+            if entity
+                .get::<SliderValue>()
+                .is_none_or(|shown| shown.0 != value)
+            {
+                entity.insert(SliderValue(value));
+            }
+        }
+
+        fn value(event: &ValueChange<f32>, _: EntityRef) -> Option<f32> {
+            Some(event.value)
+        }
+    }
+
+    impl Bindable for Checkbox {
+        type Value = bool;
+        type Event = ValueChange<bool>;
+
+        fn show(entity: &mut EntityWorldMut, &checked: &bool) {
+            match (checked, entity.contains::<Checked>()) {
+                (true, false) => {
+                    entity.insert(Checked);
+                }
+                (false, true) => {
+                    entity.remove::<Checked>();
+                }
+                _ => {}
+            }
+        }
+
+        fn value(event: &ValueChange<bool>, _: EntityRef) -> Option<bool> {
+            Some(event.value)
+        }
+    }
+
+    impl Bindable for TextInput {
+        type Value = String;
+        type Event = TextEditChange;
+
+        fn show(entity: &mut EntityWorldMut, value: &String) {
+            if let Some(mut text) = entity.get_mut::<EditableText>()
+                && text.value() != value.as_str()
+            {
+                text.editor.set_text(value);
+                text.queue_edit(TextEdit::TextEnd(false));
+            }
+        }
+
+        fn value(_: &TextEditChange, entity: EntityRef) -> Option<String> {
+            Some(entity.get::<EditableText>()?.value().to_string())
+        }
+    }
+
+    pub(super) fn register(app: &mut App) {
+        use super::BindableAppExt;
+        // `bind` shows a value by editing `EditableText`, so it must run before
+        // the edits are applied. `UiPlugin` implies this order; without it the
+        // two would be unordered and a stale edit could overwrite the value.
+        app.configure_sets(
+            PostUpdate,
+            super::ReactiveSystems.before(bevy::text::EditableTextSystems),
+        );
+        app.register_bindable::<Slider>()
+            .register_bindable::<Checkbox>()
+            .register_bindable::<TextInput>();
     }
 }
 
@@ -1207,11 +1776,19 @@ fn region<B: Body + 'static>(make: impl Fn() -> B + Send + Sync + 'static) -> Re
     RegionScene(Arc::new(move || Box::new(make()) as Box<dyn Body>))
 }
 
-fn spawn_children(world: &mut World, parent: Entity, list: Box<dyn SceneList>) -> Vec<Entity> {
-    // Hold first runs until the content has its parent, so lookups through
-    // ancestors work.
+/// Spawns region content under `parent` and starts its transitions.
+fn spawn_children(
+    world: &mut World,
+    parent: Entity,
+    list: Box<dyn SceneList>,
+    start: Start,
+) -> Vec<Entity> {
+    // Hold first runs until the content has its parent and its `Presence`,
+    // so lookups through ancestors work and nothing renders fully shown
+    // before it enters.
     world.resource_mut::<Pending>().held += 1;
     let entities = shared::spawn_children(world, parent, list, "bevy_radioactive::reactive");
+    transition::start(world, &entities, start);
     world.resource_mut::<Pending>().held -= 1;
     run_pending(world);
     entities
@@ -1222,6 +1799,8 @@ struct BranchBody<K> {
     key: Box<dyn Reader<K>>,
     render: Render<K>,
     current: Option<(K, Vec<Entity>)>,
+    /// Earlier branches still animating out, newest last.
+    leaving: Vec<(K, Vec<Entity>)>,
 }
 
 impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
@@ -1236,10 +1815,27 @@ impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
         if self.current.as_ref().is_some_and(|(key, _)| *key == next) {
             return;
         }
-        if let Some((_, children)) = self.current.take() {
-            despawn_all(world, &children);
+        let first = self.current.is_none();
+        self.leaving
+            .retain(|(_, children)| transition::any_alive(world, children));
+        if let Some((key, children)) = self.current.take()
+            && transition::remove(world, &children)
+        {
+            self.leaving.push((key, children));
         }
-        let children = spawn_children(world, cx.host, (self.render)(&next));
+        // A branch coming back while it is still leaving turns around.
+        if let Some(index) = self
+            .leaving
+            .iter()
+            .rposition(|(key, children)| *key == next && transition::is_leaving(world, children))
+        {
+            let (key, children) = self.leaving.remove(index);
+            transition::revive(world, &children);
+            self.current = Some((key, children));
+            return;
+        }
+        let start = if first { Start::Initial } else { Start::New };
+        let children = spawn_children(world, cx.host, (self.render)(&next), start);
         self.current = Some((next, children));
     }
 }
@@ -1253,6 +1849,7 @@ fn branch<K: PartialEq + Send + Sync + 'static>(
         key: key(),
         render: Arc::clone(&render),
         current: None,
+        leaving: Vec::new(),
     })
 }
 
@@ -1417,7 +2014,9 @@ where
         key: Arc::clone(&key),
         row: Arc::clone(&row),
         rows: HashMap::default(),
+        leaving: HashMap::default(),
         order: Vec::new(),
+        started: false,
     })
 }
 
@@ -1426,7 +2025,11 @@ struct EachBody<I, V, K> {
     key: Key<V, K>,
     row: Render<V>,
     rows: HashMap<K, (V, Vec<Entity>)>,
+    /// Removed rows still animating out.
+    leaving: HashMap<K, (V, Vec<Entity>)>,
+    /// The host's children as last set: shown and leaving rows.
     order: Vec<Entity>,
+    started: bool,
 }
 
 impl<I, V, K> Body for EachBody<I, V, K>
@@ -1443,27 +2046,52 @@ where
         let Some(items) = self.items.read(world, cx) else {
             return;
         };
+        let start = if self.started {
+            Start::New
+        } else {
+            Start::Initial
+        };
+        self.started = true;
+        self.leaving
+            .retain(|_, (_, children)| transition::any_alive(world, children));
         let mut next_rows: HashMap<K, (V, Vec<Entity>)> = HashMap::default();
-        let mut next_order = Vec::with_capacity(self.order.len());
+        let mut shown = Vec::with_capacity(self.order.len());
         let mut duplicates = 0;
         for (index, item) in items.into_iter().enumerate() {
             let key = (self.key)(index, &item);
             let row = match self.rows.remove(&key) {
                 Some((old, children)) if old == item => (old, children),
-                old => {
-                    if let Some((_, children)) = old {
-                        despawn_all(world, &children);
-                    }
-                    let children = spawn_children(world, cx.host, (self.row)(&item));
+                // A changed item is the same row with new content: replaced
+                // in place, without transitions.
+                Some((_, children)) => {
+                    transition::despawn(world, &children);
+                    let children =
+                        spawn_children(world, cx.host, (self.row)(&item), Start::Replace);
                     (item, children)
                 }
+                None => match self.leaving.remove(&key) {
+                    // A row coming back while it is still leaving turns around.
+                    Some((old, children))
+                        if old == item && transition::is_leaving(world, &children) =>
+                    {
+                        transition::revive(world, &children);
+                        (old, children)
+                    }
+                    leaving => {
+                        if let Some((_, children)) = leaving {
+                            transition::despawn(world, &children);
+                        }
+                        let children = spawn_children(world, cx.host, (self.row)(&item), start);
+                        (item, children)
+                    }
+                },
             };
-            next_order.extend_from_slice(&row.1);
+            shown.extend_from_slice(&row.1);
             if let Some((_, displaced)) = next_rows.insert(key, row) {
                 // A duplicate key: the later item wins.
                 duplicates += 1;
-                next_order.retain(|entity| !displaced.contains(entity));
-                despawn_all(world, &displaced);
+                shown.retain(|entity| !displaced.contains(entity));
+                transition::despawn(world, &displaced);
             }
         }
         if duplicates > 0 {
@@ -1472,17 +2100,40 @@ where
                  key is shown"
             );
         }
-        for (_, (_, children)) in self.rows.drain() {
-            despawn_all(world, &children);
+        for (key, (item, children)) in self.rows.drain() {
+            if transition::remove(world, &children) {
+                self.leaving.insert(key, (item, children));
+            }
         }
         self.rows = next_rows;
-        if next_order != self.order
+        let order = with_leaving(world, &self.order, shown);
+        if order != self.order
             && let Ok(mut host) = world.get_entity_mut(cx.host)
         {
-            host.replace_children(&next_order);
+            host.replace_children(&order);
         }
-        self.order = next_order;
+        self.order = order;
     }
+}
+
+/// `shown` with the leaving entities of `old` kept where they were: each
+/// right after the entity it followed before.
+fn with_leaving(world: &World, old: &[Entity], mut shown: Vec<Entity>) -> Vec<Entity> {
+    for (index, &entity) in old.iter().enumerate() {
+        let leaving = world
+            .get_entity(entity)
+            .is_ok_and(|entity| entity.contains::<Leaving>());
+        if !leaving || shown.contains(&entity) {
+            continue;
+        }
+        let at = old[..index]
+            .iter()
+            .rev()
+            .find_map(|before| shown.iter().position(|e| e == before))
+            .map_or(0, |position| position + 1);
+        shown.insert(at, entity);
+    }
+    shown
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,13 +2190,26 @@ impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        each as __rsn_each, each_indexed as __rsn_each_indexed, handle as __rsn_handle,
-        switch as __rsn_switch, watch as __rsn_watch,
+        bind as __rsn_bind, each as __rsn_each, each_indexed as __rsn_each_indexed,
+        handle as __rsn_handle, switch as __rsn_switch, watch as __rsn_watch,
     };
+
+    /// Whether `value` differs from `place`; ties a `bind` writer's value type
+    /// to the place it writes.
+    pub fn __rsn_differs<T: PartialEq>(place: &T, value: &T) -> bool {
+        place != value
+    }
     pub use bevy::scene::{bsn, bsn_list};
 
-    use super::{Cx, Disabled, Input, IntoReader, Reader};
-    use bevy::prelude::*;
+    use super::{Cx, Disabled, Input, IntoReader, ReactiveParam, Read, Reader, record};
+    use bevy::{
+        ecs::{
+            component::{ComponentId, ComponentIdFor},
+            query::QueryEntityError,
+            system::SystemParamItem,
+        },
+        prelude::*,
+    };
     use std::marker::PhantomData;
 
     /// A reader closure returning `Option<V>`, read as one returning `V`
@@ -1584,6 +2248,45 @@ pub mod __private {
 
         fn read(&mut self, world: &mut World, cx: &Cx) -> Option<V> {
             self.0.read(world, cx).flatten()
+        }
+    }
+
+    /// `$Ref<Type>(..)`'s parameter: like `Query<Ref<Type>>`, but re-runs
+    /// the closure only when what it got changes, not any `Type` anywhere.
+    #[allow(non_camel_case_types)]
+    pub struct __rsn_Get<'w, 's, T: Component> {
+        query: Query<'w, 's, Ref<'static, T>>,
+        id: ComponentId,
+    }
+
+    impl<T: Component> __rsn_Get<'_, '_, T> {
+        /// `T` on `entity`, recording the read.
+        pub fn get(&self, entity: Entity) -> Result<Ref<'_, T>, QueryEntityError> {
+            let found = self.query.get(entity);
+            record(if found.is_ok() {
+                Read::At(entity, self.id)
+            } else {
+                Read::Missing(self.id)
+            });
+            found
+        }
+    }
+
+    impl<T: Component> ReactiveParam for __rsn_Get<'_, '_, T> {
+        type Param = (
+            Query<'static, 'static, Ref<'static, T>>,
+            ComponentIdFor<'static, T>,
+        );
+        type Item<'w, 's> = __rsn_Get<'w, 's, T>;
+
+        fn fetch<'w, 's>(
+            (query, id): SystemParamItem<'w, 's, Self::Param>,
+            _: &Cx,
+        ) -> Option<Self::Item<'w, 's>> {
+            Some(__rsn_Get {
+                query,
+                id: id.get(),
+            })
         }
     }
 
