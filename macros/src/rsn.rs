@@ -451,8 +451,8 @@ fn dollar(
     Ok((params.param(ty, kind), j + 1))
 }
 
-const MISPLACED_DOLLAR: &str =
-    "`$` reads work in component values, `on(..)` handlers and `if`/`match`/`for` headers";
+const MISPLACED_DOLLAR: &str = "`$` reads work in component values, `on(..)` handlers, `bind(..)` \
+     and `if`/`match`/`for` headers";
 
 fn has_dollar(tokens: &[TokenTree]) -> bool {
     tokens.iter().enumerate().any(|(i, token)| match token {
@@ -557,6 +557,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
         // `Type`, `Type { .. }`, `Type(..)` or `Enum::Variant`, as in `bsn!`.
         let is_component = idents.last().is_some_and(upper);
         let is_on = path.len() == 1 && is_ident(path.first(), "on");
+        let is_bind = path.len() == 1 && is_ident(path.first(), "bind");
 
         if let Some(TokenTree::Group(g)) = tokens.get(i)
             && g.delimiter() == Delimiter::Bracket
@@ -604,6 +605,7 @@ fn entity(tokens: &[TokenTree], scope: &mut Scope) -> TokenStream {
             }
             match &group {
                 Some(g) if is_on && chain.is_empty() => handler(g, scope).to_tokens(&mut out),
+                Some(g) if is_bind && chain.is_empty() => binding(g, scope).to_tokens(&mut out),
                 Some(g) if is_component && chain.is_empty() => {
                     reactive_component(path, g, scope).to_tokens(&mut out);
                 }
@@ -904,6 +906,67 @@ fn handler(group: &Group, scope: &mut Scope) -> TokenStream {
     quote! {
         #handle({ #site move |#pattern: &#event, #(#rest,)* #writers| { #lookups #body; } })
     }
+}
+
+/// `$Res`/`$ResMut` and `$Ref`/`$Mut` in `tokens`, deeply, as the reading
+/// (`write: false`) or writing form.
+fn access(tokens: &[TokenTree], write: bool) -> Tokens {
+    let (from, to) = if write {
+        (["Res", "Ref"], ["ResMut", "Mut"])
+    } else {
+        (["ResMut", "Mut"], ["Res", "Ref"])
+    };
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| match token {
+            TokenTree::Ident(ident) if is_punct(tokens.get(i.wrapping_sub(1)), '$') => {
+                match from.iter().position(|name| ident == name) {
+                    Some(index) => TokenTree::Ident(Ident::new(to[index], ident.span())),
+                    None => token.clone(),
+                }
+            }
+            TokenTree::Group(g) if !nested_rsn(tokens, i) => {
+                let mut group = Group::new(g.delimiter(), stream(&access(&tokens_of(g), write)));
+                group.set_span(g.span());
+                TokenTree::Group(group)
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// `bind(place with $X)` → `bind(|x: Res<X>| clone(place), |v: &_, x: ResMut<X>| place = v)`.
+fn binding(group: &Group, scope: &mut Scope) -> TokenStream {
+    let content = tokens_of(group);
+    let site = scope.site(&content);
+
+    let mut params = Params::default();
+    let read = reads(&access(&content, false), &mut params);
+    let get = params.reader(
+        TokenStream::new(),
+        None,
+        quote!(::core::clone::Clone::clone(&(#read))),
+    );
+
+    let mut params = Params {
+        params: Vec::new(),
+        write: true,
+    };
+    let place = reads(&access(&content, true), &mut params);
+    let writers = params.closure_params(true);
+    let lookups = params.lookups(true);
+    let differs = private("differs");
+    let set = quote! {
+        move |__rsn_value: &_, #writers| {
+            #lookups
+            if #differs(&(#place), __rsn_value) {
+                #place = ::core::clone::Clone::clone(__rsn_value);
+            }
+        }
+    };
+    let bind = private("bind");
+    quote!(#bind({ #site #get }, { #site #set }))
 }
 
 // ---------------------------------------------------------------------------

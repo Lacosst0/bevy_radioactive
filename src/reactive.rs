@@ -61,6 +61,7 @@
 //! | `Type::new(.. $ ..)`, `func(.. $ ..)`, `Comp(..).with(.. $ ..)` | a [`watch`] that rebuilds the component the expression returns |
 //! | `Comp { a: Inner { x: .. $ .. } }` | patches only `a.x`, as `bsn!` does for nested values |
 //! | `on(\|e: On<E>\| .. $ ..)` | a [`handle`]r; write with `$Mut<Type>(..)` or `$ResMut<T>` |
+//! | `bind(.. $ ..)` | a [`bind`]ing: the widget shows the value and writes the user's edits back |
 //! | `if`/`else if`/`else` | a [`switch`] region showing one branch |
 //! | `match value { pat => .., }` | a [`switch`] region; arms are `pat => scene,` or `pat => { scene -- scene }` |
 //! | `for pat in $Query<D, F> { .. }` | an [`each`] region with one row per entity |
@@ -86,6 +87,27 @@
 //! }
 //! ```
 //!
+//! # Two-way binding
+//!
+//! `bind(place)` in [`rsn!`] keeps a widget and a value in sync: the widget
+//! shows the value and re-renders when it changes, and the user's edits are
+//! written back. The place is read with `$Res`/`$Ref` and written with
+//! `$ResMut`/`$Mut`, only when the edit differs from what is there.
+//!
+//! ```ignore
+//! Slider SliderRange::new(0.0, 1.0) bind($Res<Settings>.volume)  // f32
+//! --
+//! Checkbox bind($Res<Settings>.muted)                            // bool
+//! --
+//! TextInput bind($Ref<Player>(#Player).name)                     // String
+//! ```
+//!
+//! The widget is the entity's [`Bindable`] component for the value's type.
+//! The `widgets` feature registers `bevy_ui_widgets`' `Slider`, `Checkbox`
+//! and `TextInput`, which Feathers' controls build on; register your own
+//! with [`BindableAppExt::register_bindable`]. Button clicks and other
+//! events are handled with `on(|_: On<Activate>| ..)`.
+//!
 //! # Parameters
 //!
 //! | In a closure | Re-runs it? | Meaning |
@@ -109,6 +131,7 @@
 //! | --- | --- |
 //! | [`watch`] | re-run a closure on change; a returned component or bundle is inserted |
 //! | [`handle`] | run a closure when an entity event reaches this entity |
+//! | [`bind`] | keep a widget and a value in sync, both ways |
 //! | `@`[`when`]`(cond, then)` | show entities while a condition holds |
 //! | `@`[`if_else`]`(cond, then, otherwise)` | `if`/`else` |
 //! | `@`[`switch`]`(key, render)` | show entities for the current value of a key (`match`) |
@@ -163,6 +186,7 @@ use bevy::{
         resource::IsResource,
         system::{SystemParam, SystemParamItem, SystemState},
         template::{FromTemplate, Template, TemplateContext},
+        world::DeferredWorld,
     },
     platform::collections::HashMap,
     prelude::*,
@@ -180,12 +204,15 @@ impl Plugin for ReactivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AnyChanges>()
             .init_resource::<Pending>()
+            .init_resource::<Bindables>()
             .add_systems(PostUpdate, run_reactions.in_set(ReactiveSystems));
         #[cfg(feature = "ui")]
         app.configure_sets(
             PostUpdate,
             ReactiveSystems.before(bevy::ui::UiSystems::Prepare),
         );
+        #[cfg(feature = "widgets")]
+        widgets::register(app);
     }
 }
 
@@ -1112,30 +1139,12 @@ where
     F: IntoHandler<E, M> + Clone,
 {
     fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
-        let handler = Arc::new(Mutex::new((self.0.clone().into_handler(), None)));
+        let handler = handler_state(self.0.clone().into_handler());
         let observer = move |event: On<E>, mut commands: Commands| {
             let event = event.event().clone();
             let handler = Arc::clone(&handler);
             // Exclusive world access, so handlers can take any parameter.
-            commands.queue(move |world: &mut World| {
-                let mut handler = lock(&handler);
-                let (reader, inputs) = &mut *handler;
-                let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
-                    let mut inputs = Vec::new();
-                    reader.inputs(world, &mut inputs);
-                    inputs
-                });
-                let resolved = resolve_all(world, host, inputs);
-                reader.read(
-                    world,
-                    &Cx {
-                        host,
-                        inputs,
-                        resolved: &resolved,
-                        event: Some(&event),
-                    },
-                );
-            });
+            commands.queue(move |world: &mut World| run_handler(world, host, &handler, &event));
         };
         world
             .get_entity_mut(host)
@@ -1143,6 +1152,39 @@ where
             .observe(observer);
         Ok(())
     }
+}
+
+/// A handler closure and its inputs, found on its first run.
+type HandlerState = Arc<Mutex<(Box<dyn Reader<()>>, Option<Vec<Input>>)>>;
+
+fn handler_state(reader: Box<dyn Reader<()>>) -> HandlerState {
+    Arc::new(Mutex::new((reader, None)))
+}
+
+/// Runs a [`handle`] or [`bind`] closure for `event`, declared on `host`.
+fn run_handler(
+    world: &mut World,
+    host: Entity,
+    handler: &HandlerState,
+    event: &(dyn std::any::Any + Send + Sync),
+) {
+    let mut handler = lock(handler);
+    let (reader, inputs) = &mut *handler;
+    let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
+        let mut inputs = Vec::new();
+        reader.inputs(world, &mut inputs);
+        inputs
+    });
+    let resolved = resolve_all(world, host, inputs);
+    reader.read(
+        world,
+        &Cx {
+            host,
+            inputs,
+            resolved: &resolved,
+            event: Some(event),
+        },
+    );
 }
 
 impl<E, F, M: 'static> Template for Handler<E, F, M>
@@ -1158,6 +1200,321 @@ where
 
     fn clone_template(&self) -> Self {
         Self(self.0.clone(), PhantomData)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bind
+// ---------------------------------------------------------------------------
+
+/// Keeps a widget and a value in sync, both ways: the widget shows what `get`
+/// returns, re-run like [`watch`], and when the user edits the widget, `set`
+/// runs with the new value, like a [`handle`]r.
+///
+/// The widget is the entity's [`Bindable`] component for the value's type:
+/// with the `widgets` feature, a `Slider` edits an `f32`, a `Checkbox` a
+/// `bool` and a `TextInput` a `String`. Register others with
+/// [`BindableAppExt::register_bindable`].
+///
+/// ```ignore
+/// Slider SliderRange::new(0.0, 1.0)
+/// bind(
+///     |volume: Res<Volume>| volume.0,
+///     |value: &f32, mut volume: ResMut<Volume>| volume.0 = *value,
+/// )
+/// ```
+///
+/// In [`rsn!`], write the value once: `bind($Res<Volume>.0)` reads it with
+/// `$Res`/`$Ref` and writes it with `$ResMut`/`$Mut`, only when it differs.
+pub fn bind<M, N, G, S>(get: G, set: S) -> Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    Bind(get, set, PhantomData)
+}
+
+/// Made by [`bind`].
+pub struct Bind<G, S, M, N>(G, S, PhantomData<fn() -> (M, N)>);
+
+/// A widget component that edits a value: what [`bind`] syncs.
+///
+/// ```ignore
+/// impl Bindable for Knob {
+///     type Value = f32;
+///     type Event = ValueChange<f32>;
+///
+///     fn show(entity: &mut EntityWorldMut, value: &f32) {
+///         entity.insert(KnobAngle(*value));
+///     }
+///
+///     fn value(event: &ValueChange<f32>, _: EntityRef) -> Option<f32> {
+///         Some(event.value)
+///     }
+/// }
+///
+/// // app.register_bindable::<Knob>()
+/// ```
+pub trait Bindable: Component {
+    /// The value the widget edits.
+    type Value: Clone + PartialEq + Send + Sync + 'static;
+    /// The event the widget sends when the user edits it.
+    type Event: EntityEvent;
+
+    /// Shows `value` in the widget. Called when the bound value changes, so
+    /// skip work when the widget already shows it.
+    fn show(entity: &mut EntityWorldMut, value: &Self::Value);
+
+    /// The edited value an `event` on `entity` carries, if any.
+    fn value(event: &Self::Event, entity: EntityRef) -> Option<Self::Value>;
+}
+
+/// Registers [`Bindable`] widgets for [`bind`].
+pub trait BindableAppExt {
+    /// Lets [`bind`] sync `W` with values of type `W::Value`. Widgets
+    /// registered later are tried first.
+    fn register_bindable<W: Bindable>(&mut self) -> &mut Self;
+}
+
+impl BindableAppExt for App {
+    fn register_bindable<W: Bindable>(&mut self) -> &mut Self {
+        let marker = self.world_mut().register_component::<W>();
+        self.world_mut()
+            .get_resource_or_init::<Bindables>()
+            .0
+            .push(Widget {
+                marker,
+                value: TypeId::of::<W::Value>(),
+                name: std::any::type_name::<W>(),
+                show: show_widget::<W>,
+                observe: observe_widget::<W>,
+            });
+        self
+    }
+}
+
+/// The registered [`Bindable`]s.
+#[derive(Resource, Default)]
+struct Bindables(Vec<Widget>);
+
+/// A [`Bindable`], type-erased.
+#[derive(Clone, Copy)]
+struct Widget {
+    marker: ComponentId,
+    value: TypeId,
+    name: &'static str,
+    show: fn(&mut World, Entity, &(dyn std::any::Any + Send + Sync)),
+    observe: fn(&mut World, Entity, HandlerState),
+}
+
+fn show_widget<W: Bindable>(
+    world: &mut World,
+    host: Entity,
+    value: &(dyn std::any::Any + Send + Sync),
+) {
+    if let Some(value) = value.downcast_ref::<W::Value>()
+        && let Ok(mut entity) = world.get_entity_mut(host)
+    {
+        W::show(&mut entity, value);
+    }
+}
+
+fn observe_widget<W: Bindable>(world: &mut World, host: Entity, set: HandlerState) {
+    let observer = move |event: On<W::Event>, mut world: DeferredWorld| {
+        if event.event_target() != host {
+            return;
+        }
+        let Ok(entity) = world.get_entity(host) else {
+            return;
+        };
+        let Some(value) = W::value(event.event(), entity) else {
+            return;
+        };
+        let set = Arc::clone(&set);
+        world
+            .commands()
+            .queue(move |world: &mut World| run_handler(world, host, &set, &value));
+    };
+    if let Ok(mut entity) = world.get_entity_mut(host) {
+        entity.observe(observer);
+    }
+}
+
+struct BindBody<V> {
+    get: Box<dyn Reader<V>>,
+    set: HandlerState,
+    /// The widget, found on the first run.
+    widget: Option<Widget>,
+    looked_up: bool,
+}
+
+impl<V: Clone + PartialEq + Send + Sync + 'static> BindBody<V> {
+    fn widget(&mut self, world: &mut World, host: Entity) -> Option<Widget> {
+        if self.looked_up {
+            return self.widget;
+        }
+        let found = world.get_resource::<Bindables>().and_then(|bindables| {
+            let entity = world.get_entity(host).ok()?;
+            bindables
+                .0
+                .iter()
+                .rev()
+                .find(|widget| {
+                    widget.value == TypeId::of::<V>() && entity.contains_id(widget.marker)
+                })
+                .copied()
+        });
+        if let Some(widget) = found {
+            (widget.observe)(world, host, Arc::clone(&self.set));
+        } else {
+            let registered: Vec<&str> = world
+                .get_resource::<Bindables>()
+                .map(|bindables| {
+                    bindables
+                        .0
+                        .iter()
+                        .filter(|widget| widget.value == TypeId::of::<V>())
+                        .map(|widget| widget.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            warn!(
+                "bind: entity {host} has no widget that edits `{}` values; add one of [{}], \
+                 or register yours with `app.register_bindable::<W>()`",
+                std::any::type_name::<V>(),
+                registered.join(", "),
+            );
+        }
+        self.widget = found;
+        self.looked_up = true;
+        found
+    }
+}
+
+impl<V: Clone + PartialEq + Send + Sync + 'static> Body for BindBody<V> {
+    fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
+        self.get.inputs(world, inputs);
+    }
+
+    fn run(&mut self, world: &mut World, cx: &Cx) {
+        let Some(value) = self.get.read(world, cx) else {
+            return;
+        };
+        if let Some(widget) = self.widget(world, cx.host) {
+            (widget.show)(world, cx.host, &value);
+        }
+    }
+}
+
+impl<G, S, M: 'static, N: 'static> Reactive for Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
+        let body = Box::new(BindBody {
+            get: self.0.clone().into_reader(),
+            set: handler_state(self.1.clone().into_handler()),
+            widget: None,
+            looked_up: false,
+        });
+        attach(world, host, body).map(|_| ())
+    }
+}
+
+impl<G, S, M: 'static, N: 'static> Template for Bind<G, S, M, N>
+where
+    G: IntoReader<M> + Clone,
+    G::Output: Clone + PartialEq + Send + Sync,
+    S: IntoHandler<G::Output, N> + Clone,
+{
+    type Output = EmptySceneEffect;
+
+    fn build_template(&self, context: &mut TemplateContext) -> Result<EmptySceneEffect> {
+        build_reactive(self, context)
+    }
+
+    fn clone_template(&self) -> Self {
+        Self(self.0.clone(), self.1.clone(), PhantomData)
+    }
+}
+
+/// [`Bindable`] for the `bevy_ui_widgets` widgets.
+#[cfg(feature = "widgets")]
+mod widgets {
+    use super::Bindable;
+    use bevy::{
+        prelude::*,
+        text::{EditableText, TextEdit, TextEditChange},
+        ui::Checked,
+        ui_widgets::{Checkbox, Slider, SliderValue, TextInput, ValueChange},
+    };
+
+    impl Bindable for Slider {
+        type Value = f32;
+        type Event = ValueChange<f32>;
+
+        #[allow(clippy::float_cmp, reason = "skips only an exact repeat")]
+        fn show(entity: &mut EntityWorldMut, &value: &f32) {
+            if entity
+                .get::<SliderValue>()
+                .is_none_or(|shown| shown.0 != value)
+            {
+                entity.insert(SliderValue(value));
+            }
+        }
+
+        fn value(event: &ValueChange<f32>, _: EntityRef) -> Option<f32> {
+            Some(event.value)
+        }
+    }
+
+    impl Bindable for Checkbox {
+        type Value = bool;
+        type Event = ValueChange<bool>;
+
+        fn show(entity: &mut EntityWorldMut, &checked: &bool) {
+            match (checked, entity.contains::<Checked>()) {
+                (true, false) => {
+                    entity.insert(Checked);
+                }
+                (false, true) => {
+                    entity.remove::<Checked>();
+                }
+                _ => {}
+            }
+        }
+
+        fn value(event: &ValueChange<bool>, _: EntityRef) -> Option<bool> {
+            Some(event.value)
+        }
+    }
+
+    impl Bindable for TextInput {
+        type Value = String;
+        type Event = TextEditChange;
+
+        fn show(entity: &mut EntityWorldMut, value: &String) {
+            if let Some(mut text) = entity.get_mut::<EditableText>()
+                && text.value() != value.as_str()
+            {
+                text.editor.set_text(value);
+                text.queue_edit(TextEdit::TextEnd(false));
+            }
+        }
+
+        fn value(_: &TextEditChange, entity: EntityRef) -> Option<String> {
+            Some(entity.get::<EditableText>()?.value().to_string())
+        }
+    }
+
+    pub(super) fn register(app: &mut App) {
+        use super::BindableAppExt;
+        app.register_bindable::<Slider>()
+            .register_bindable::<Checkbox>()
+            .register_bindable::<TextInput>();
     }
 }
 
@@ -1539,9 +1896,15 @@ impl<'s, D: IterQueryData + 'static> Nearest<'_, 's, D> {
 #[doc(hidden)]
 pub mod __private {
     pub use super::{
-        each as __rsn_each, each_indexed as __rsn_each_indexed, handle as __rsn_handle,
-        switch as __rsn_switch, watch as __rsn_watch,
+        bind as __rsn_bind, each as __rsn_each, each_indexed as __rsn_each_indexed,
+        handle as __rsn_handle, switch as __rsn_switch, watch as __rsn_watch,
     };
+
+    /// Whether `value` differs from `place`; ties a `bind` writer's value type
+    /// to the place it writes.
+    pub fn __rsn_differs<T: PartialEq>(place: &T, value: &T) -> bool {
+        place != value
+    }
     pub use bevy::scene::{bsn, bsn_list};
 
     use super::{Cx, Disabled, Input, IntoReader, Reader};
