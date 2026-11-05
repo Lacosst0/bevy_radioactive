@@ -1,5 +1,6 @@
 #![cfg(feature = "rfn")]
-//! `#[rfn]`: system parameters as arguments and derived `let`s, read as `$name`.
+//! `#[rfn]`: system parameters as arguments and derived `let`s; `#[reactive]`
+//! ones are read as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -84,7 +85,7 @@ fn named(app: &mut App, name: &str) -> Entity {
 }
 
 #[rfn]
-fn score_label(score: Res<Score>) -> impl Scene {
+fn score_label(#[reactive] score: Res<Score>) -> impl Scene {
     rsn! { Label({ format!("score {}", $score.0) }) }
 }
 
@@ -99,8 +100,10 @@ fn a_declared_param_is_read_with_dollar() {
 }
 
 #[rfn]
-fn derived(prefix: &'static str, score: Res<Score>) -> impl Scene {
+fn derived(prefix: &'static str, #[reactive] score: Res<Score>) -> impl Scene {
+    #[reactive]
     let doubled = score.0 * 2;
+    #[reactive]
     let text = format!("{prefix} {doubled}");
     let shout = prefix.to_uppercase();
     bsn! {
@@ -126,7 +129,8 @@ fn derived_lets_recompute_and_plain_lets_run_once() {
 }
 
 #[rfn]
-fn branches(tab: Res<Tab>, score: Res<Score>) -> impl Scene {
+fn branches(#[reactive] tab: Res<Tab>, #[reactive] score: Res<Score>) -> impl Scene {
+    #[reactive]
     let big = score.0 > 10;
     rsn! {
         Node
@@ -153,7 +157,8 @@ fn if_and_match_on_declared_values() {
 }
 
 #[rfn]
-fn enemies(enemies: Query<&Health, With<Enemy>>) -> impl Scene {
+fn enemies(#[reactive] enemies: Query<&Health, With<Enemy>>) -> impl Scene {
+    #[reactive]
     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
     rsn! {
         Node
@@ -180,7 +185,12 @@ fn queries_loop_and_derive() {
 }
 
 #[rfn]
-fn counter(#[from("Counter")] count: Ref<Count>, score: Res<Score>) -> impl Scene {
+fn counter(
+    #[reactive]
+    #[from("Counter")]
+    count: Ref<Count>,
+    #[reactive] score: Res<Score>,
+) -> impl Scene {
     rsn! {
         #Counter
         Count(0)
@@ -214,7 +224,13 @@ fn handlers_write_declared_values() {
 }
 
 #[rfn]
-fn health_of(player: Entity, #[from(player)] hp: Ref<Health>) -> impl Scene {
+fn health_of(
+    player: Entity,
+    #[reactive]
+    #[from(player)]
+    hp: Ref<Health>,
+) -> impl Scene {
+    #[reactive]
     let low = hp.0 < 10;
     rsn! {
         Label({ format!("{}{}", $hp.0, if $low { "!" } else { "" }) })
@@ -233,14 +249,18 @@ fn ref_of_an_entity_argument() {
 }
 
 #[rfn]
-fn counts_calls(score: Res<Score>, tab: Res<Tab>, calls: ResMut<Calls>) -> impl Scene {
+fn counts_calls(
+    #[reactive] score: Res<Score>,
+    #[reactive] tab: Res<Tab>,
+    mut calls: ResMut<Calls>,
+) -> impl Scene {
     rsn! {
         Node
         Children [
             Label({ format!("{:?}", *$tab) })
             --
             Label({
-                $calls.0 += 1;
+                calls.0 += 1;
                 format!("{}", $score.0)
             })
         ]
@@ -262,7 +282,7 @@ fn only_reads_that_changed_re_run() {
 }
 
 #[rfn]
-fn strings(name: String, score: Res<Score>) -> impl Scene {
+fn strings(name: String, #[reactive] score: Res<Score>) -> impl Scene {
     let greeting = format!("hi {name}");
     rsn! {
         Node
@@ -296,9 +316,14 @@ struct Totals<'w> {
 }
 
 #[rfn]
-fn optional(bonus: Option<Res<Bonus>>, score: Res<Score>, totals: Untracked<Totals>) -> impl Scene {
+fn optional(
+    #[reactive] bonus: Option<Res<Bonus>>,
+    #[reactive] score: Res<Score>,
+    totals: Untracked<Totals>,
+) -> impl Scene {
+    #[reactive]
     let extra = bonus.as_ref().and_then(|b| b.0).unwrap_or(0);
-    rsn! { Label({ format!("{} + {} ({})", $score.0, $extra, $totals.score.0) }) }
+    rsn! { Label({ format!("{} + {} ({})", $score.0, $extra, totals.score.0) }) }
 }
 
 #[test]
@@ -310,4 +335,62 @@ fn optional_and_custom_params() {
     app.world_mut().resource_mut::<Score>().0 = 2;
     app.update();
     assert_eq!(labels(&mut app), ["2 + 3 (2)"]);
+}
+
+#[derive(Component, Clone, Copy, Default)]
+struct Spawned;
+
+#[rfn]
+fn untracked(
+    mut commands: Commands,
+    score: Res<Score>,
+    #[from("Root")] mut count: Ref<Count>,
+    #[reactive] tab: Res<Tab>,
+) -> impl Scene {
+    let snapshot = score.0 + 100;
+    rsn! {
+        #Root
+        Count(0)
+        Children [
+            // Untracked: read when this label renders, but a change doesn't re-run it.
+            Label({ format!("{:?} {}", *$tab, score.0) })
+            --
+            Label({ format!("snapshot {snapshot}") })
+            --
+            #Button
+            on(|_: On<Poke>| {
+                commands.spawn(Spawned);
+                count.0 += 1;
+            })
+        ]
+    }
+}
+
+#[test]
+fn unmarked_params_are_untracked() {
+    let mut app = app();
+    app.world_mut().resource_mut::<Score>().0 = 1;
+    app.world_mut().spawn_scene(untracked()).unwrap();
+    assert_eq!(labels(&mut app), ["Home 1", "snapshot 101"]);
+
+    // `score` isn't tracked: nothing re-runs.
+    app.world_mut().resource_mut::<Score>().0 = 2;
+    app.update();
+    assert_eq!(labels(&mut app), ["Home 1", "snapshot 101"]);
+
+    // `tab` is: the label re-runs and reads the current `score` too.
+    *app.world_mut().resource_mut::<Tab>() = Tab::Settings;
+    app.update();
+    assert_eq!(labels(&mut app), ["Settings 2", "snapshot 101"]);
+
+    let button = named(&mut app, "Button");
+    app.world_mut().trigger(Poke {
+        entity: button,
+        by: 0,
+    });
+    app.update();
+    let world = app.world_mut();
+    assert_eq!(world.query::<&Spawned>().iter(world).count(), 1);
+    let root = named(&mut app, "Root");
+    assert_eq!(app.world().get::<Count>(root), Some(&Count(1)));
 }

@@ -190,7 +190,7 @@ pub(crate) fn mentions(tokens: &[TokenTree], names: &[Ident]) -> bool {
 }
 
 /// Whether the string literal `text` has `{name}` or `{name:..}`.
-fn formats(text: &str, name: &str) -> bool {
+pub(crate) fn formats(text: &str, name: &str) -> bool {
     text.match_indices('{').any(|(at, _)| {
         let rest = &text[at + 1..];
         rest.starts_with(name)
