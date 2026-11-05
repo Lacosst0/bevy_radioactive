@@ -347,15 +347,12 @@ fn untracked(
     #[from("Root")] mut count: Ref<Count>,
     #[reactive] tab: Res<Tab>,
 ) -> impl Scene {
-    let snapshot = score.0 + 100;
     rsn! {
         #Root
         Count(0)
         Children [
             // Untracked: read when this label renders, but a change doesn't re-run it.
             Label({ format!("{:?} {}", *$tab, score.0) })
-            --
-            Label({ format!("snapshot {snapshot}") })
             --
             #Button
             on(|_: On<Poke>| {
@@ -371,17 +368,17 @@ fn unmarked_params_are_untracked() {
     let mut app = app();
     app.world_mut().resource_mut::<Score>().0 = 1;
     app.world_mut().spawn_scene(untracked()).unwrap();
-    assert_eq!(labels(&mut app), ["Home 1", "snapshot 101"]);
+    assert_eq!(labels(&mut app), ["Home 1"]);
 
     // `score` isn't tracked: nothing re-runs.
     app.world_mut().resource_mut::<Score>().0 = 2;
     app.update();
-    assert_eq!(labels(&mut app), ["Home 1", "snapshot 101"]);
+    assert_eq!(labels(&mut app), ["Home 1"]);
 
     // `tab` is: the label re-runs and reads the current `score` too.
     *app.world_mut().resource_mut::<Tab>() = Tab::Settings;
     app.update();
-    assert_eq!(labels(&mut app), ["Settings 2", "snapshot 101"]);
+    assert_eq!(labels(&mut app), ["Settings 2"]);
 
     let button = named(&mut app, "Button");
     app.world_mut().trigger(Poke {
@@ -393,4 +390,47 @@ fn unmarked_params_are_untracked() {
     assert_eq!(world.query::<&Spawned>().iter(world).count(), 1);
     let root = named(&mut app, "Root");
     assert_eq!(app.world().get::<Count>(root), Some(&Count(1)));
+}
+
+#[derive(Resource, Default)]
+struct Spawned2(u32);
+
+/// `#[rfn]` on a system: parameters the body uses stay system parameters.
+#[rfn]
+fn setup_ui(mut commands: Commands, #[reactive] score: Res<Score>, mut spawned: ResMut<Spawned2>) {
+    let start = score.0;
+    spawned.0 += 1;
+    commands.spawn_scene(rsn! {
+        Node
+        Children [
+            Label({ format!("start {start}, now {}", $score.0) })
+            --
+            #Button
+            on(|_: On<Poke>| { commands.spawn(Spawned); })
+        ]
+    });
+}
+
+#[test]
+fn rfn_systems_keep_the_parameters_their_body_uses() {
+    let mut app = app();
+    app.init_resource::<Spawned2>()
+        .add_systems(Startup, setup_ui);
+    app.world_mut().resource_mut::<Score>().0 = 3;
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Spawned2>().0, 1);
+    assert_eq!(labels(&mut app), ["start 3, now 3"]);
+    app.world_mut().resource_mut::<Score>().0 = 4;
+    app.update();
+    assert_eq!(labels(&mut app), ["start 3, now 4"]);
+
+    let button = named(&mut app, "Button");
+    app.world_mut().trigger(Poke {
+        entity: button,
+        by: 0,
+    });
+    app.update();
+    let world = app.world_mut();
+    assert_eq!(world.query::<&Spawned>().iter(world).count(), 1);
 }

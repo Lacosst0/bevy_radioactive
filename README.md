@@ -354,11 +354,24 @@ fn scoreboard(
 | `#[from(..)] x: Ref<T>` (unmarked) | the same, for handlers | `x`, only in `on(..)` |
 | any other argument | a prop, passed by the caller | `x`, cloned per use |
 | `#[reactive] let y = .. x ..;` | a derived value | `$y`, recomputed from the parameters it reads |
-| `let y = .. x ..;` with only untracked `x` | an untracked derived value | `y`, recomputed where it is used |
 | any other statement | plain Rust, run once | `y`, cloned per use |
 
-System parameter arguments are removed from the signature, so callers pass only the
-props: `@scoreboard("Round 1")`.
+System parameter arguments that only the scene uses are removed from the signature, so
+callers pass only the props: `@scoreboard("Round 1")`. One the body itself uses (outside
+`rsn!` and `#[reactive] let`s) stays an argument, so `#[rfn]` works on systems too, and
+the scene still reads its own copy:
+
+```rust,ignore
+#[rfn]
+fn setup_ui(mut commands: Commands, #[reactive] score: Res<Score>) {
+    commands.spawn_scene(rsn! {
+        Text({ $score.0.to_string() })
+        Button on(|_: On<Activate>| { commands.spawn(Enemy); })
+    });
+}
+
+// app.add_systems(Startup, setup_ui)
+```
 
 - **One rule, as in `reactive`:** whatever contains a `$` re-runs when what it read
   changes; everything else runs once. `#[reactive]` says which values those are, and
