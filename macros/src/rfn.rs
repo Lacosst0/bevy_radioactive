@@ -6,14 +6,14 @@
 //! component script:
 //!
 //! - An argument whose type is a system parameter (`Res<T>`, `Query<..>`,
-//!   `Commands`, ..) is removed from the signature and read by the scene.
+//!   `Commands`, ..) is read by the scene. It is removed from the signature
+//!   unless the body uses it too, outside scene macros and `#[reactive] let`s
+//!   (then it stays, so the function can be a system).
 //!   Marked `#[reactive]`, it is tracked and read as `$name`; unmarked, it is
 //!   untracked and read as `name`. `#[from(target)] x: Ref<T>` reads
 //!   component `T` on an entity (`"Name"` or an `Entity` argument). Other
 //!   arguments are plain props.
 //! - `#[reactive] let` is a *derived* value, recomputed from what it reads.
-//!   An unmarked `let` that reads only untracked parameters is derived too,
-//!   but untracked.
 //! - Every other statement runs once, when the function is called.
 //!
 //! Parameter arguments and derived `let`s are removed. Each use in a scene
@@ -35,6 +35,10 @@ struct Reactive {
     names: Vec<Ident>,
     /// Marked `#[reactive]`: read with `$`, and re-runs what reads it.
     tracked: bool,
+    /// A parameter the body itself uses: it stays an argument of the
+    /// function (a system parameter when the function is a system), and
+    /// scenes read their own copy, tracked or not.
+    kept: bool,
     kind: Kind,
     /// Earlier reactive items it reads (indices), for derived values.
     deps: Vec<usize>,
@@ -80,6 +84,17 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut plain = Vec::new();
     let mut reactive: Vec<Reactive> = Vec::new();
     let mut errors = TokenStream::new();
+    // The body's own code: everything but `#[reactive] let`s, which become
+    // part of the scene.
+    let body_tokens: Tokens = function
+        .block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            !matches!(stmt, Stmt::Local(local) if local.attrs.iter().any(|a| a.path().is_ident("reactive")))
+        })
+        .flat_map(ToTokens::to_token_stream)
+        .collect();
     for input in std::mem::take(&mut function.sig.inputs) {
         let syn::FnArg::Typed(mut arg) = input else {
             function.sig.inputs.push(input);
@@ -103,6 +118,15 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         let mut names = Vec::new();
         pattern_names(&arg.pat, &mut names);
+        // A parameter the body uses (`commands.spawn_scene(..)`) stays an
+        // argument, so the function can be a system.
+        let kept = from.is_none()
+            && names
+                .iter()
+                .any(|name| used_outside_scenes(&body_tokens, name));
+        if kept {
+            function.sig.inputs.push(syn::FnArg::Typed(arg.clone()));
+        }
         let wrapper = last_ident(&arg.ty).unwrap_or_default();
         let component = wrapper == "Ref" || wrapper == "Mut";
         let target = match (&from, component) {
@@ -143,6 +167,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         reactive.push(Reactive {
             names,
             tracked: marked.is_some(),
+            kept,
             kind: Kind::Param {
                 ty: ty.to_token_stream(),
                 target,
@@ -185,6 +210,11 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map(|(_, e)| e.to_token_stream().into_iter().collect())
                     .unwrap_or_default();
                 for (index, item) in reactive.iter().enumerate() {
+                    // A kept argument has a value in the body: an unmarked
+                    // `let` reading it is plain.
+                    if item.kept && marked.is_none() {
+                        continue;
+                    }
                     if mentions(&value, &item.names) || mentions(&diverge, &item.names) {
                         deps.push(index);
                     }
@@ -233,6 +263,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 reactive.push(Reactive {
                     names,
                     tracked: marked.is_some(),
+                    kept: false,
                     kind: Kind::Derived(stmt.to_token_stream()),
                     deps: all,
                 });
@@ -372,7 +403,10 @@ impl Context<'_> {
             }
             match &tokens[i] {
                 TokenTree::Ident(ident)
-                    if self.find(ident).is_some() && Self::bare_use(tokens, i) =>
+                    if self
+                        .find(ident)
+                        .is_some_and(|index| !self.reactive[index].kept)
+                        && Self::bare_use(tokens, i) =>
                 {
                     let message = if self.reactive[self.find(ident).unwrap()].tracked {
                         format!(
@@ -629,6 +663,26 @@ impl Context<'_> {
             None => quote!($::bevy_radioactive::reactive::Untracked<#ty>),
         }
     }
+}
+
+/// Whether `tokens` use `name` as a value outside scene macros.
+fn used_outside_scenes(tokens: &[TokenTree], name: &Ident) -> bool {
+    let mut i = 0;
+    while i < tokens.len() {
+        if scene_macro(tokens, i).is_some() {
+            i += 3;
+            continue;
+        }
+        match &tokens[i] {
+            TokenTree::Ident(ident) if ident == name && Context::bare_use(tokens, i) => {
+                return true;
+            }
+            TokenTree::Group(g) if used_outside_scenes(&tokens_of(g), name) => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether a string literal directly in `tokens` captures `name` (`"{name}"`).

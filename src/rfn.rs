@@ -7,8 +7,10 @@
 //! - An argument whose type is a system parameter (`Res<T>`, `ResMut<T>`,
 //!   `Query<..>`, `Single<..>`, `Populated<..>`, `Local<T>`, `Commands`,
 //!   `Option<Res<T>>`, `Untracked<P>` for a custom one, ..) is supplied by the
-//!   runtime and removed from the signature, so callers pass only the other
-//!   arguments.
+//!   runtime. If only the scene uses it, it is removed from the signature, so
+//!   callers pass only the other arguments; if the body uses it too
+//!   (`commands.spawn_scene(..)`), it stays an argument, so a system can be an
+//!   `#[rfn]`.
 //! - `#[reactive] score: Res<Score>` is tracked: the scene reads it as
 //!   `$score`, and whatever does re-runs when it changes. Unmarked
 //!   (`mut commands: Commands`), it is untracked: the scene uses it as
@@ -17,9 +19,8 @@
 //!   named `Name` (`#Name` in a scene); `#[from(entity)]` reads it on an
 //!   `Entity` argument. Unmarked, it only works in `on(..)`.
 //! - In the body, `#[reactive] let` is a derived value, recomputed where the
-//!   scene reads it (`$name`). A `let` reading a `#[reactive]` value must be
-//!   marked; one reading only untracked parameters is used as `name`.
-//!   Everything else runs once, when the function is called.
+//!   scene reads it (`$name`). Everything else, unmarked `let`s included,
+//!   runs once, when the function is called.
 //!
 //! In `rsn!` (or `bsn!`), `$name` reads a reactive value, and whatever
 //! contains it re-runs when what it read changes, exactly as with
