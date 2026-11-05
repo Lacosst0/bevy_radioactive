@@ -1,6 +1,6 @@
 //! A scoreboard written with `#[rfn]`: it takes system parameters as
 //! arguments, like a Bevy system, derives values from them in the body, and
-//! reads them in `rsn!` as `$name`.
+//! reads the `#[reactive]` ones in `rsn!` as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -24,12 +24,18 @@ struct Hit {
 
 #[rfn]
 fn scoreboard(
-    title: &'static str, // a prop: `scoreboard("round 1")`
-    score: Res<Score>,   // system parameters, as in a Bevy system
-    enemies: Query<&Health, With<Enemy>>,
+    // A prop: `scoreboard("round 1")`.
+    title: &'static str,
+    // Tracked: `$score` re-runs what reads it when it changes.
+    #[reactive] score: Res<Score>,
+    #[reactive] enemies: Query<&Health, With<Enemy>>,
+    // Untracked: used as `commands`.
+    mut commands: Commands,
 ) -> impl Scene {
     // Derived: they read reactive values, so they re-run when those change.
+    #[reactive]
     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
+    #[reactive]
     let status = if alive == 0 { "cleared" } else { "fighting" };
 
     // Plain: runs once.
@@ -44,7 +50,10 @@ fn scoreboard(
             --
             #Button
             // In `on(..)` reads are writable: `Res<Score>` becomes `ResMut<Score>`.
-            on(|_: On<Hit>| $score.0 += 10)
+            on(|_: On<Hit>| {
+                $score.0 += 10;
+                commands.spawn(Label("  (hit)".into()));
+            })
             --
             if $alive == 0 { Label("  you win!") }
         ]

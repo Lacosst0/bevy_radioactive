@@ -3,7 +3,7 @@
 //! Plain Bevy version: `comparison_bevy`.
 //!
 //! `Count` lives on the counter's root node, so every `@counter()` has its
-//! own. The `#[from("Counter")] count: Ref<Count>` argument reads it: buttons
+//! own. The `#[reactive] #[from("Counter")] count: Ref<Count>` argument reads it: buttons
 //! write `$count` in `on(..)`, the label re-renders when it changes, and the
 //! Reset button exists only while the count is not zero.
 
@@ -38,7 +38,12 @@ fn scene() -> impl SceneList {
 }
 
 #[rfn]
-fn counter(#[from("Counter")] count: Ref<Count>) -> impl Scene {
+fn counter(
+    #[reactive]
+    #[from("Counter")]
+    count: Ref<Count>,
+) -> impl Scene {
+    #[reactive]
     let label = count.0.to_string();
     rsn! {
         #Counter
