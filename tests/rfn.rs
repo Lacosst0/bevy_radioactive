@@ -1,5 +1,5 @@
 #![cfg(feature = "rfn")]
-//! `#[rfn]`: system parameters as arguments and derived `let`s; `#[reactive]`
+//! `#[rfn]`: system parameters as arguments and derived `let`s; `Reactive<..>`
 //! ones are read as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
@@ -85,7 +85,7 @@ fn named(app: &mut App, name: &str) -> Entity {
 }
 
 #[rfn]
-fn score_label(#[reactive] score: Res<Score>) -> impl Scene {
+fn score_label(score: Reactive<Res<Score>>) -> impl Scene {
     rsn! { Label({ format!("score {}", $score.0) }) }
 }
 
@@ -100,11 +100,9 @@ fn a_declared_param_is_read_with_dollar() {
 }
 
 #[rfn]
-fn derived(prefix: &'static str, #[reactive] score: Res<Score>) -> impl Scene {
-    #[reactive]
-    let doubled = score.0 * 2;
-    #[reactive]
-    let text = format!("{prefix} {doubled}");
+fn derived(prefix: &'static str, score: Reactive<Res<Score>>) -> impl Scene {
+    let doubled: Reactive<_> = score.0 * 2;
+    let text: Reactive<_> = format!("{prefix} {doubled}");
     let shout = prefix.to_uppercase();
     bsn! {
         Node
@@ -129,9 +127,8 @@ fn derived_lets_recompute_and_plain_lets_run_once() {
 }
 
 #[rfn]
-fn branches(#[reactive] tab: Res<Tab>, #[reactive] score: Res<Score>) -> impl Scene {
-    #[reactive]
-    let big = score.0 > 10;
+fn branches(tab: Reactive<Res<Tab>>, score: Reactive<Res<Score>>) -> impl Scene {
+    let big: Reactive<_> = score.0 > 10;
     rsn! {
         Node
         Children [
@@ -157,9 +154,8 @@ fn if_and_match_on_declared_values() {
 }
 
 #[rfn]
-fn enemies(#[reactive] enemies: Query<&Health, With<Enemy>>) -> impl Scene {
-    #[reactive]
-    let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
+fn enemies(enemies: Reactive<Query<&Health, With<Enemy>>>) -> impl Scene {
+    let alive: Reactive<_> = enemies.iter().filter(|hp| hp.0 > 0).count();
     rsn! {
         Node
         Children [
@@ -185,12 +181,7 @@ fn queries_loop_and_derive() {
 }
 
 #[rfn]
-fn counter(
-    #[reactive]
-    #[from("Counter")]
-    count: Ref<Count>,
-    #[reactive] score: Res<Score>,
-) -> impl Scene {
+fn counter(count: Reactive<Ref<Count>, Of<Counter>>, score: Reactive<Res<Score>>) -> impl Scene {
     rsn! {
         #Counter
         Count(0)
@@ -224,14 +215,8 @@ fn handlers_write_declared_values() {
 }
 
 #[rfn]
-fn health_of(
-    player: Entity,
-    #[reactive]
-    #[from(player)]
-    hp: Ref<Health>,
-) -> impl Scene {
-    #[reactive]
-    let low = hp.0 < 10;
+fn health_of(player: Entity, hp: Reactive<Ref<Health>, Of<player>>) -> impl Scene {
+    let low: Reactive<_> = hp.0 < 10;
     rsn! {
         Label({ format!("{}{}", $hp.0, if $low { "!" } else { "" }) })
     }
@@ -250,8 +235,8 @@ fn ref_of_an_entity_argument() {
 
 #[rfn]
 fn counts_calls(
-    #[reactive] score: Res<Score>,
-    #[reactive] tab: Res<Tab>,
+    score: Reactive<Res<Score>>,
+    tab: Reactive<Res<Tab>>,
     mut calls: ResMut<Calls>,
 ) -> impl Scene {
     rsn! {
@@ -282,7 +267,7 @@ fn only_reads_that_changed_re_run() {
 }
 
 #[rfn]
-fn strings(name: String, #[reactive] score: Res<Score>) -> impl Scene {
+fn strings(name: String, score: Reactive<Res<Score>>) -> impl Scene {
     let greeting = format!("hi {name}");
     rsn! {
         Node
@@ -317,12 +302,11 @@ struct Totals<'w> {
 
 #[rfn]
 fn optional(
-    #[reactive] bonus: Option<Res<Bonus>>,
-    #[reactive] score: Res<Score>,
+    bonus: Reactive<Option<Res<Bonus>>>,
+    score: Reactive<Res<Score>>,
     totals: Untracked<Totals>,
 ) -> impl Scene {
-    #[reactive]
-    let extra = bonus.as_ref().and_then(|b| b.0).unwrap_or(0);
+    let extra: Reactive<_> = bonus.as_ref().and_then(|b| b.0).unwrap_or(0);
     rsn! { Label({ format!("{} + {} ({})", $score.0, $extra, totals.score.0) }) }
 }
 
@@ -344,8 +328,8 @@ struct Spawned;
 fn untracked(
     mut commands: Commands,
     score: Res<Score>,
-    #[from("Root")] mut count: Ref<Count>,
-    #[reactive] tab: Res<Tab>,
+    mut count: Ref<Count, Of<Root>>,
+    tab: Reactive<Res<Tab>>,
 ) -> impl Scene {
     rsn! {
         #Root
@@ -397,7 +381,7 @@ struct Spawned2(u32);
 
 /// `#[rfn]` on a system: parameters the body uses stay system parameters.
 #[rfn]
-fn setup_ui(mut commands: Commands, #[reactive] score: Res<Score>, mut spawned: ResMut<Spawned2>) {
+fn setup_ui(mut commands: Commands, score: Reactive<Res<Score>>, mut spawned: ResMut<Spawned2>) {
     let start = score.0;
     spawned.0 += 1;
     commands.spawn_scene(rsn! {
@@ -433,4 +417,20 @@ fn rfn_systems_keep_the_parameters_their_body_uses() {
     app.update();
     let world = app.world_mut();
     assert_eq!(world.query::<&Spawned>().iter(world).count(), 1);
+}
+
+#[rfn]
+fn by_runtime_name(count: Reactive<Ref<Count>, Of<"Lookup">>) -> impl Scene {
+    rsn! {
+        #Lookup
+        Count(4)
+        Children [ Label({ format!("count {}", $count.0) }) ]
+    }
+}
+
+#[test]
+fn of_a_string_looks_the_name_up_at_runtime() {
+    let mut app = app();
+    app.world_mut().spawn_scene(by_runtime_name()).unwrap();
+    assert_eq!(labels(&mut app), ["count 4"]);
 }
