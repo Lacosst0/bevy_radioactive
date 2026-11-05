@@ -1,5 +1,6 @@
-//! A scoreboard written with `#[rfn]`: the body declares what it reads and
-//! derives values from it; `$name` reads them in `rsn!`.
+//! A scoreboard written with `#[rfn]`: it takes system parameters as
+//! arguments, like a Bevy system, derives values from them in the body, and
+//! reads them in `rsn!` as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -22,11 +23,11 @@ struct Hit {
 }
 
 #[rfn]
-fn scoreboard(title: &'static str) -> impl Scene {
-    // System parameters, as in a Bevy system.
-    let score: Res<Score>;
-    let enemies: Query<&Health, With<Enemy>>;
-
+fn scoreboard(
+    title: &'static str, // a prop: `scoreboard("round 1")`
+    score: Res<Score>,   // system parameters, as in a Bevy system
+    enemies: Query<&Health, With<Enemy>>,
+) -> impl Scene {
     // Derived: they read reactive values, so they re-run when those change.
     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
     let status = if alive == 0 { "cleared" } else { "fighting" };
