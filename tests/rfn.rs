@@ -1,5 +1,5 @@
 #![cfg(feature = "rfn")]
-//! `#[rfn]`: reactive values declared in the function body, read as `$name`.
+//! `#[rfn]`: system parameters as arguments and derived `let`s, read as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -84,8 +84,7 @@ fn named(app: &mut App, name: &str) -> Entity {
 }
 
 #[rfn]
-fn score_label() -> impl Scene {
-    let score: Res<Score>;
+fn score_label(score: Res<Score>) -> impl Scene {
     rsn! { Label({ format!("score {}", $score.0) }) }
 }
 
@@ -100,8 +99,7 @@ fn a_declared_param_is_read_with_dollar() {
 }
 
 #[rfn]
-fn derived(prefix: &'static str) -> impl Scene {
-    let score: Res<Score>;
+fn derived(prefix: &'static str, score: Res<Score>) -> impl Scene {
     let doubled = score.0 * 2;
     let text = format!("{prefix} {doubled}");
     let shout = prefix.to_uppercase();
@@ -128,9 +126,7 @@ fn derived_lets_recompute_and_plain_lets_run_once() {
 }
 
 #[rfn]
-fn branches() -> impl Scene {
-    let tab: Res<Tab>;
-    let score: Res<Score>;
+fn branches(tab: Res<Tab>, score: Res<Score>) -> impl Scene {
     let big = score.0 > 10;
     rsn! {
         Node
@@ -157,8 +153,7 @@ fn if_and_match_on_declared_values() {
 }
 
 #[rfn]
-fn enemies() -> impl Scene {
-    let enemies: Query<&Health, With<Enemy>>;
+fn enemies(enemies: Query<&Health, With<Enemy>>) -> impl Scene {
     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
     rsn! {
         Node
@@ -185,9 +180,7 @@ fn queries_loop_and_derive() {
 }
 
 #[rfn]
-fn counter() -> impl Scene {
-    let count: Ref<Count> = "Counter";
-    let score: Res<Score>;
+fn counter(#[from("Counter")] count: Ref<Count>, score: Res<Score>) -> impl Scene {
     rsn! {
         #Counter
         Count(0)
@@ -221,8 +214,7 @@ fn handlers_write_declared_values() {
 }
 
 #[rfn]
-fn health_of(player: Entity) -> impl Scene {
-    let hp: Ref<Health> = player;
+fn health_of(player: Entity, #[from(player)] hp: Ref<Health>) -> impl Scene {
     let low = hp.0 < 10;
     rsn! {
         Label({ format!("{}{}", $hp.0, if $low { "!" } else { "" }) })
@@ -241,10 +233,7 @@ fn ref_of_an_entity_argument() {
 }
 
 #[rfn]
-fn counts_calls() -> impl Scene {
-    let score: Res<Score>;
-    let tab: Res<Tab>;
-    let calls: ResMut<Calls>;
+fn counts_calls(score: Res<Score>, tab: Res<Tab>, calls: ResMut<Calls>) -> impl Scene {
     rsn! {
         Node
         Children [
@@ -273,8 +262,7 @@ fn only_reads_that_changed_re_run() {
 }
 
 #[rfn]
-fn strings(name: String) -> impl Scene {
-    let score: Res<Score>;
+fn strings(name: String, score: Res<Score>) -> impl Scene {
     let greeting = format!("hi {name}");
     rsn! {
         Node
@@ -296,4 +284,30 @@ fn plain_values_can_be_used_many_times() {
     app.world_mut().resource_mut::<Score>().0 = 1;
     app.update();
     assert_eq!(labels(&mut app), ["hi ann", "hi ann, ann: 1", "ann"]);
+}
+
+#[derive(Resource, Default)]
+struct Bonus(Option<u32>);
+
+/// A custom `SystemParam`, read through `Untracked`.
+#[derive(bevy::ecs::system::SystemParam)]
+struct Totals<'w> {
+    score: Res<'w, Score>,
+}
+
+#[rfn]
+fn optional(bonus: Option<Res<Bonus>>, score: Res<Score>, totals: Untracked<Totals>) -> impl Scene {
+    let extra = bonus.as_ref().and_then(|b| b.0).unwrap_or(0);
+    rsn! { Label({ format!("{} + {} ({})", $score.0, $extra, $totals.score.0) }) }
+}
+
+#[test]
+fn optional_and_custom_params() {
+    let mut app = app();
+    app.world_mut().spawn_scene(optional()).unwrap();
+    assert_eq!(labels(&mut app), ["0 + 0 (0)"]);
+    app.insert_resource(Bonus(Some(3)));
+    app.world_mut().resource_mut::<Score>().0 = 2;
+    app.update();
+    assert_eq!(labels(&mut app), ["2 + 3 (2)"]);
 }

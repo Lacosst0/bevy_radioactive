@@ -1,17 +1,19 @@
-//! `#[rfn]`: a scene function whose body declares its reactive values as
-//! variables, read in `rsn!` as `$name`.
+//! `#[rfn]`: a scene function that takes Bevy system parameters as
+//! arguments, like a system, and reads them in `rsn!` as `$name`.
 //!
-//! The body is split at compile time, the way Svelte's compiler splits a
+//! The function is split at compile time, the way Svelte's compiler splits a
 //! component script:
 //!
-//! - `let name: Param;` (no value) declares a Bevy system parameter, such as
-//!   `Res<T>`, `Query<..>` or `Single<..>`. `let name: Ref<T> = target;`
-//!   reads component `T` on an entity (`"Name"` or an `Entity` value).
+//! - An argument whose type is a system parameter (`Res<T>`, `Query<..>`,
+//!   `Single<..>`, `Untracked<P>`, ..) is reactive and is
+//!   removed from the signature. `#[from(target)] x: Ref<T>` reads component
+//!   `T` on an entity (`"Name"` or an `Entity` argument). Other arguments
+//!   are plain props.
 //! - A `let` whose value mentions a reactive name is *derived*: it is
 //!   reactive too.
 //! - Every other statement runs once, when the function is called.
 //!
-//! Reactive `let`s are removed from the body. Each `$name` in a scene macro
+//! Reactive arguments and `let`s are removed. Each `$name` in a scene macro
 //! (`rsn!`, `rsn_list!`, `bsn!`, `bsn_list!`) is replaced by what it stands
 //! for: `$Param` for a parameter, or a block that reads the parameters a
 //! derived value needs and recomputes it. `rsn!` then turns each use into a
@@ -24,7 +26,7 @@ use syn::{Pat, Stmt, Type};
 
 use super::{Tokens, is_ident, is_punct, tokens_of};
 
-/// One reactive `let`.
+/// One reactive argument or `let`.
 struct Reactive {
     /// The names it binds.
     names: Vec<Ident>,
@@ -34,7 +36,7 @@ struct Reactive {
 }
 
 enum Kind {
-    /// `let name: Ty;` or `let name: Ref<T> = target;`: `$Ty` or `$Ref<T>(target)`.
+    /// An argument `name: Ty` or `#[from(target)] name: Ref<T>`: `$Ty` or `$Ref<T>(target)`.
     Param {
         ty: TokenStream,
         target: Option<TokenStream>,
@@ -69,17 +71,72 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(error) => return error.into_compile_error(),
     };
 
-    // Plain values: arguments and `let`s that don't read reactive values.
+    // System parameter arguments are reactive; the others are plain props.
     let mut plain = Vec::new();
-    for input in &function.sig.inputs {
-        if let syn::FnArg::Typed(arg) = input {
+    let mut reactive: Vec<Reactive> = Vec::new();
+    let mut errors = TokenStream::new();
+    for input in std::mem::take(&mut function.sig.inputs) {
+        let syn::FnArg::Typed(mut arg) = input else {
+            function.sig.inputs.push(input);
+            continue;
+        };
+        let from = take_attr(&mut arg.attrs, "from");
+        if from.is_none() && !is_param(&arg.ty) {
             pattern_names(&arg.pat, &mut plain);
+            function.sig.inputs.push(syn::FnArg::Typed(arg));
+            continue;
         }
+        let mut names = Vec::new();
+        pattern_names(&arg.pat, &mut names);
+        let wrapper = last_ident(&arg.ty).unwrap_or_default();
+        let component = wrapper == "Ref" || wrapper == "Mut";
+        let target = match (&from, component) {
+            (Some(attr), true) => match attr.parse_args::<syn::Expr>() {
+                Ok(expr) => Some(expr.to_token_stream()),
+                Err(error) => {
+                    error.into_compile_error().to_tokens(&mut errors);
+                    continue;
+                }
+            },
+            (None, true) => {
+                syn::Error::new_spanned(
+                    &arg,
+                    "say which entity: `#[from(\"Name\")] x: Ref<T>` for the nearest entity \
+                     named `Name`, or `#[from(entity)]` for an `Entity` argument",
+                )
+                .into_compile_error()
+                .to_tokens(&mut errors);
+                continue;
+            }
+            (Some(attr), false) => {
+                syn::Error::new_spanned(
+                    attr,
+                    "`#[from(..)]` is for `Ref<T>` and `Mut<T>` arguments",
+                )
+                .into_compile_error()
+                .to_tokens(&mut errors);
+                continue;
+            }
+            (None, false) => None,
+        };
+        let mut ty = (*arg.ty).clone();
+        if component && let Type::Path(path) = &mut ty {
+            // `Mut<T>` and `Ref<T>` read the same; `on(..)` writes either.
+            let last = path.path.segments.last_mut().unwrap();
+            last.ident = Ident::new("Ref", last.ident.span());
+        }
+        reactive.push(Reactive {
+            names,
+            kind: Kind::Param {
+                ty: ty.to_token_stream(),
+                target,
+                wrapper: if component { "Ref".into() } else { wrapper },
+            },
+            deps: Vec::new(),
+        });
     }
 
-    let mut reactive: Vec<Reactive> = Vec::new();
     let mut kept = Vec::new();
-    let mut errors = TokenStream::new();
     for stmt in std::mem::take(&mut function.block.stmts) {
         let Stmt::Local(local) = &stmt else {
             kept.push(stmt);
@@ -87,60 +144,19 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let mut names = Vec::new();
         pattern_names(&local.pat, &mut names);
-        let declared = match &local.pat {
-            Pat::Type(typed) => Some(&*typed.ty),
-            _ => None,
-        };
-        let wrapper = declared.and_then(type_wrapper);
-        match (&local.init, wrapper.as_deref()) {
-            // `let name: Param;`
-            (None, Some(_)) => {
-                if matches!(wrapper.as_deref(), Some("Ref" | "Mut")) {
-                    syn::Error::new_spanned(
-                        &local.pat,
-                        "say which entity: `let x: Ref<T> = \"Name\";` for the nearest entity \
-                         named `Name`, or `= entity` for an `Entity` value",
-                    )
-                    .into_compile_error()
-                    .to_tokens(&mut errors);
-                    continue;
-                }
-                reactive.push(Reactive {
-                    names,
-                    kind: Kind::Param {
-                        ty: declared.unwrap().to_token_stream(),
-                        target: None,
-                        wrapper: wrapper.clone().unwrap(),
-                    },
-                    deps: Vec::new(),
-                });
-            }
-            // `let name: Ref<T> = target;`
-            (Some(init), Some("Ref" | "Mut")) => {
-                if init.diverge.is_some() {
-                    syn::Error::new_spanned(&local.pat, "`let .. else` can't declare a read")
-                        .into_compile_error()
-                        .to_tokens(&mut errors);
-                    continue;
-                }
-                let Type::Path(path) = declared.unwrap() else {
-                    unreachable!()
-                };
-                let mut ty = path.clone();
-                // `Mut<T>` and `Ref<T>` read the same; `on(..)` writes either.
-                ty.path.segments.last_mut().unwrap().ident =
-                    Ident::new("Ref", path.path.segments.last().unwrap().ident.span());
-                reactive.push(Reactive {
-                    names,
-                    kind: Kind::Param {
-                        ty: ty.to_token_stream(),
-                        target: Some(init.expr.to_token_stream()),
-                        wrapper: "Ref".into(),
-                    },
-                    deps: Vec::new(),
-                });
-            }
-            (Some(init), _) => {
+        if let Pat::Type(typed) = &local.pat
+            && is_param(&typed.ty)
+        {
+            syn::Error::new_spanned(
+                &local.pat,
+                "declare system parameters as function arguments: `fn scene(score: Res<Score>)`",
+            )
+            .into_compile_error()
+            .to_tokens(&mut errors);
+            continue;
+        }
+        match &local.init {
+            Some(init) => {
                 let mut deps = Vec::new();
                 let value: Tokens = init.expr.to_token_stream().into_iter().collect();
                 let diverge: Tokens = init
@@ -179,7 +195,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     deps: all,
                 });
             }
-            (None, None) => kept.push(stmt),
+            None => kept.push(stmt),
         }
     }
 
@@ -204,14 +220,50 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// `Res` for `Res<Score>`, `Query` for `bevy::prelude::Query<..>`, when the
-/// type is a path with generics (or `Commands`).
-fn type_wrapper(ty: &Type) -> Option<String> {
+/// The system parameter types that make an argument reactive.
+const PARAMS: &[&str] = &[
+    "Res",
+    "ResMut",
+    "Query",
+    "Single",
+    "Populated",
+    "Local",
+    "Commands",
+    "NonSend",
+    "NonSendMut",
+    "Ref",
+    "Mut",
+    "MessageReader",
+    "MessageWriter",
+    "Untracked",
+];
+
+/// The last path segment of a type: `Res` for `bevy::prelude::Res<Score>`.
+fn last_ident(ty: &Type) -> Option<String> {
     let Type::Path(path) = ty else { return None };
-    let last = path.path.segments.last()?;
+    Some(path.path.segments.last()?.ident.to_string())
+}
+
+/// Whether `ty` is a known system parameter, or an `Option` of one.
+fn is_param(ty: &Type) -> bool {
+    let Type::Path(path) = ty else { return false };
+    let Some(last) = path.path.segments.last() else {
+        return false;
+    };
     let name = last.ident.to_string();
-    let generic = matches!(last.arguments, syn::PathArguments::AngleBracketed(_));
-    (generic || name == "Commands").then_some(name)
+    if name == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &last.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return is_param(inner);
+    }
+    PARAMS.contains(&name.as_str())
+}
+
+/// Removes `#[name(..)]` from `attrs` and returns it.
+fn take_attr(attrs: &mut Vec<syn::Attribute>, name: &str) -> Option<syn::Attribute> {
+    let index = attrs.iter().position(|a| a.path().is_ident(name))?;
+    Some(attrs.remove(index))
 }
 
 fn pattern_names(pat: &Pat, out: &mut Vec<Ident>) {
@@ -336,7 +388,7 @@ impl Context<'_> {
                             )
                         } else {
                             format!(
-                                "no reactive `{name}` here: declare it in the function body, as `let {name}: Res<T>;`"
+                                "no reactive `{name}` here: add it as a function argument, like `{name}: Res<T>`"
                             )
                         };
                         quote_spanned!(name.span()=> ::core::compile_error!(#message))

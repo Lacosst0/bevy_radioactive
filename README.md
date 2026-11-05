@@ -12,7 +12,7 @@ handlers, context and cleanup.
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
 | [`reactive`](#reactive) | `reactive` | `ReactivePlugin` | do all of the below with components as state and entities as scope |
-| [`rfn`](#rfn) | `rfn` | `ReactivePlugin` | keep the logic in the function body: declare what you read as variables, use them as `$name` |
+| [`rfn`](#rfn) | `rfn` | `ReactivePlugin` | take system parameters as function arguments like a Bevy system, keep the logic in the body, read values as `$name` |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
 | [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
@@ -295,20 +295,21 @@ Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `reactive_
 
 ## `rfn`
 
-`#[rfn]` keeps a scene's logic in its function body, like a Bevy system or a
-`hooks` component, and keeps `reactive`'s fine-grained updates. The body declares what
-it reads as variables; the scene reads them as `$name`.
+`#[rfn]` writes a scene function like a Bevy system: system parameters are its
+arguments and the logic is in its body. It keeps `reactive`'s fine-grained updates;
+the scene reads values as `$name`.
 
 ```rust,ignore
 use bevy::{prelude::*, ui_widgets::Activate};
 use bevy_radioactive::rfn::*;
 
 #[rfn]
-fn scoreboard(title: &'static str) -> impl Scene {
-    // Reactive: system parameters, declared with a type and no value.
-    let score: Res<Score>;
-    let enemies: Query<&Health, With<Enemy>>;
-    let count: Ref<Count> = "Counter";        // `Count` on the nearest `#Counter`
+fn scoreboard(
+    title: &'static str,                     // a prop: `@scoreboard("Round 1")`
+    score: Res<Score>,                       // system parameters, as in a system
+    enemies: Query<&Health, With<Enemy>>,
+    #[from("Counter")] count: Ref<Count>,    // `Count` on the nearest `#Counter`
+) -> impl Scene {
 
     // Derived: a `let` that uses a reactive value is reactive too.
     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
@@ -337,25 +338,29 @@ fn scoreboard(title: &'static str) -> impl Scene {
 // app.add_plugins(ReactivePlugin)
 ```
 
-| In the body | Means | In `rsn!` |
+| In the function | Means | In `rsn!` |
 | --- | --- | --- |
-| `let x: Res<T>;` (any system parameter: `ResMut`, `Query`, `Single`, `Local`, `Commands`, ..) | that parameter | `$x` is `$Res<T>` |
-| `let x: Ref<T> = "Name";` | `T` on the nearest entity named `Name` | `$x` is `$Ref<T>("Name")` |
-| `let x: Ref<T> = entity;` | `T` on an `Entity` value, such as an argument | `$x` is `$Ref<T>(entity)` |
+| argument `x: Res<T>` (or `ResMut`, `Query`, `Single`, `Populated`, `Local`, `Commands`, `Option<Res<T>>`, `Untracked<P>`, ..) | that system parameter | `$x` is `$Res<T>` |
+| argument `#[from("Name")] x: Ref<T>` | `T` on the nearest entity named `Name` | `$x` is `$Ref<T>("Name")` |
+| argument `#[from(entity)] x: Ref<T>` | `T` on an `Entity` argument | `$x` is `$Ref<T>(entity)` |
+| any other argument | a prop, passed by the caller | used without `$`, cloned per use |
 | `let y = .. x ..;` | a derived value | `$y` recomputes `y` from the parameters it uses |
 | any other statement | plain Rust, run once | used without `$`, cloned per use |
+
+System parameter arguments are removed from the signature, so callers pass only
+the props: `@scoreboard("Round 1")`.
 
 - **The rule is `reactive`'s:** whatever contains a `$` re-runs when what it read
   changes; everything else runs once. In the body, reactive values are plain
   variables (`score.0 * 2`); in the scene, `$` marks where they are read.
 - **How the body becomes reactive.** `#[rfn]` splits the body at compile time, the way
-  Svelte's compiler splits a component script. Reactive `let`s are removed from the
-  body, and each `$name` is replaced by what it stands for: `$Res<T>` for a parameter,
+  Svelte's compiler splits a component script. Reactive arguments and `let`s are
+  removed, and each `$name` is replaced by what it stands for: `$Res<T>` for a parameter,
   or a block that reads the parameters a derived value needs and recomputes it. So
   `$alive` above re-runs when an `Enemy`'s `Health` changes and `$score.0` when
   `Score` does, and nothing else re-runs. The function itself never runs again.
 - In a derived `let`, `Res`, `Single`, `Ref` and `Local` read as the value they point
-  to (`&Score`), and `Query` by reference.
+  to (`&Score`), and `Query` and `Option` by reference (`bonus.as_ref()`).
 - In `on(..)`, `$name` is writable: `$score.0 += 1` writes `Score` through `ResMut`,
   and `$count.0 += 1` writes the component.
 - `bsn!` works as well as `rsn!` in an `#[rfn]` body; both get `rsn!`'s `if`/`match`/`for`.
@@ -630,13 +635,12 @@ rsn! {
 
 ### `rfn`
 
-The same scene, with the count declared in the body. `$count` reads and writes it,
-and the label is a derived value:
+The same scene, with the count as an argument. `$count` reads and writes it, and the
+label is a derived value:
 
 ```rust,ignore
 #[rfn]
-fn counter() -> impl Scene {
-    let count: Ref<Count> = "Counter";
+fn counter(#[from("Counter")] count: Ref<Count>) -> impl Scene {
     let label = count.0.to_string();
     rsn! {
         #Counter

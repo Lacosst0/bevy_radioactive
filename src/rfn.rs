@@ -1,32 +1,36 @@
-//! Scene functions whose body holds the logic: reactive values are declared
-//! as variables and read in [`rsn!`] as `$name`.
+//! Scene functions that take Bevy system parameters as arguments, like a
+//! system, keep their logic in the body, and read values in [`rsn!`] as
+//! `$name`.
 //!
-//! Mark a scene function with [`#[rfn]`](rfn). In its body:
+//! Mark a scene function with [`#[rfn]`](rfn):
 //!
-//! - `let name: Param;`, with a type and no value, declares a Bevy system
-//!   parameter: `Res<T>`, `ResMut<T>`, `Query<..>`, `Single<..>`, `Local<T>`,
-//!   `Commands` or any other.
-//! - `let name: Ref<T> = "Name";` reads component `T` on the nearest entity
-//!   named `Name` (`#Name` in a scene); `= entity` reads it on an `Entity`.
-//! - A `let` whose value uses a reactive name is reactive too (*derived*).
-//! - Everything else runs once, when the function is called.
+//! - An argument whose type is a system parameter (`Res<T>`, `ResMut<T>`,
+//!   `Query<..>`, `Single<..>`, `Populated<..>`, `Local<T>`, `Commands`,
+//!   `Option<Res<T>>`, `Untracked<P>` for a custom one, ..) is reactive. It is
+//!   removed from the signature, so callers pass only the other arguments.
+//! - `#[from("Name")] x: Ref<T>` reads component `T` on the nearest entity
+//!   named `Name` (`#Name` in a scene); `#[from(entity)]` reads it on an
+//!   `Entity` argument.
+//! - In the body, a `let` whose value uses a reactive name is reactive too
+//!   (*derived*). Everything else runs once, when the function is called.
 //!
 //! In `rsn!` (or `bsn!`), `$name` reads a reactive value, and whatever
 //! contains it re-runs when what it read changes, exactly as with
 //! `$Res<T>`. A derived value is recomputed where it is read, from the
 //! parameters it needs, so nothing re-runs that doesn't depend on them. In
-//! `on(..)`, `$name` is writable: `$score.0 += 1` for `let score: Res<Score>;`.
+//! `on(..)`, `$name` is writable: `$score.0 += 1` for a `score: Res<Score>` argument.
 //!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};
 //! use bevy_radioactive::rfn::*;
 //!
 //! #[rfn]
-//! fn hud(title: &'static str) -> impl Scene {
-//!     let score: Res<Score>;
-//!     let enemies: Query<&Health, With<Enemy>>;
-//!     let count: Ref<Count> = "Counter";
-//!
+//! fn hud(
+//!     title: &'static str,
+//!     score: Res<Score>,
+//!     enemies: Query<&Health, With<Enemy>>,
+//!     #[from("Counter")] count: Ref<Count>,
+//! ) -> impl Scene {
 //!     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
 //!     let status = if alive == 0 { "Cleared" } else { "Fighting" };
 //!     let heading = title.to_uppercase();       // plain: runs once
