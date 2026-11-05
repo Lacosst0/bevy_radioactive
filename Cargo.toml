@@ -10,9 +10,11 @@ keywords = ["bevy", "ecs", "gamedev", "reactive", "ui"]
 categories = ["game-development", "gui"]
 
 [features]
-default = ["reactive", "subscribe", "hooks", "view", "ui", "widgets"]
+default = ["reactive", "rfn", "subscribe", "hooks", "view", "ui", "widgets"]
 ## `watch`, `handle`, `when`, `switch`, `each`: one ECS-native API for reactivity and control flow.
 reactive = ["bevy/bevy_curve"]
+## `#[rfn]`: scene functions whose body declares reactive values, read as `$name`.
+rfn = ["reactive"]
 ## `subscribe_to`, `bind_event`: react to entity events on other entities.
 subscribe = []
 ## `#[component]`: React-style function components with hooks.
@@ -70,6 +72,11 @@ path = "examples/reactive_settings.rs"
 required-features = ["reactive", "widgets"]
 
 [[example]]
+name = "rfn_scoreboard"
+path = "examples/rfn_scoreboard.rs"
+required-features = ["rfn"]
+
+[[example]]
 name = "subscribe"
 path = "examples/subscribe.rs"
 required-features = ["subscribe"]
@@ -103,6 +110,11 @@ required-features = ["comparison"]
 name = "comparison_reactive"
 path = "examples/comparison/reactive.rs"
 required-features = ["comparison", "reactive"]
+
+[[example]]
+name = "comparison_rfn"
+path = "examples/comparison/rfn.rs"
+required-features = ["comparison", "rfn"]
 
 [[example]]
 name = "comparison_subscribe"

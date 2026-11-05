@@ -34,10 +34,12 @@ jobs:
         features:
           - default
           - reactive
+          - rfn
           - subscribe
           - hooks
           - view
           - reactive,ui
+          - rfn,ui
           - hooks,ui
           - view,ui
     steps:

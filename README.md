@@ -3,7 +3,7 @@
 Reactive UI for Bevy 0.20 BSN scenes. A node declares what it depends on, right
 where it is spawned, instead of a global system querying for it.
 
-There are four styles. Each one is a separate module behind its own Cargo feature,
+There are five styles. Each one is a separate module behind its own Cargo feature,
 with its own plugin and runtime, so use any one of them alone or several side by
 side. [`reactive`](#reactive) is the newest and covers what the
 others do in one ECS-native API: watching, `if`/`else`, `match`, keyed lists, event
@@ -12,6 +12,7 @@ handlers, context and cleanup.
 | Style | Feature | Plugin | Use it to |
 | --- | --- | --- | --- |
 | [`reactive`](#reactive) | `reactive` | `ReactivePlugin` | do all of the below with components as state and entities as scope |
+| [`rfn`](#rfn) | `rfn` | `ReactivePlugin` | keep the logic in the function body: declare what you read as variables, use them as `$name` |
 | [`subscribe`](#subscribe) | `subscribe` | none | react to entity events fired on other entities |
 | [`hooks`](#hooks) | `hooks` | `HooksPlugin` | write React-style function components |
 | [`view`](#view) | `view` | `ViewPlugin` | write templates with signals and reactive `if`/`for`/`match` |
@@ -25,7 +26,7 @@ handlers, context and cleanup.
 ```toml
 [dependencies]
 bevy = "0.20"
-# All four styles:
+# All five styles:
 bevy_radioactive = { path = "../bevy_radioactive" }
 # Or only the ones you use:
 # bevy_radioactive = { path = "../bevy_radioactive", default-features = false, features = ["view", "ui"] }
@@ -292,6 +293,81 @@ rsn! {
 
 Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `reactive_transitions`, `comparison_reactive`.
 
+## `rfn`
+
+`#[rfn]` keeps a scene's logic in its function body, like a Bevy system or a
+`hooks` component, and keeps `reactive`'s fine-grained updates. The body declares what
+it reads as variables; the scene reads them as `$name`.
+
+```rust,ignore
+use bevy::{prelude::*, ui_widgets::Activate};
+use bevy_radioactive::rfn::*;
+
+#[rfn]
+fn scoreboard(title: &'static str) -> impl Scene {
+    // Reactive: system parameters, declared with a type and no value.
+    let score: Res<Score>;
+    let enemies: Query<&Health, With<Enemy>>;
+    let count: Ref<Count> = "Counter";        // `Count` on the nearest `#Counter`
+
+    // Derived: a `let` that uses a reactive value is reactive too.
+    let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
+    let status = if alive == 0 { "cleared" } else { "fighting" };
+
+    // Plain: runs once, when the function is called.
+    let heading = title.to_uppercase();
+
+    rsn! {
+        #Counter
+        Node Count(0)
+        Children [
+            Text({ heading })
+            --
+            Text({ format!("{} points, {} alive, {}", $score.0, $alive, $status) })
+            --
+            Button on(|_: On<Activate>| { $count.0 += 1; $score.0 += 10; })
+            --
+            if $alive == 0 { Text("You win!") }
+            --
+            for hp in $enemies { Text({ hp.0.to_string() }) }
+        ]
+    }
+}
+
+// app.add_plugins(ReactivePlugin)
+```
+
+| In the body | Means | In `rsn!` |
+| --- | --- | --- |
+| `let x: Res<T>;` (any system parameter: `ResMut`, `Query`, `Single`, `Local`, `Commands`, ..) | that parameter | `$x` is `$Res<T>` |
+| `let x: Ref<T> = "Name";` | `T` on the nearest entity named `Name` | `$x` is `$Ref<T>("Name")` |
+| `let x: Ref<T> = entity;` | `T` on an `Entity` value, such as an argument | `$x` is `$Ref<T>(entity)` |
+| `let y = .. x ..;` | a derived value | `$y` recomputes `y` from the parameters it uses |
+| any other statement | plain Rust, run once | used without `$`, cloned per use |
+
+- **The rule is `reactive`'s:** whatever contains a `$` re-runs when what it read
+  changes; everything else runs once. In the body, reactive values are plain
+  variables (`score.0 * 2`); in the scene, `$` marks where they are read.
+- **How the body becomes reactive.** `#[rfn]` splits the body at compile time, the way
+  Svelte's compiler splits a component script. Reactive `let`s are removed from the
+  body, and each `$name` is replaced by what it stands for: `$Res<T>` for a parameter,
+  or a block that reads the parameters a derived value needs and recomputes it. So
+  `$alive` above re-runs when an `Enemy`'s `Health` changes and `$score.0` when
+  `Score` does, and nothing else re-runs. The function itself never runs again.
+- In a derived `let`, `Res`, `Single`, `Ref` and `Local` read as the value they point
+  to (`&Score`), and `Query` by reference.
+- In `on(..)`, `$name` is writable: `$score.0 += 1` writes `Score` through `ResMut`,
+  and `$count.0 += 1` writes the component.
+- `bsn!` works as well as `rsn!` in an `#[rfn]` body; both get `rsn!`'s `if`/`match`/`for`.
+- Using a reactive name outside a scene, or without `$` inside one, is a compile error
+  that says what to write.
+- Plain locals and arguments are cloned where the scene uses them, so they need `Clone`,
+  and can be used any number of times.
+- A reactive value has no value in the body itself: there are no effects that run
+  when it changes. Use `watch`, `on(..)` or a system for that.
+
+Examples: `rfn_scoreboard`, `comparison_rfn`.
+
 ## `subscribe`
 
 BSN's `on(...)` observes events on the entity that declares it. `subscribe_to`
@@ -486,13 +562,14 @@ cargo run --example game_ui --features comparison
 ## Comparison with plain Bevy
 
 `examples/comparison` builds the same Feathers counter (−1, count, +1, and a Reset
-button shown while the count is not zero) five times: once in plain Bevy and once per
+button shown while the count is not zero) six times: once in plain Bevy and once per
 style. Each file stands alone; none shares code with another.
 
 | Example | Built with |
 | --- | --- |
 | `comparison_bevy` | plain Bevy |
 | `comparison_reactive` | `reactive` |
+| `comparison_rfn` | `rfn` |
 | `comparison_subscribe` | `subscribe` |
 | `comparison_hooks` | `hooks` |
 | `comparison_view` | `view` |
@@ -547,6 +624,33 @@ rsn! {
         @FeathersButton
         on(|_: On<Activate>| $Mut<Count>(#Counter).0 = 0)
         Children [ @caption("Reset") ]
+    }
+}
+```
+
+### `rfn`
+
+The same scene, with the count declared in the body. `$count` reads and writes it,
+and the label is a derived value:
+
+```rust,ignore
+#[rfn]
+fn counter() -> impl Scene {
+    let count: Ref<Count> = "Counter";
+    let label = count.0.to_string();
+    rsn! {
+        #Counter
+        Count(0)
+        // ...
+        on(|_: On<Activate>| $count.0 += 1)
+        // ...
+        Text({ $label })
+        // ...
+        if $count.0 != 0 {
+            @FeathersButton
+            on(|_: On<Activate>| $count.0 = 0)
+            Children [ @caption("Reset") ]
+        }
     }
 }
 ```
