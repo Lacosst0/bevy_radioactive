@@ -1,6 +1,7 @@
 //! Scene functions that take Bevy system parameters as arguments, like a
 //! system, keep their logic in the body, and read values in [`rsn!`]. What is
-//! reactive is marked `#[reactive]` and read as `$name`.
+//! reactive says so in its type, [`Reactive<..>`](Reactive), and is read as
+//! `$name`.
 //!
 //! Mark a scene function with [`#[rfn]`](rfn):
 //!
@@ -11,22 +12,25 @@
 //!   callers pass only the other arguments; if the body uses it too
 //!   (`commands.spawn_scene(..)`), it stays an argument, so a system can be an
 //!   `#[rfn]`.
-//! - `#[reactive] score: Res<Score>` is tracked: the scene reads it as
-//!   `$score`, and whatever does re-runs when it changes. Unmarked
+//! - `score: Reactive<Res<Score>>` is tracked: the scene reads it as
+//!   `$score`, and whatever does re-runs when it changes. Without `Reactive`
 //!   (`mut commands: Commands`), it is untracked: the scene uses it as
 //!   `commands` and never re-runs because of it.
-//! - `#[from("Name")] x: Ref<T>` reads component `T` on the nearest entity
-//!   named `Name` (`#Name` in a scene); `#[from(entity)]` reads it on an
-//!   `Entity` argument. Unmarked, it only works in `on(..)`.
-//! - In the body, `#[reactive] let` is a derived value, recomputed where the
-//!   scene reads it (`$name`). Everything else, unmarked `let`s included,
+//! - `count: Reactive<Ref<T>, Of<Name>>` reads component `T` on the nearest
+//!   entity named `#Name` (checked at compile time against the scene),
+//!   `Of<entity>` on an `Entity` argument, and `Of<"Name">` on a name looked
+//!   up at runtime. Without `Reactive` (`Ref<T, Of<Name>>`), it only works in
+//!   `on(..)`.
+//! - In the body, `let x: Reactive<_> = ..;` is a derived value, recomputed
+//!   where the scene reads it (`$x`). Everything else, other `let`s included,
 //!   runs once, when the function is called.
 //!
 //! In `rsn!` (or `bsn!`), `$name` reads a reactive value, and whatever
 //! contains it re-runs when what it read changes, exactly as with
 //! `$Res<T>`. A derived value is recomputed where it is read, from the
 //! parameters it needs, so nothing re-runs that doesn't depend on them. In
-//! `on(..)`, `$name` is writable: `$score.0 += 1` for a `#[reactive] score: Res<Score>` argument.
+//! `on(..)`, `$name` is writable: `$score.0 += 1` for a
+//! `score: Reactive<Res<Score>>` argument.
 //!
 //! ```ignore
 //! use bevy::{prelude::*, ui_widgets::Activate};
@@ -35,15 +39,13 @@
 //! #[rfn]
 //! fn hud(
 //!     title: &'static str,
-//!     #[reactive] score: Res<Score>,
-//!     #[reactive] enemies: Query<&Health, With<Enemy>>,
-//!     #[reactive] #[from("Counter")] count: Ref<Count>,
+//!     score: Reactive<Res<Score>>,
+//!     enemies: Reactive<Query<&Health, With<Enemy>>>,
+//!     count: Reactive<Ref<Count>, Of<Counter>>,
 //!     mut commands: Commands,
 //! ) -> impl Scene {
-//!     #[reactive]
-//!     let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
-//!     #[reactive]
-//!     let status = if alive == 0 { "Cleared" } else { "Fighting" };
+//!     let alive: Reactive<_> = enemies.iter().filter(|hp| hp.0 > 0).count();
+//!     let status: Reactive<_> = if alive == 0 { "Cleared" } else { "Fighting" };
 //!     let heading = title.to_uppercase();       // plain: runs once
 //!
 //!     rsn! {
@@ -73,3 +75,18 @@
 
 pub use crate::macros::rfn;
 pub use crate::reactive::*;
+
+use std::marker::PhantomData;
+
+/// Marks an `#[rfn]` argument or `let` as reactive: `score: Reactive<Res<Score>>`,
+/// `count: Reactive<Ref<Count>, Of<Counter>>`, `let x: Reactive<_> = ..;`.
+///
+/// `#[rfn]` removes it while expanding; it never exists at runtime.
+pub struct Reactive<P, O = ()>(PhantomData<fn() -> (P, O)>);
+
+/// Says which entity a `Ref<T>` argument of an `#[rfn]` reads:
+/// `Of<Counter>` for the nearest `#Counter`, `Of<player>` for an `Entity`
+/// argument, `Of<"Counter">` for a name looked up at runtime.
+///
+/// `#[rfn]` removes it while expanding; it never exists at runtime.
+pub struct Of<T>(PhantomData<fn() -> T>);

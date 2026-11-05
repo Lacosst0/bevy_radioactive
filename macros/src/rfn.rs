@@ -1,5 +1,5 @@
 //! `#[rfn]`: a scene function that takes Bevy system parameters as
-//! arguments, like a system, and reads the ones marked `#[reactive]` in
+//! arguments, like a system, and reads the `Reactive<..>` ones in
 //! `rsn!` as `$name`.
 //!
 //! The function is split at compile time, the way Svelte's compiler splits a
@@ -7,13 +7,13 @@
 //!
 //! - An argument whose type is a system parameter (`Res<T>`, `Query<..>`,
 //!   `Commands`, ..) is read by the scene. It is removed from the signature
-//!   unless the body uses it too, outside scene macros and `#[reactive] let`s
+//!   unless the body uses it too, outside scene macros and `Reactive<_>` `let`s
 //!   (then it stays, so the function can be a system).
-//!   Marked `#[reactive]`, it is tracked and read as `$name`; unmarked, it is
-//!   untracked and read as `name`. `#[from(target)] x: Ref<T>` reads
+//!   As `Reactive<P>`, it is tracked and read as `$name`; otherwise it is
+//!   untracked and read as `name`. `Reactive<Ref<T>, Of<target>>` reads
 //!   component `T` on an entity (`"Name"` or an `Entity` argument). Other
 //!   arguments are plain props.
-//! - `#[reactive] let` is a *derived* value, recomputed from what it reads.
+//! - `let x: Reactive<_> = ..;` is a *derived* value, recomputed from what it reads.
 //! - Every other statement runs once, when the function is called.
 //!
 //! Parameter arguments and derived `let`s are removed. Each use in a scene
@@ -33,7 +33,7 @@ use super::{Tokens, is_ident, is_punct, tokens_of};
 struct Reactive {
     /// The names it binds.
     names: Vec<Ident>,
-    /// Marked `#[reactive]`: read with `$`, and re-runs what reads it.
+    /// `Reactive<..>`: read with `$`, and re-runs what reads it.
     tracked: bool,
     /// A parameter the body itself uses: it stays an argument of the
     /// function (a system parameter when the function is a system), and
@@ -45,7 +45,7 @@ struct Reactive {
 }
 
 enum Kind {
-    /// An argument `name: Ty` or `#[from(target)] name: Ref<T>`: `$Ty` or `$Ref<T>(target)`.
+    /// An argument `name: Ty` or `name: Ref<T, Of<target>>`: `$Ty` or `$Ref<T>(target)`.
     Param {
         ty: TokenStream,
         target: Option<TokenStream>,
@@ -84,15 +84,13 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut plain = Vec::new();
     let mut reactive: Vec<Reactive> = Vec::new();
     let mut errors = TokenStream::new();
-    // The body's own code: everything but `#[reactive] let`s, which become
+    // The body's own code: everything but `Reactive<_>` lets, which become
     // part of the scene.
     let body_tokens: Tokens = function
         .block
         .stmts
         .iter()
-        .filter(|stmt| {
-            !matches!(stmt, Stmt::Local(local) if local.attrs.iter().any(|a| a.path().is_ident("reactive")))
-        })
+        .filter(|stmt| !matches!(stmt, Stmt::Local(local) if reactive_let(local).is_some()))
         .flat_map(ToTokens::to_token_stream)
         .collect();
     for input in std::mem::take(&mut function.sig.inputs) {
@@ -100,65 +98,71 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             function.sig.inputs.push(input);
             continue;
         };
-        let from = take_attr(&mut arg.attrs, "from");
-        let marked = take_attr(&mut arg.attrs, "reactive");
-        if from.is_none() && !is_param(&arg.ty) {
-            if let Some(attr) = marked {
+        for old in ["reactive", "from"] {
+            if let Some(attr) = take_attr(&mut arg.attrs, old) {
                 syn::Error::new_spanned(
                     attr,
-                    "`#[reactive]` is for system parameter arguments (`Res<T>`, `Query<..>`, ..); \
-                     this argument is a prop, passed by the caller",
+                    "write `x: Reactive<Res<T>>` instead of `#[reactive]`, and \
+                     `Reactive<Ref<T>, Of<Name>>` instead of `#[from(..)]`",
                 )
                 .into_compile_error()
                 .to_tokens(&mut errors);
             }
+        }
+        let param = match unwrap_param(&arg.ty) {
+            Ok(param) => param,
+            Err(error) => {
+                error.into_compile_error().to_tokens(&mut errors);
+                continue;
+            }
+        };
+        if !param.tracked && param.target.is_none() && !is_param(&param.ty) {
             pattern_names(&arg.pat, &mut plain);
             function.sig.inputs.push(syn::FnArg::Typed(arg));
             continue;
         }
+        if !is_param(&param.ty) {
+            syn::Error::new_spanned(
+                &arg.ty,
+                "`Reactive<..>` wraps a system parameter (`Res<T>`, `Query<..>`, `Ref<T>`, ..); \
+                 this argument would be a prop, passed by the caller",
+            )
+            .into_compile_error()
+            .to_tokens(&mut errors);
+            continue;
+        }
         let mut names = Vec::new();
         pattern_names(&arg.pat, &mut names);
+        let wrapper = last_ident(&param.ty).unwrap_or_default();
+        let component = wrapper == "Ref" || wrapper == "Mut";
+        if component && param.target.is_none() {
+            syn::Error::new_spanned(
+                &arg.ty,
+                "say which entity: `Reactive<Ref<T>, Of<Name>>` for the nearest entity named \
+                 `#Name`, or `Of<entity>` for an `Entity` argument",
+            )
+            .into_compile_error()
+            .to_tokens(&mut errors);
+            continue;
+        }
+        if !component && param.target.is_some() {
+            syn::Error::new_spanned(&arg.ty, "`Of<..>` is for `Ref<T>` and `Mut<T>`")
+                .into_compile_error()
+                .to_tokens(&mut errors);
+            continue;
+        }
         // A parameter the body uses (`commands.spawn_scene(..)`) stays an
         // argument, so the function can be a system.
-        let kept = from.is_none()
+        let kept = !component
             && names
                 .iter()
                 .any(|name| used_outside_scenes(&body_tokens, name));
         if kept {
-            function.sig.inputs.push(syn::FnArg::Typed(arg.clone()));
+            let mut arg = arg.clone();
+            *arg.ty = param.ty.clone();
+            function.sig.inputs.push(syn::FnArg::Typed(arg));
         }
-        let wrapper = last_ident(&arg.ty).unwrap_or_default();
-        let component = wrapper == "Ref" || wrapper == "Mut";
-        let target = match (&from, component) {
-            (Some(attr), true) => match attr.parse_args::<syn::Expr>() {
-                Ok(expr) => Some(expr.to_token_stream()),
-                Err(error) => {
-                    error.into_compile_error().to_tokens(&mut errors);
-                    continue;
-                }
-            },
-            (None, true) => {
-                syn::Error::new_spanned(
-                    &arg,
-                    "say which entity: `#[from(\"Name\")] x: Ref<T>` for the nearest entity \
-                     named `Name`, or `#[from(entity)]` for an `Entity` argument",
-                )
-                .into_compile_error()
-                .to_tokens(&mut errors);
-                continue;
-            }
-            (Some(attr), false) => {
-                syn::Error::new_spanned(
-                    attr,
-                    "`#[from(..)]` is for `Ref<T>` and `Mut<T>` arguments",
-                )
-                .into_compile_error()
-                .to_tokens(&mut errors);
-                continue;
-            }
-            (None, false) => None,
-        };
-        let mut ty = (*arg.ty).clone();
+        let mut ty = param.ty.clone();
         if component && let Type::Path(path) = &mut ty {
             // `Mut<T>` and `Ref<T>` read the same; `on(..)` writes either.
             let last = path.path.segments.last_mut().unwrap();
@@ -166,11 +170,11 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         reactive.push(Reactive {
             names,
-            tracked: marked.is_some(),
+            tracked: param.tracked,
             kept,
             kind: Kind::Param {
                 ty: ty.to_token_stream(),
-                target,
+                target: param.target,
                 wrapper: if component { "Ref".into() } else { wrapper },
             },
             deps: Vec::new(),
@@ -179,10 +183,36 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut kept = Vec::new();
     for mut stmt in std::mem::take(&mut function.block.stmts) {
-        let marked = match &mut stmt {
-            Stmt::Local(local) => take_attr(&mut local.attrs, "reactive"),
-            _ => None,
-        };
+        let mut marked = None;
+        if let Stmt::Local(local) = &mut stmt {
+            if let Some(attr) = take_attr(&mut local.attrs, "reactive") {
+                syn::Error::new_spanned(
+                    attr,
+                    "write `let x: Reactive<_> = ..;` instead of `#[reactive] let`",
+                )
+                .into_compile_error()
+                .to_tokens(&mut errors);
+            }
+            // `let x: Reactive<T> = ..;` becomes `let x: T = ..;`.
+            if let Some(inner) = reactive_let(local) {
+                marked = Some(local.pat.clone());
+                local.pat = match inner {
+                    Some(ty) => {
+                        let Pat::Type(mut typed) = local.pat.clone() else {
+                            unreachable!()
+                        };
+                        *typed.ty = ty;
+                        Pat::Type(typed)
+                    }
+                    None => {
+                        let Pat::Type(typed) = &local.pat else {
+                            unreachable!()
+                        };
+                        (*typed.pat).clone()
+                    }
+                };
+            }
+        }
         let Stmt::Local(local) = &stmt else {
             kept.push(stmt);
             continue;
@@ -194,7 +224,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         {
             syn::Error::new_spanned(
                 &local.pat,
-                "declare system parameters as function arguments: `fn scene(score: Res<Score>)`",
+                "declare system parameters as function arguments: `fn scene(score: Reactive<Res<Score>>)`",
             )
             .into_compile_error()
             .to_tokens(&mut errors);
@@ -220,9 +250,9 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
                 if deps.is_empty() {
-                    if let Some(attr) = marked {
+                    if let Some(pat) = marked {
                         syn::Error::new_spanned(
-                            attr,
+                            pat,
                             "this `let` reads no system parameter argument, so it has nothing \
                              to react to",
                         )
@@ -237,7 +267,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     && let Some(&dep) = deps.iter().find(|&&dep| reactive[dep].tracked)
                 {
                     let message = format!(
-                        "this `let` reads `{}`, which is reactive: mark it `#[reactive] let`",
+                        "this `let` reads `{}`, which is reactive: make it `let x: Reactive<_> = ..;`",
                         reactive[dep].names[0]
                     );
                     syn::Error::new_spanned(&local.pat, message)
@@ -333,6 +363,111 @@ fn is_param(ty: &Type) -> bool {
     PARAMS.contains(&name.as_str())
 }
 
+/// An argument type with `Reactive<..>` and `Of<..>` taken apart.
+struct Unwrapped {
+    ty: Type,
+    tracked: bool,
+    target: Option<TokenStream>,
+}
+
+/// `Reactive<P>`, `Reactive<Ref<T>, Of<X>>`, `Ref<T, Of<X>>` or `P`.
+fn unwrap_param(ty: &Type) -> syn::Result<Unwrapped> {
+    let mut ty = ty.clone();
+    let mut tracked = false;
+    let mut of = None;
+    if let Some(mut args) = generic_args(&ty, "Reactive") {
+        tracked = true;
+        let Some(syn::GenericArgument::Type(inner)) = args.first().cloned() else {
+            return Err(syn::Error::new_spanned(&ty, "write `Reactive<Res<T>>`"));
+        };
+        if args.len() > 1 {
+            of = Some(args.remove(1));
+        }
+        ty = inner;
+    }
+    if let Some(args) = generic_args(&ty, "Ref").or_else(|| generic_args(&ty, "Mut"))
+        && args.len() > 1
+    {
+        if of.is_some() {
+            return Err(syn::Error::new_spanned(&ty, "`Of<..>` is given twice"));
+        }
+        of = Some(args[1].clone());
+        // Drop `Of<..>` from `Ref<T, Of<..>>`.
+        if let Type::Path(path) = &mut ty
+            && let syn::PathArguments::AngleBracketed(angle) =
+                &mut path.path.segments.last_mut().unwrap().arguments
+        {
+            let first = angle.args.first().cloned().unwrap();
+            angle.args.clear();
+            angle.args.push(first);
+        }
+    }
+    let target = of.map(|of| target_of(&of)).transpose()?;
+    Ok(Unwrapped {
+        ty,
+        tracked,
+        target,
+    })
+}
+
+/// The generic arguments of `ty` when its last segment is `name<..>`.
+fn generic_args(ty: &Type, name: &str) -> Option<Vec<syn::GenericArgument>> {
+    let Type::Path(path) = ty else { return None };
+    let last = path.path.segments.last()?;
+    if last.ident != name {
+        return None;
+    }
+    match &last.arguments {
+        syn::PathArguments::AngleBracketed(angle) => Some(angle.args.iter().cloned().collect()),
+        _ => None,
+    }
+}
+
+/// `Of<Name>` → `#Name`, `Of<entity>` → `entity`, `Of<"Name">` → `"Name"`.
+fn target_of(of: &syn::GenericArgument) -> syn::Result<TokenStream> {
+    const HELP: &str = "write `Of<Name>` for the nearest entity named `#Name`, `Of<entity>` \
+                        for an `Entity` argument, or `Of<\"Name\">` for a name looked up at runtime";
+    let syn::GenericArgument::Type(Type::Path(of_path)) = of else {
+        return Err(syn::Error::new_spanned(of, HELP));
+    };
+    let last = of_path.path.segments.last().unwrap();
+    if last.ident != "Of" {
+        return Err(syn::Error::new_spanned(of, HELP));
+    }
+    let syn::PathArguments::AngleBracketed(angle) = &last.arguments else {
+        return Err(syn::Error::new_spanned(of, HELP));
+    };
+    match angle.args.first() {
+        Some(syn::GenericArgument::Type(Type::Path(path)))
+            if path.qself.is_none() && path.path.segments.len() == 1 =>
+        {
+            let ident = &path.path.segments[0].ident;
+            if ident.to_string().starts_with(char::is_uppercase) {
+                let hash = proc_macro2::Punct::new('#', Spacing::Alone);
+                Ok(quote!(#hash #ident))
+            } else {
+                Ok(quote!(#ident))
+            }
+        }
+        Some(syn::GenericArgument::Const(syn::Expr::Lit(lit))) => Ok(lit.to_token_stream()),
+        _ => Err(syn::Error::new_spanned(of, HELP)),
+    }
+}
+
+/// For `let x: Reactive<T> = ..;`: `Some(Some(T))`, or `Some(None)` for
+/// `Reactive<_>`.
+fn reactive_let(local: &syn::Local) -> Option<Option<Type>> {
+    let Pat::Type(typed) = &local.pat else {
+        return None;
+    };
+    let args = generic_args(&typed.ty, "Reactive")?;
+    match args.first() {
+        Some(syn::GenericArgument::Type(Type::Infer(_))) | None => Some(None),
+        Some(syn::GenericArgument::Type(ty)) => Some(Some(ty.clone())),
+        _ => Some(None),
+    }
+}
+
 /// Removes `#[name(..)]` from `attrs` and returns it.
 fn take_attr(attrs: &mut Vec<syn::Attribute>, name: &str) -> Option<syn::Attribute> {
     let index = attrs.iter().position(|a| a.path().is_ident(name))?;
@@ -411,7 +546,7 @@ impl Context<'_> {
                     let message = if self.reactive[self.find(ident).unwrap()].tracked {
                         format!(
                             "`{ident}` is reactive, so it has no value in the function body: \
-                             read it as `${ident}` in `rsn!`, or use it in a `#[reactive] let`"
+                             read it as `${ident}` in `rsn!`, or use it in a `let x: Reactive<_> = ..;`"
                         )
                     } else {
                         format!(
@@ -459,7 +594,7 @@ impl Context<'_> {
                             self.value(index, name, handler).to_tokens(&mut out);
                         } else {
                             let message = format!(
-                                "`{name}` isn't reactive: use it without `$`, or mark it `#[reactive]` \
+                                "`{name}` isn't reactive: use it without `$`, or make it `Reactive<..>` \
                                  to re-run what reads it when it changes"
                             );
                             quote_spanned!(name.span()=> ::core::compile_error!(#message))
@@ -480,7 +615,7 @@ impl Context<'_> {
                         } else {
                             format!(
                                 "no reactive `{name}` here: add it as a function argument, like \
-                                 `#[reactive] {name}: Res<T>`"
+                                 `{name}: Reactive<Res<T>>`"
                             )
                         };
                         quote_spanned!(name.span()=> ::core::compile_error!(#message))
@@ -642,7 +777,7 @@ impl Context<'_> {
         };
         if !item.tracked && target.is_some() && !handler {
             let message = format!(
-                "`{}` is only usable in `on(..)`: mark it `#[reactive]` to read it in the scene",
+                "`{}` is only usable in `on(..)`: make it `Reactive<..>` to read it in the scene",
                 item.names[0]
             );
             let span = item.names[0].span();
@@ -658,7 +793,17 @@ impl Context<'_> {
         let ty: TokenStream = ty.into_iter().collect();
         match target {
             // Handlers don't track: an untracked read there is the same.
-            Some(target) => quote!($#ty(#target)),
+            Some(target) => {
+                // Spanned at the target, so a `#Name` error points at `Of<Name>`.
+                let span = target
+                    .clone()
+                    .into_iter()
+                    .last()
+                    .map_or_else(Span::call_site, |t| t.span());
+                let mut group = Group::new(Delimiter::Parenthesis, target.clone());
+                group.set_span(span);
+                quote!($#ty #group)
+            }
             None if item.tracked || wrapper == "Untracked" => quote!($#ty),
             None => quote!($::bevy_radioactive::reactive::Untracked<#ty>),
         }

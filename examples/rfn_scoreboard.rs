@@ -1,6 +1,6 @@
 //! A scoreboard written with `#[rfn]`: it takes system parameters as
 //! arguments, like a Bevy system, derives values from them in the body, and
-//! reads the `#[reactive]` ones in `rsn!` as `$name`.
+//! reads the `Reactive<..>` ones in `rsn!` as `$name`.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -27,16 +27,14 @@ fn scoreboard(
     // A prop: `scoreboard("round 1")`.
     title: &'static str,
     // Tracked: `$score` re-runs what reads it when it changes.
-    #[reactive] score: Res<Score>,
-    #[reactive] enemies: Query<&Health, With<Enemy>>,
+    score: Reactive<Res<Score>>,
+    enemies: Reactive<Query<&Health, With<Enemy>>>,
     // Untracked: used as `commands`.
     mut commands: Commands,
 ) -> impl Scene {
     // Derived: they read reactive values, so they re-run when those change.
-    #[reactive]
-    let alive = enemies.iter().filter(|hp| hp.0 > 0).count();
-    #[reactive]
-    let status = if alive == 0 { "cleared" } else { "fighting" };
+    let alive: Reactive<_> = enemies.iter().filter(|hp| hp.0 > 0).count();
+    let status: Reactive<_> = if alive == 0 { "cleared" } else { "fighting" };
 
     // Plain: runs once.
     let heading = title.to_uppercase();
