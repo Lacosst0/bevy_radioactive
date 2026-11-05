@@ -73,6 +73,26 @@ pub fn rsn_list(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
 mod rsn;
 
+/// A scene function whose body declares reactive values as variables, read
+/// in `rsn!` (or `bsn!`) as `$name`.
+///
+/// See `bevy_radioactive::rfn` for details.
+#[proc_macro_attribute]
+pub fn rfn(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    rfn::expand(attr.into(), item.into()).into()
+}
+
+#[doc(hidden)]
+#[proc_macro]
+pub fn __rfn_rsn(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    rfn::rsn_with(input.into()).into()
+}
+
+mod rfn;
+
 fn debug(output: &TokenStream) {
     if std::env::var_os("VIEW_DEBUG").is_some() {
         eprintln!("{output}");

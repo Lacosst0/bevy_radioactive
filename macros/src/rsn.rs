@@ -65,12 +65,21 @@ fn declared(tokens: &[TokenTree], out: &mut Vec<String>) {
 }
 
 pub(crate) fn expand(input: TokenStream, list: bool) -> TokenStream {
+    expand_with(input, list, Vec::new())
+}
+
+/// `rsn!` where `bound` names (an `#[rfn]` function's plain values) are
+/// cloned per use, like `for`/`match` bindings.
+pub(crate) fn expand_with(input: TokenStream, list: bool, bound: Vec<Ident>) -> TokenStream {
     let tokens: Tokens = input.into_iter().collect();
     let mut names = Vec::new();
     declared(&tokens, &mut names);
     let previous = DECLARED.with(|declared| declared.replace(names));
     let previous_errors = ERRORS.with(|errors| errors.replace(Vec::new()));
-    let mut scope = Scope::default();
+    let mut scope = Scope {
+        prelude: TokenStream::new(),
+        bound,
+    };
     let bsn = if list {
         invoke(
             "bsn_list",
@@ -166,11 +175,27 @@ impl Scope {
     }
 }
 
-fn mentions(tokens: &[TokenTree], names: &[Ident]) -> bool {
+/// Whether `tokens` use any of `names`, including as inline arguments in a
+/// format string (`"{name}"`).
+pub(crate) fn mentions(tokens: &[TokenTree], names: &[Ident]) -> bool {
     tokens.iter().any(|token| match token {
         TokenTree::Ident(ident) => names.contains(ident),
         TokenTree::Group(g) => mentions(&tokens_of(g), names),
+        TokenTree::Literal(literal) => {
+            let text = literal.to_string();
+            text.contains('{') && names.iter().any(|name| formats(&text, &name.to_string()))
+        }
         _ => false,
+    })
+}
+
+/// Whether the string literal `text` has `{name}` or `{name:..}`.
+fn formats(text: &str, name: &str) -> bool {
+    text.match_indices('{').any(|(at, _)| {
+        let rest = &text[at + 1..];
+        rest.starts_with(name)
+            && rest[name.len()..].starts_with(['}', ':'])
+            && !text[..at].ends_with('{')
     })
 }
 
