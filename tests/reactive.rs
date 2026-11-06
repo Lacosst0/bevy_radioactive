@@ -340,6 +340,117 @@ fn untracked_params_do_not_rerun() {
     assert_eq!(app.world().resource::<Runs>().0, 1);
 }
 
+#[test]
+fn tracked_res_mut_reruns_on_other_writes_but_not_its_own() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|mut score: Tracked<ResMut<Score>>, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                // Writes every run: without the filter this would loop.
+                score.0 = score.0.min(10) + 1;
+            })
+        })
+        .unwrap();
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Score>().0, 1);
+    assert_eq!(
+        app.world().resource::<Runs>().0,
+        1,
+        "its own write isn't a trigger"
+    );
+
+    app.world_mut().resource_mut::<Score>().0 = 50;
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Score>().0, 11, "clamped once");
+    assert_eq!(app.world().resource::<Runs>().0, 2, "another write is");
+}
+
+#[test]
+fn untracked_res_mut_never_reruns() {
+    let mut app = app();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|mut score: ResMut<Score>, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                score.0 = score.0.min(10);
+            })
+        })
+        .unwrap();
+    app.world_mut().resource_mut::<Score>().0 = 50;
+    app.update();
+    assert_eq!(app.world().resource::<Score>().0, 50);
+    assert_eq!(app.world().resource::<Runs>().0, 1);
+}
+
+#[test]
+fn tracked_mut_component_clamps_the_nearest_without_looping() {
+    let mut app = app();
+    let root = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Health(5)
+            Children [
+                watch(|mut hp: Tracked<&mut Health>, mut runs: ResMut<Runs>| {
+                    runs.0 += 1;
+                    hp.0 = hp.0.min(100);
+                })
+            ]
+        })
+        .unwrap()
+        .id();
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Runs>().0, 1);
+
+    app.world_mut().get_mut::<Health>(root).unwrap().0 = 500;
+    app.update();
+    app.update();
+    assert_eq!(app.world().get::<Health>(root), Some(&Health(100)));
+    assert_eq!(app.world().resource::<Runs>().0, 2);
+}
+
+#[test]
+fn tracked_query_reruns_on_other_writes_and_others_see_its_writes() {
+    let mut app = app();
+    let enemy = app.world_mut().spawn((Enemy, Health(1))).id();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|mut enemies: Tracked<Query<&mut Health, With<Enemy>>>, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                for mut hp in enemies.iter_mut() {
+                    hp.0 = hp.0.min(3);
+                }
+            })
+        })
+        .unwrap();
+    let label = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            Label
+            watch(|enemies: Query<&Health, With<Enemy>>| {
+                Label(enemies.iter().map(|hp| hp.0.to_string()).collect())
+            })
+        })
+        .unwrap()
+        .id();
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Runs>().0, 1);
+
+    app.world_mut().get_mut::<Health>(enemy).unwrap().0 = 9;
+    app.update();
+    app.update();
+    assert_eq!(app.world().resource::<Runs>().0, 2);
+    assert_eq!(
+        label_of(&app, label),
+        "3",
+        "a reader sees the clamped value"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // when / switch
 // ---------------------------------------------------------------------------
