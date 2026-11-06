@@ -297,7 +297,8 @@ Examples: `reactive_counters`, `reactive_todos`, `reactive_settings`, `reactive_
 
 `#[rfn]` writes a scene function like a Bevy system: system parameters are its
 arguments and the logic is in its body. What is reactive says so in its type, `Reactive<..>`, and is
-read in the scene as `$name`; everything else is not. It keeps `reactive`'s
+read in the scene by its plain name, with no `$`: whatever reads it re-runs when it
+changes. Everything else runs once. It keeps `reactive`'s
 fine-grained updates.
 
 ```rust,ignore
@@ -307,7 +308,7 @@ use bevy_radioactive::rfn::*;
 #[rfn]
 fn scoreboard(
     title: &'static str,                              // a prop: `@scoreboard("Round 1")`
-    score: Reactive<Res<Score>>,                      // tracked: read as `$score`
+    score: Reactive<Res<Score>>,                      // tracked: read as `score`
     enemies: Reactive<Query<&Health, With<Enemy>>>,
     count: Reactive<Ref<Count>, Of<Counter>>,         // `Count` on the nearest `#Counter`
     mut commands: Commands,                           // untracked: used as `commands`
@@ -325,17 +326,17 @@ fn scoreboard(
         Children [
             Text({ heading })
             --
-            Text({ format!("{} points, {} alive, {}", $score.0, $alive, $status) })
+            Text({ format!("{} points, {} alive, {}", score.0, alive, status) })
             --
             Button on(|_: On<Activate>| {
-                $count.0 += 1;
-                $score.0 += 10;
+                count.0 += 1;
+                score.0 += 10;
                 commands.spawn(Enemy);
             })
             --
-            if $alive == 0 { Text("You win!") }
+            if alive == 0 { Text("You win!") }
             --
-            for hp in $enemies { Text({ hp.0.to_string() }) }
+            for hp in enemies { Text({ hp.0.to_string() }) }
         ]
     }
 }
@@ -345,14 +346,14 @@ fn scoreboard(
 
 | In the function | Means | In `rsn!` |
 | --- | --- | --- |
-| `x: Reactive<Res<T>>` (or `ResMut`, `Query`, `Single`, `Populated`, `Local`, `Option<Res<T>>`, ..) | a tracked system parameter | `$x`, as `$Res<T>`: what reads it re-runs when it changes |
+| `x: Reactive<Res<T>>` (or `ResMut`, `Query`, `Single`, `Populated`, `Local`, `Option<Res<T>>`, ..) | a tracked system parameter | `x`, as `$Res<T>`: what reads it re-runs when it changes |
 | `x: Res<T>`, `mut commands: Commands`, `x: Untracked<P>` (no `Reactive`) | an untracked system parameter | `x`, read when the code around it runs, never a reason to re-run |
-| `x: Reactive<Ref<T>, Of<Name>>` | `T` on the nearest entity named `#Name`, checked at compile time | `$x`, as `$Ref<T>(#Name)` |
-| `x: Reactive<Ref<T>, Of<entity>>` | `T` on an `Entity` argument | `$x`, as `$Ref<T>(entity)` |
-| `x: Reactive<Ref<T>, Of<"Name">>` | `T` on an entity named `Name`, looked up at runtime | `$x`, as `$Ref<T>("Name")` |
+| `x: Reactive<Ref<T>, Of<Name>>` | `T` on the nearest entity named `#Name`, checked at compile time | `x`, as `$Ref<T>(#Name)` |
+| `x: Reactive<Ref<T>, Of<entity>>` | `T` on an `Entity` argument | `x`, as `$Ref<T>(entity)` |
+| `x: Reactive<Ref<T>, Of<"Name">>` | `T` on an entity named `Name`, looked up at runtime | `x`, as `$Ref<T>("Name")` |
 | `x: Ref<T, Of<..>>` (no `Reactive`) | the same, for handlers | `x`, only in `on(..)` |
 | any other argument | a prop, passed by the caller | `x`, cloned per use |
-| `let y: Reactive<_> = .. x ..;` | a derived value | `$y`, recomputed from the parameters it reads |
+| `let y: Reactive<_> = .. x ..;` | a derived value | `y`, recomputed from the parameters it reads |
 | any other statement | plain Rust, run once | `y`, cloned per use |
 
 System parameter arguments that only the scene uses are removed from the signature, so
@@ -364,7 +365,7 @@ the scene still reads its own copy:
 #[rfn]
 fn setup_ui(mut commands: Commands, score: Reactive<Res<Score>>) {
     commands.spawn_scene(rsn! {
-        Text({ $score.0.to_string() })
+        Text({ score.0.to_string() })
         Button on(|_: On<Activate>| { commands.spawn(Enemy); })
     });
 }
@@ -381,16 +382,15 @@ fn setup_ui(mut commands: Commands, score: Reactive<Res<Score>>) {
   way Svelte's compiler splits a component script. Parameter arguments and derived
   `let`s are removed, and each use in the scene is replaced by what it stands for:
   `$Res<T>` for a tracked parameter, `$Untracked<Res<T>>` for an untracked one, or a
-  block that reads the parameters a derived value needs and recomputes it. So `$alive`
-  above re-runs when an `Enemy`'s `Health` changes and `$score.0` when `Score` does,
+  block that reads the parameters a derived value needs and recomputes it. So `alive`
+  above re-runs when an `Enemy`'s `Health` changes and `score.0` when `Score` does,
   and nothing else re-runs. The function itself never runs again.
 - In a derived `let`, `Res`, `Single`, `Ref` and `Local` read as the value they point
   to (`&Score`), and `Query` and `Option` by reference (`bonus.as_ref()`).
-- In `on(..)`, parameters are writable: `$score.0 += 1` writes `Score` through
-  `ResMut`, `$count.0 += 1` writes the component, and `commands` is `Commands`.
+- In `on(..)`, parameters are writable: `score.0 += 1` writes `Score` through
+  `ResMut`, `count.0 += 1` writes the component, and `commands` is `Commands`.
 - `bsn!` works as well as `rsn!` in an `#[rfn]` body; both get `rsn!`'s `if`/`match`/`for`.
-  Untracked values work in format strings (`"{snapshot}"`); reactive ones are passed
-  as `$name`.
+  Values, reactive or not, work in format strings (`"{snapshot}"`, `"{score:?}"`).
 - Plain locals and arguments are cloned where the scene uses them, so they need `Clone`,
   and can be used any number of times.
 - Parameters have no value in the body itself: there are no effects that run when
@@ -660,7 +660,7 @@ rsn! {
 
 ### `rfn`
 
-The same scene, with the count as a `Reactive` argument. `$count` reads and writes
+The same scene, with the count as a `Reactive` argument. `count` reads and writes
 it, and the label is a derived value:
 
 ```rust,ignore
@@ -671,13 +671,13 @@ fn counter(count: Reactive<Ref<Count>, Of<Counter>>) -> impl Scene {
         #Counter
         Count(0)
         // ...
-        on(|_: On<Activate>| $count.0 += 1)
+        on(|_: On<Activate>| count.0 += 1)
         // ...
-        Text({ $label })
+        Text({ label })
         // ...
-        if $count.0 != 0 {
+        if count.0 != 0 {
             @FeathersButton
-            on(|_: On<Activate>| $count.0 = 0)
+            on(|_: On<Activate>| count.0 = 0)
             Children [ @caption("Reset") ]
         }
     }

@@ -1,7 +1,7 @@
 //! Scene functions that take Bevy system parameters as arguments, like a
 //! system, keep their logic in the body, and read values in [`rsn!`]. What is
-//! reactive says so in its type, [`Reactive<..>`](Reactive), and is read as
-//! `$name`.
+//! reactive says so in its type, [`Reactive<..>`](Reactive); the scene reads
+//! it by name, with no `$`.
 //!
 //! Mark a scene function with [`#[rfn]`](rfn):
 //!
@@ -13,7 +13,7 @@
 //!   (`commands.spawn_scene(..)`), it stays an argument, so a system can be an
 //!   `#[rfn]`.
 //! - `score: Reactive<Res<Score>>` is tracked: the scene reads it as
-//!   `$score`, and whatever does re-runs when it changes. Without `Reactive`
+//!   `score`, and whatever does re-runs when it changes. Without `Reactive`
 //!   (`mut commands: Commands`), it is untracked: the scene uses it as
 //!   `commands` and never re-runs because of it.
 //! - `count: Reactive<Ref<T>, Of<Name>>` reads component `T` on the nearest
@@ -22,14 +22,14 @@
 //!   up at runtime. Without `Reactive` (`Ref<T, Of<Name>>`), it only works in
 //!   `on(..)`.
 //! - In the body, `let x: Reactive<_> = ..;` is a derived value, recomputed
-//!   where the scene reads it (`$x`). Everything else, other `let`s included,
+//!   where the scene reads it (`x`). Everything else, other `let`s included,
 //!   runs once, when the function is called.
 //!
-//! In `rsn!` (or `bsn!`), `$name` reads a reactive value, and whatever
+//! In `rsn!` (or `bsn!`), naming a reactive value reads it, and whatever
 //! contains it re-runs when what it read changes, exactly as with
 //! `$Res<T>`. A derived value is recomputed where it is read, from the
 //! parameters it needs, so nothing re-runs that doesn't depend on them. In
-//! `on(..)`, `$name` is writable: `$score.0 += 1` for a
+//! `on(..)`, it is writable: `score.0 += 1` for a
 //! `score: Reactive<Res<Score>>` argument.
 //!
 //! ```ignore
@@ -54,16 +54,16 @@
 //!         Children [
 //!             Text({ heading })
 //!             --
-//!             Text({ format!("{} points, {} left: {}", $score.0, $alive, $status) })
+//!             Text({ format!("{} points, {} left: {}", score.0, alive, status) })
 //!             --
 //!             Button on(|_: On<Activate>| {
-//!                 $count.0 += 1;
+//!                 count.0 += 1;
 //!                 commands.spawn(Enemy);
 //!             })
 //!             --
-//!             if $score.0 > 100 { Text("High score!") }
+//!             if score.0 > 100 { Text("High score!") }
 //!             --
-//!             for hp in $enemies { Text({ hp.0.to_string() }) }
+//!             for hp in enemies { Text({ hp.0.to_string() }) }
 //!         ]
 //!     }
 //! }
