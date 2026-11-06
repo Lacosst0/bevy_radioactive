@@ -1,6 +1,6 @@
 #![cfg(feature = "rfn")]
 //! `#[rfn]`: system parameters as arguments and derived `let`s; `Reactive<..>`
-//! ones are read as `$name`.
+//! ones are read by name and re-run what reads them.
 
 use bevy::{asset::AssetPlugin, prelude::*, scene::ScenePlugin};
 use bevy_radioactive::rfn::*;
@@ -86,11 +86,11 @@ fn named(app: &mut App, name: &str) -> Entity {
 
 #[rfn]
 fn score_label(score: Reactive<Res<Score>>) -> impl Scene {
-    rsn! { Label({ format!("score {}", $score.0) }) }
+    rsn! { Label({ format!("score {}", score.0) }) }
 }
 
 #[test]
-fn a_declared_param_is_read_with_dollar() {
+fn a_declared_param_is_read_by_name() {
     let mut app = app();
     app.world_mut().spawn_scene(score_label()).unwrap();
     assert_eq!(labels(&mut app), ["score 0"]);
@@ -107,11 +107,11 @@ fn derived(prefix: &'static str, score: Reactive<Res<Score>>) -> impl Scene {
     bsn! {
         Node
         Children [
-            Label({ $text })
+            Label({ text })
             --
             Label({ shout })
             --
-            Label({ format!("{prefix} {}", $doubled + 1) })
+            Label({ format!("{prefix} {}", doubled + 1) })
         ]
     }
 }
@@ -132,12 +132,12 @@ fn branches(tab: Reactive<Res<Tab>>, score: Reactive<Res<Score>>) -> impl Scene 
     rsn! {
         Node
         Children [
-            match *$tab {
+            match *tab {
                 Tab::Home => Label("home"),
                 Tab::Settings => Label("settings"),
             }
             --
-            if $big { Label("big") } else { Label("small") }
+            if big { Label("big") } else { Label("small") }
         ]
     }
 }
@@ -159,9 +159,9 @@ fn enemies(enemies: Reactive<Query<&Health, With<Enemy>>>) -> impl Scene {
     rsn! {
         Node
         Children [
-            Label({ format!("{} alive", $alive) })
+            Label({ format!("{} alive", alive) })
             --
-            for hp in $enemies { Label({ format!("hp {}", hp.0) }) }
+            for hp in enemies { Label({ format!("hp {}", hp.0) }) }
         ]
     }
 }
@@ -188,11 +188,11 @@ fn counter(count: Reactive<Ref<Count>, Of<Counter>>, score: Reactive<Res<Score>>
         Children [
             #Button
             on(|poke: On<Poke>| {
-                $count.0 += poke.by;
-                $score.0 += 1;
+                count.0 += poke.by;
+                score.0 += 1;
             })
             --
-            Label({ format!("{} / {}", $count.0, $score.0) })
+            Label({ format!("{} / {}", count.0, score.0) })
         ]
     }
 }
@@ -218,7 +218,7 @@ fn handlers_write_declared_values() {
 fn health_of(player: Entity, hp: Reactive<Ref<Health>, Of<player>>) -> impl Scene {
     let low: Reactive<_> = hp.0 < 10;
     rsn! {
-        Label({ format!("{}{}", $hp.0, if $low { "!" } else { "" }) })
+        Label({ format!("{}{}", hp.0, if low { "!" } else { "" }) })
     }
 }
 
@@ -242,11 +242,11 @@ fn counts_calls(
     rsn! {
         Node
         Children [
-            Label({ format!("{:?}", *$tab) })
+            Label({ format!("{:?}", *tab) })
             --
             Label({
                 calls.0 += 1;
-                format!("{}", $score.0)
+                format!("{}", score.0)
             })
         ]
     }
@@ -274,9 +274,9 @@ fn strings(name: String, score: Reactive<Res<Score>>) -> impl Scene {
         Children [
             Label({ greeting.clone() })
             --
-            Label({ format!("{greeting}, {name}: {}", $score.0) })
+            Label({ format!("{greeting}, {name}: {}", score.0) })
             --
-            if $score.0 > 0 { Label({ name.clone() }) }
+            if score.0 > 0 { Label({ name.clone() }) }
         ]
     }
 }
@@ -307,7 +307,7 @@ fn optional(
     totals: Untracked<Totals>,
 ) -> impl Scene {
     let extra: Reactive<_> = bonus.as_ref().and_then(|b| b.0).unwrap_or(0);
-    rsn! { Label({ format!("{} + {} ({})", $score.0, $extra, totals.score.0) }) }
+    rsn! { Label({ format!("{} + {} ({})", score.0, extra, totals.score.0) }) }
 }
 
 #[test]
@@ -336,7 +336,7 @@ fn untracked(
         Count(0)
         Children [
             // Untracked: read when this label renders, but a change doesn't re-run it.
-            Label({ format!("{:?} {}", *$tab, score.0) })
+            Label({ format!("{:?} {}", *tab, score.0) })
             --
             #Button
             on(|_: On<Poke>| {
@@ -387,7 +387,7 @@ fn setup_ui(mut commands: Commands, score: Reactive<Res<Score>>, mut spawned: Re
     commands.spawn_scene(rsn! {
         Node
         Children [
-            Label({ format!("start {start}, now {}", $score.0) })
+            Label({ format!("start {start}, now {}", score.0) })
             --
             #Button
             on(|_: On<Poke>| { commands.spawn(Spawned); })
@@ -424,7 +424,7 @@ fn by_runtime_name(count: Reactive<Ref<Count>, Of<"Lookup">>) -> impl Scene {
     rsn! {
         #Lookup
         Count(4)
-        Children [ Label({ format!("count {}", $count.0) }) ]
+        Children [ Label({ format!("count {}", count.0) }) ]
     }
 }
 

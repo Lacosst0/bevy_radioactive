@@ -1,6 +1,6 @@
 //! `#[rfn]`: a scene function that takes Bevy system parameters as
-//! arguments, like a system, and reads the `Reactive<..>` ones in
-//! `rsn!` as `$name`.
+//! arguments, like a system, and reads them in `rsn!` by name; the
+//! `Reactive<..>` ones re-run what reads them.
 //!
 //! The function is split at compile time, the way Svelte's compiler splits a
 //! component script:
@@ -9,8 +9,8 @@
 //!   `Commands`, ..) is read by the scene. It is removed from the signature
 //!   unless the body uses it too, outside scene macros and `Reactive<_>` `let`s
 //!   (then it stays, so the function can be a system).
-//!   As `Reactive<P>`, it is tracked and read as `$name`; otherwise it is
-//!   untracked and read as `name`. `Reactive<Ref<T>, Of<target>>` reads
+//!   As `Reactive<P>`, it is tracked; otherwise it is untracked. Both are
+//!   read as `name`. `Reactive<Ref<T>, Of<target>>` reads
 //!   component `T` on an entity (`"Name"` or an `Entity` argument). Other
 //!   arguments are plain props.
 //! - `let x: Reactive<_> = ..;` is a *derived* value, recomputed from what it reads.
@@ -509,8 +509,19 @@ impl Context<'_> {
         self.reactive.iter().rposition(|r| r.names.contains(name))
     }
 
+    /// Whether `tokens` name a tracked value anywhere.
+    fn reads_tracked(&self, tokens: &[TokenTree]) -> bool {
+        let names: Vec<Ident> = self
+            .reactive
+            .iter()
+            .filter(|r| r.tracked)
+            .flat_map(|r| r.names.iter().cloned())
+            .collect();
+        mentions(tokens, &names)
+    }
+
     /// Whether `tokens[i]`, a reactive name, is used as a value (not a
-    /// field, path segment, `$name` or `#Name`).
+    /// field, path segment or `#Name`).
     fn bare_use(tokens: &[TokenTree], i: usize) -> bool {
         let before = i.checked_sub(1).and_then(|j| tokens.get(j));
         let after = tokens.get(i + 1);
@@ -546,7 +557,7 @@ impl Context<'_> {
                     let message = if self.reactive[self.find(ident).unwrap()].tracked {
                         format!(
                             "`{ident}` is reactive, so it has no value in the function body: \
-                             read it as `${ident}` in `rsn!`, or use it in a `let x: Reactive<_> = ..;`"
+                             read it in `rsn!`, or use it in a `let x: Reactive<_> = ..;`"
                         )
                     } else {
                         format!(
@@ -569,7 +580,7 @@ impl Context<'_> {
         out
     }
 
-    /// `rsn! { .. }` with `$name`s substituted, expanded with the plain
+    /// `rsn! { .. }` with reactive names substituted, expanded with the plain
     /// names cloned per use.
     fn scene(&self, name: &Ident, body: &Group, list: bool) -> TokenStream {
         let body = self.substitute(&tokens_of(body), false);
@@ -579,7 +590,7 @@ impl Context<'_> {
         quote_spanned!(span=> ::bevy_radioactive::macros::__rfn_rsn! { #kind [#(#plain),*] #body })
     }
 
-    /// Replaces each `$name` in a scene macro body, deeply. In `on(..)`,
+    /// Replaces each reactive name in a scene macro body, deeply. In `on(..)`,
     /// resources become writable.
     fn substitute(&self, tokens: &[TokenTree], handler: bool) -> TokenStream {
         let mut out = TokenStream::new();
@@ -588,33 +599,18 @@ impl Context<'_> {
             match &tokens[i] {
                 TokenTree::Punct(p) if p.as_char() == '$' => {
                     if let Some(TokenTree::Ident(name)) = tokens.get(i + 1)
-                        && let Some(index) = self.find(name)
-                    {
-                        if self.reactive[index].tracked {
-                            self.value(index, name, handler).to_tokens(&mut out);
-                        } else {
-                            let message = format!(
-                                "`{name}` isn't reactive: use it without `$`, or make it `Reactive<..>` \
-                                 to re-run what reads it when it changes"
-                            );
-                            quote_spanned!(name.span()=> ::core::compile_error!(#message))
-                                .to_tokens(&mut out);
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    if let Some(TokenTree::Ident(name)) = tokens.get(i + 1)
                         && name
                             .to_string()
                             .starts_with(|c: char| c.is_lowercase() || c == '_')
                     {
-                        let message = if self.plain.contains(name) {
+                        let message = if self.find(name).is_some() || self.plain.contains(name) {
                             format!(
-                                "`{name}` isn't reactive (its value doesn't use a reactive name): use it without `$`"
+                                "`{name}` is read by name, without `$`: write `{name}` \
+                                 (a `Reactive<..>` one re-runs what reads it on its own)"
                             )
                         } else {
                             format!(
-                                "no reactive `{name}` here: add it as a function argument, like \
+                                "no `{name}` here: add it as a function argument, like \
                                  `{name}: Reactive<Res<T>>`"
                             )
                         };
@@ -629,13 +625,7 @@ impl Context<'_> {
                     if self.find(ident).is_some() && Self::bare_use(tokens, i) =>
                 {
                     let index = self.find(ident).unwrap();
-                    if self.reactive[index].tracked {
-                        let message = format!("`{ident}` is reactive: read it as `${ident}`");
-                        quote_spanned!(ident.span()=> ::core::compile_error!(#message))
-                            .to_tokens(&mut out);
-                    } else {
-                        self.value(index, ident, handler).to_tokens(&mut out);
-                    }
+                    self.value(index, ident, handler).to_tokens(&mut out);
                 }
                 TokenTree::Ident(ident)
                     if is_punct(tokens.get(i + 1), '!')
@@ -646,40 +636,28 @@ impl Context<'_> {
                     // becomes a named argument, `name = value`.
                     let inner = tokens_of(g);
                     let mut body = self.substitute(&inner, handler);
-                    let mut errors = TokenStream::new();
                     for (index, item) in self.reactive.iter().enumerate() {
                         for name in &item.names {
                             if self.find(name) != Some(index) || !captures(&inner, name) {
                                 continue;
                             }
-                            if item.tracked {
-                                let message = format!(
-                                    "`{name}` is reactive: pass it as `${name}`, as in \
-                                     `format!(\"{{}}\", ${name})`"
-                                );
-                                quote_spanned!(g.span()=> ::core::compile_error!(#message);)
-                                    .to_tokens(&mut errors);
-                            } else {
-                                let value = self.value(index, name, handler);
-                                quote!(, #name = #value).to_tokens(&mut body);
-                            }
+                            let value = self.value(index, name, handler);
+                            quote!(, #name = #value).to_tokens(&mut body);
                         }
                     }
                     let mut group = Group::new(g.delimiter(), body);
                     group.set_span(g.span());
                     let bang = &tokens[i + 1];
-                    if errors.is_empty() {
-                        quote!(#ident #bang #group).to_tokens(&mut out);
-                    } else {
-                        quote!(({ #errors #ident #bang #group })).to_tokens(&mut out);
-                    }
+                    quote!(#ident #bang #group).to_tokens(&mut out);
                     i += 3;
                     continue;
                 }
                 TokenTree::Ident(ident) => {
-                    // A nested `bsn!` reading `$name` is reactive: make it `rsn!`.
+                    // A nested `bsn!` reading a tracked name is reactive: make it `rsn!`.
                     match scene_macro(tokens, i) {
-                        Some((_, g, list)) if has_dollar(&tokens_of(g)) => {
+                        Some((_, g, list))
+                            if has_dollar(&tokens_of(g)) || self.reads_tracked(&tokens_of(g)) =>
+                        {
                             let name =
                                 Ident::new(if list { "rsn_list" } else { "rsn" }, ident.span());
                             quote!(::bevy_radioactive::macros::#name!).to_tokens(&mut out);
@@ -719,7 +697,7 @@ impl Context<'_> {
         out
     }
 
-    /// What `$name` stands for.
+    /// What a reactive name stands for.
     fn value(&self, index: usize, name: &Ident, handler: bool) -> TokenStream {
         let item = &self.reactive[index];
         match &item.kind {
