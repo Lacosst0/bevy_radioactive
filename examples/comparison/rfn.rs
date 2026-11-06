@@ -1,10 +1,10 @@
-//! Counter using `rfn`: the count is an argument, `$count` reads it.
+//! Counter using `rfn`: the count is an argument, `count` reads it.
 //!
 //! Plain Bevy version: `comparison_bevy`.
 //!
 //! `Count` lives on the counter's root node, so every `@counter()` has its
 //! own. The `count: Reactive<Ref<Count>, Of<Counter>>` argument reads it: buttons
-//! write `$count` in `on(..)`, the label re-renders when it changes, and the
+//! write `count` in `on(..)`, the label re-renders when it changes, and the
 //! Reset button exists only while the count is not zero.
 
 use bevy::{
@@ -58,25 +58,25 @@ fn counter(count: Reactive<Ref<Count>, Of<Counter>>) -> impl Scene {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $count.0 -= 1)
+                on(|_: On<Activate>| count.0 -= 1)
                 Children [ @caption("-1") ]
                 --
-                Text({ $label })
+                Text({ label })
                 TextFont { font_size: FontSize::VMin(20.0) }
                 ThemeTextColor(tokens::TEXT_MAIN)
                 --
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $count.0 += 1)
+                on(|_: On<Activate>| count.0 += 1)
                 Children [ @caption("+1") ]
             ]
             --
-            if $count.0 != 0 {
+            if count.0 != 0 {
                 @FeathersButton
                 Node { height: Val::Auto, min_width: vmin(18), padding: UiRect::axes(vmin(3), vmin(1.5)) }
                 InheritableFont { font_size: FontSize::VMin(6.0) }
-                on(|_: On<Activate>| $count.0 = 0)
+                on(|_: On<Activate>| count.0 = 0)
                 Children [ @caption("Reset") ]
             }
         ]
