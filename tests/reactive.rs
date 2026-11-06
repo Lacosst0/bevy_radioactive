@@ -705,6 +705,119 @@ fn each_over_entities_with_source_updates_rows_in_place() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_handler_that_triggers_itself_runs_each_event_in_turn() {
+    let mut app = app();
+    let host = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            handle(|poke: &Poke, mut commands: Commands, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                if poke.by > 0 {
+                    commands.trigger(Poke { entity: poke.entity, by: poke.by - 1 });
+                }
+            })
+        })
+        .unwrap()
+        .id();
+    app.world_mut().trigger(Poke {
+        entity: host,
+        by: 10,
+    });
+    app.world_mut().flush();
+    assert_eq!(app.world().resource::<Runs>().0, 11, "no event is lost");
+}
+
+#[test]
+fn a_handler_that_always_triggers_itself_is_cut_off_instead_of_hanging() {
+    let mut app = app();
+    let host = app
+        .world_mut()
+        .spawn_scene(bsn! {
+            handle(|poke: &Poke, mut commands: Commands, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                commands.trigger(poke.clone());
+            })
+        })
+        .unwrap()
+        .id();
+    app.world_mut().trigger(Poke {
+        entity: host,
+        by: 0,
+    });
+    app.world_mut().flush();
+    let runs = app.world().resource::<Runs>().0;
+    assert!(
+        (2..=300).contains(&runs),
+        "cut off after a bounded chain, ran {runs}"
+    );
+
+    // It still works afterwards.
+    app.world_mut().resource_mut::<Runs>().0 = 0;
+    app.world_mut().trigger(Poke {
+        entity: host,
+        by: 0,
+    });
+    app.world_mut().flush();
+    assert!(app.world().resource::<Runs>().0 >= 2);
+}
+
+#[test]
+fn handlers_that_trigger_each_other_are_cut_off_instead_of_hanging() {
+    let mut app = app();
+    let a = app.world_mut().spawn_empty().id();
+    let b = app.world_mut().spawn_empty().id();
+    app.world_mut().entity_mut(a).react(handle(
+        move |_: &Poke, mut commands: Commands, mut runs: ResMut<Runs>| {
+            runs.0 += 1;
+            commands.trigger(Poke { entity: b, by: 0 });
+        },
+    ));
+    app.world_mut().entity_mut(b).react(handle(
+        move |_: &Poke, mut commands: Commands, mut runs: ResMut<Runs>| {
+            runs.0 += 1;
+            commands.trigger(Poke { entity: a, by: 0 });
+        },
+    ));
+    app.world_mut().trigger(Poke { entity: a, by: 0 });
+    app.world_mut().flush();
+    let runs = app.world().resource::<Runs>().0;
+    assert!((2..=1000).contains(&runs), "ran {runs}");
+}
+
+#[derive(Resource, Default)]
+struct Ping(u32);
+
+#[derive(Resource, Default)]
+struct Pong(u32);
+
+#[test]
+fn watches_that_write_each_other_run_a_bounded_number_of_times_per_frame() {
+    let mut app = app();
+    app.init_resource::<Ping>().init_resource::<Pong>();
+    app.world_mut()
+        .spawn_scene(bsn! {
+            watch(|ping: Res<Ping>, mut pong: ResMut<Pong>, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                pong.0 = ping.0 + 1;
+            })
+            watch(|pong: Res<Pong>, mut ping: ResMut<Ping>, mut runs: ResMut<Runs>| {
+                runs.0 += 1;
+                ping.0 = pong.0 + 1;
+            })
+        })
+        .unwrap();
+    for _ in 0..3 {
+        let before = app.world().resource::<Runs>().0;
+        app.update();
+        let ran = app.world().resource::<Runs>().0 - before;
+        assert!(
+            (1..=32).contains(&ran),
+            "16 rounds at most per frame, ran {ran}"
+        );
+    }
+}
+
+#[test]
 fn handle_writes_the_nearest_component() {
     let mut app = app();
     let root = app

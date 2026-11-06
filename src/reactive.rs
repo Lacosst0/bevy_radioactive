@@ -182,6 +182,17 @@
 //! feature) whenever its inputs changed. Outer regions update before the
 //! reactions inside them. A reaction doesn't see its own writes; one that
 //! changes another's input re-runs it in the same frame, for up to 16 rounds.
+//!
+//! # Cycles
+//!
+//! Reactions that keep writing what each other read never hang the app.
+//! Like Bevy systems, which run once a frame however their writes chain,
+//! a cycle runs 16 rounds in a frame and continues next frame, with one
+//! warning naming the reactions involved. A [`handle`]r that triggers an
+//! event reaching itself again (directly, or through other handlers) runs
+//! it after its current run instead of inside it; after 256 such runs from
+//! one event the chain is cut with a warning. Bevy's own observers have no
+//! such limit, and recurse until the stack overflows.
 
 pub use crate::macros::{rsn, rsn_list};
 
@@ -1135,6 +1146,8 @@ fn boxed<L: SceneList>(list: L) -> Box<dyn SceneList> {
 trait Body: Send + Sync {
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>);
     fn run(&mut self, world: &mut World, cx: &Cx);
+    /// What it is, for warnings.
+    fn label(&self) -> &'static str;
 }
 
 /// Makes a reaction's body; cloned with its template.
@@ -1255,17 +1268,55 @@ fn run_reaction(world: &mut World, reaction: Entity) {
     world.flush();
 }
 
-fn run_reactions(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) {
-    shared::settle(
-        world,
-        MAX_ROUNDS,
-        |world| run_round(world, reactions),
-        "reactive: values",
-    );
+fn run_reactions(
+    world: &mut World,
+    reactions: &mut QueryState<(Entity, &Reaction)>,
+    mut cycling: Local<bool>,
+) {
+    let mut ran = Vec::new();
+    for _ in 0..MAX_ROUNDS {
+        ran = run_round(world, reactions);
+        if ran.is_empty() {
+            *cycling = false;
+            return;
+        }
+    }
+    // Still changing: like a Bevy system, the rest runs next frame, so a
+    // cycle never hangs the app. Warn once per cycle, not every frame.
+    if !std::mem::replace(&mut *cycling, true) {
+        warn!(
+            "reactive: values still changing after {MAX_ROUNDS} rounds; the rest runs next \
+             frame. These reactions may be writing what each other reads:{}",
+            describe(world, &ran)
+        );
+    }
 }
 
-/// Runs every reaction whose inputs changed. Returns how many ran.
-fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) -> usize {
+/// The reactions in `ran`, one per line, for a warning.
+fn describe(world: &World, ran: &[Entity]) -> String {
+    use std::fmt::Write;
+    const SHOWN: usize = 8;
+    let mut lines = String::new();
+    for &reaction in ran.iter().take(SHOWN) {
+        let Some(state) = world.get::<Reaction>(reaction) else {
+            continue;
+        };
+        let label = state.body.as_ref().map_or("?", |body| body.label());
+        let host = state.host;
+        let name = world
+            .get::<Name>(host)
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let _ = write!(lines, "\n  - {label} on {host}{name}");
+    }
+    if ran.len() > SHOWN {
+        let _ = write!(lines, "\n  - and {} more", ran.len() - SHOWN);
+    }
+    lines
+}
+
+/// Runs every reaction whose inputs changed. Returns the ones that ran.
+fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>) -> Vec<Entity> {
     world.flush();
     run_pending(world);
     scan_any(world);
@@ -1299,7 +1350,7 @@ fn run_round(world: &mut World, reactions: &mut QueryState<(Entity, &Reaction)>)
     for &(_, reaction) in &due {
         run_reaction(world, reaction);
     }
-    due.len()
+    due.into_iter().map(|(_, reaction)| reaction).collect()
 }
 
 /// Something [`ReactExt::react`] can attach to an entity: [`watch`] or
@@ -1390,9 +1441,13 @@ where
 /// Made by [`watch`].
 pub struct Watch<F, M>(F, PhantomData<fn() -> M>);
 
-struct WatchBody<R>(Box<dyn Reader<R>>);
+struct WatchBody<R>(Box<dyn Reader<R>>, &'static str);
 
 impl<R: Bundle> Body for WatchBody<R> {
+    fn label(&self) -> &'static str {
+        self.1
+    }
+
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
         self.0.inputs(world, inputs);
     }
@@ -1415,7 +1470,10 @@ where
     F::Output: Bundle,
 {
     fn attach_to(&self, world: &mut World, host: Entity) -> Result<()> {
-        let body = Box::new(WatchBody(self.0.clone().into_reader()));
+        let body = Box::new(WatchBody(
+            self.0.clone().into_reader(),
+            std::any::type_name::<F>(),
+        ));
         attach(world, host, body).map(|_| ())
     }
 }
@@ -1471,7 +1529,9 @@ where
             let event = event.event().clone();
             let handler = Arc::clone(&handler);
             // Exclusive world access, so handlers can take any parameter.
-            commands.queue(move |world: &mut World| run_handler(world, host, &handler, &event));
+            commands.queue(move |world: &mut World| {
+                run_handler(world, host, &handler, Box::new(event));
+            });
         };
         world
             .get_entity_mut(host)
@@ -1481,37 +1541,80 @@ where
     }
 }
 
-/// A handler closure and its inputs, found on its first run.
-type HandlerState = Arc<Mutex<(Box<dyn Reader<()>>, Option<Vec<Input>>)>>;
+/// A handler closure and its inputs, found on its first run, plus the
+/// events that reached it while it was running.
+type HandlerState = Arc<HandlerCell>;
+
+struct HandlerCell {
+    run: Mutex<(Box<dyn Reader<()>>, Option<Vec<Input>>)>,
+    /// Events for this handler that arrived during one of its own runs.
+    queued: Mutex<Vec<Payload>>,
+}
+
+/// An event (or a widget's new value) for a handler, type-erased.
+type Payload = Box<dyn std::any::Any + Send + Sync>;
+
+/// Runs of one handler started by its own run, directly or through other
+/// handlers, before the chain is treated as a cycle and cut.
+const MAX_CHAIN: usize = 256;
 
 fn handler_state(reader: Box<dyn Reader<()>>) -> HandlerState {
-    Arc::new(Mutex::new((reader, None)))
+    Arc::new(HandlerCell {
+        run: Mutex::new((reader, None)),
+        queued: Mutex::new(Vec::new()),
+    })
 }
 
 /// Runs a [`handle`] or [`bind`] closure for `event`, declared on `host`.
-fn run_handler(
-    world: &mut World,
-    host: Entity,
-    handler: &HandlerState,
-    event: &(dyn std::any::Any + Send + Sync),
-) {
-    let mut handler = lock(handler);
-    let (reader, inputs) = &mut *handler;
+///
+/// A handler can trigger an event that reaches itself again, directly or
+/// through other handlers, while it runs. That event is queued and run after
+/// the current run ends, so the handler never re-enters itself. A chain
+/// longer than [`MAX_CHAIN`] is a cycle: it is cut with a warning.
+fn run_handler(world: &mut World, host: Entity, handler: &HandlerState, event: Payload) {
+    let mut run = match handler.run.try_lock() {
+        Ok(run) => run,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Running further up this stack: run this one when it's done.
+            lock(&handler.queued).push(event);
+            return;
+        }
+    };
+    let (reader, inputs) = &mut *run;
     let inputs: &mut Vec<Input> = inputs.get_or_insert_with(|| {
         let mut inputs = Vec::new();
         reader.inputs(world, &mut inputs);
         inputs
     });
-    let resolved = resolve_all(world, host, inputs);
-    reader.read(
-        world,
-        &Cx {
-            host,
-            inputs,
-            resolved: &resolved,
-            event: Some(event),
-        },
-    );
+    let mut event = event;
+    for chain in 0.. {
+        let resolved = resolve_all(world, host, inputs);
+        reader.read(
+            world,
+            &Cx {
+                host,
+                inputs,
+                resolved: &resolved,
+                event: Some(&*event),
+            },
+        );
+        let mut queued = lock(&handler.queued);
+        if queued.is_empty() {
+            return;
+        }
+        if chain == MAX_CHAIN {
+            let dropped = queued.len();
+            queued.clear();
+            warn!(
+                "reactive: a handler on {host} kept triggering itself ({MAX_CHAIN} runs from one \
+                 event); dropped {dropped} queued event(s). Something may be writing or \
+                 triggering what it handles."
+            );
+            return;
+        }
+        event = queued.remove(0);
+    }
 }
 
 impl<E, F, M: 'static> Template for Handler<E, F, M>
@@ -1661,7 +1764,7 @@ fn observe_widget<W: Bindable>(world: &mut World, host: Entity, set: HandlerStat
         let set = Arc::clone(&set);
         world
             .commands()
-            .queue(move |world: &mut World| run_handler(world, host, &set, &value));
+            .queue(move |world: &mut World| run_handler(world, host, &set, Box::new(value)));
     };
     if let Ok(mut entity) = world.get_entity_mut(host) {
         entity.observe(observer);
@@ -1720,6 +1823,10 @@ impl<V: Clone + PartialEq + Send + Sync + 'static> BindBody<V> {
 }
 
 impl<V: Clone + PartialEq + Send + Sync + 'static> Body for BindBody<V> {
+    fn label(&self) -> &'static str {
+        "bind"
+    }
+
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
         self.get.inputs(world, inputs);
     }
@@ -1926,6 +2033,10 @@ struct BranchBody<K> {
 }
 
 impl<K: PartialEq + Send + Sync + 'static> Body for BranchBody<K> {
+    fn label(&self) -> &'static str {
+        "a region (`if`, `match`, `when`, `switch`)"
+    }
+
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
         self.key.inputs(world, inputs);
     }
@@ -2160,6 +2271,10 @@ where
     V: PartialEq + Send + Sync + 'static,
     K: Eq + Hash + Send + Sync + 'static,
 {
+    fn label(&self) -> &'static str {
+        "a list (`for`, `each`)"
+    }
+
     fn inputs(&self, world: &mut World, inputs: &mut Vec<Input>) {
         self.items.inputs(world, inputs);
     }
