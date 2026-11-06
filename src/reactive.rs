@@ -128,10 +128,13 @@
 //! | `e: Entity` | no | the entity that declared the closure |
 //! | `ResMut`, `Commands`, `Local`, `MessageReader`, `MessageWriter` | no | ordinary system parameters |
 //! | `Untracked<P>` | no | any system parameter, read without re-running |
+//! | [`Tracked<P>`](Tracked) | yes, but not by its own writes | `ResMut<T>`, `&mut C` or a writing `Query`, re-run when something else changes it |
 //!
 //! A run is skipped while a `Ref<T>` or `&mut C` it needs is missing. Query
 //! parameters that write a component (`Query<&mut T>`) don't track that
-//! component.
+//! component, unless wrapped in [`Tracked`]. A closure never re-runs because
+//! of its own writes, so `Tracked` lets it change what it watches, for
+//! example to clamp or normalize a value, without looping.
 //!
 //! # Building blocks
 //!
@@ -679,6 +682,16 @@ fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
     world: &mut World,
     inputs: &mut Vec<Input>,
 ) {
+    query_inputs_with::<D, F>(world, inputs, false);
+}
+
+/// [`query_inputs`], also tracking the components the query writes when
+/// `writes_too` (for [`Tracked`]).
+fn query_inputs_with<D: QueryData + 'static, F: QueryFilter + 'static>(
+    world: &mut World,
+    inputs: &mut Vec<Input>,
+    writes_too: bool,
+) {
     let state = QueryState::<D, F>::new(world);
     let access = state.component_access();
     let writes = access.access().writes();
@@ -697,7 +710,7 @@ fn query_inputs<D: QueryData + 'static, F: QueryFilter + 'static>(
     inputs.extend(
         reads
             .chain(filters)
-            .filter(|&(id, _)| !writes.contains(id) && id != is_resource)
+            .filter(|&(id, _)| (writes_too || !writes.contains(id)) && id != is_resource)
             .map(|(id, track)| Input {
                 type_id: TypeId::of::<()>(),
                 id,
@@ -842,6 +855,115 @@ impl<P: SystemParam + 'static> ReactiveParam for Untracked<'_, '_, P> {
 
     fn fetch<'w, 's>(param: SystemParamItem<'w, 's, P>, _: &Cx) -> Option<Self::Item<'w, 's>> {
         Some(Untracked(param))
+    }
+}
+
+/// A parameter that writes, tracked like a read: the closure re-runs when
+/// something else changes what it writes, but never because of its own
+/// writes, so it can keep a value in shape without looping.
+///
+/// ```ignore
+/// // Clamps the score whenever anything else raises it past 100.
+/// watch(|mut score: Tracked<ResMut<Score>>| score.0 = score.0.min(100))
+/// --
+/// // Keeps the nearest `Health` within its `MaxHealth`.
+/// watch(|max: Ref<MaxHealth>, mut hp: Tracked<&mut Health>| hp.0 = hp.0.min(max.0))
+/// --
+/// // Re-runs when another system moves a `Transform` that has `Snap`.
+/// watch(|mut snapped: Tracked<Query<&mut Transform, With<Snap>>>| {
+///     for mut transform in snapped.iter_mut() {
+///         transform.translation = transform.translation.round();
+///     }
+/// })
+/// ```
+///
+/// Wraps `ResMut<T>`, `Option<ResMut<T>>`, `&mut C`, and `Query`, `Single`
+/// and `Populated` that write. Writes go through Bevy's change detection as
+/// usual, so other closures reading the value still re-run; only this one
+/// skips its own. A write that changes nothing (`score.0 = score.0`) still
+/// counts as a change for the others: guard it, or use
+/// [`set_if_neq`](bevy::ecs::change_detection::DetectChangesMut::set_if_neq).
+pub struct Tracked<P> {
+    // Named, so `score.0` reaches the value rather than this wrapper.
+    item: P,
+}
+
+impl<P> Tracked<P> {
+    /// The parameter itself.
+    pub fn into_inner(self) -> P {
+        self.item
+    }
+}
+
+impl<P> std::ops::Deref for Tracked<P> {
+    type Target = P;
+
+    fn deref(&self) -> &P {
+        &self.item
+    }
+}
+
+impl<P> std::ops::DerefMut for Tracked<P> {
+    fn deref_mut(&mut self) -> &mut P {
+        &mut self.item
+    }
+}
+
+/// A writing parameter that [`Tracked`] can track.
+pub trait Trackable: ReactiveParam {
+    #[doc(hidden)]
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>);
+}
+
+impl<P: Trackable + 'static> ReactiveParam for Tracked<P> {
+    type Param = P::Param;
+    type Item<'w, 's> = Tracked<P::Item<'w, 's>>;
+
+    fn inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        P::tracked_inputs(world, inputs);
+    }
+
+    fn fetch<'w, 's>(
+        param: SystemParamItem<'w, 's, Self::Param>,
+        cx: &Cx,
+    ) -> Option<Self::Item<'w, 's>> {
+        P::fetch(param, cx).map(|item| Tracked { item })
+    }
+}
+
+impl<T: Resource + Component<Mutability = Mutable>> Trackable for ResMut<'_, T> {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
+    }
+}
+
+impl<T: Resource + Component<Mutability = Mutable>> Trackable for Option<ResMut<'_, T>> {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        inputs.push(Input::new::<T>(world, Lookup::Resource, Track::Value));
+    }
+}
+
+impl<C: Component<Mutability = Mutable>> Trackable for &mut C {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        inputs.push(Input::new::<C>(world, Lookup::Nearest, Track::Value));
+    }
+}
+
+impl<D: QueryData + 'static, F: QueryFilter + 'static> Trackable for Query<'_, '_, D, F> {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        query_inputs_with::<D, F>(world, inputs, true);
+    }
+}
+
+impl<D: IterQueryData + 'static, F: QueryFilter + 'static> Trackable for Single<'_, '_, D, F> {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        query_inputs_with::<D, F>(world, inputs, true);
+    }
+}
+
+impl<D: QueryData + 'static, F: QueryFilter + 'static> Trackable for Populated<'_, '_, D, F> {
+    fn tracked_inputs(world: &mut World, inputs: &mut Vec<Input>) {
+        query_inputs_with::<D, F>(world, inputs, true);
     }
 }
 
